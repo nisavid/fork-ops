@@ -12,10 +12,10 @@ Provide reusable agentic operations for Maintained Forks while keeping each fork
 The first implementation should fully support the `track-aware` Fork Ops Capability Level. It should design for `sync-ready` without implementing every sync mutation in the first release.
 
 The first implementation should include read-only migration assessment,
-non-mutating config proposal generation, and non-mutating migration plan
-generation for existing fork-related materials. Migration dry run and migration
-execution support should follow after the target config, docs, and component
-surfaces exist.
+non-mutating config proposal generation, non-mutating migration plan generation,
+and non-mutating migration dry run for existing fork-related materials.
+Migration execution support should follow after the target config, docs, and
+component surfaces exist.
 
 ## Users
 

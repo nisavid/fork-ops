@@ -44,11 +44,10 @@ Use the narrowest source that answers the question:
 The foundation implementation is `track-aware` and non-mutating. It supports
 config discovery, schema validation, capability reporting, local Git diagnostics,
 migration assessment, proposed config patch generation, and migration plan
-generation.
+generation, and migration dry run.
 
 Treat these as planned, not implemented:
 
-- migration dry run
 - migration execution
 - Broad upstream sync mutation
 - PR publication closeout

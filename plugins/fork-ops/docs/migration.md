@@ -50,6 +50,19 @@ The plan output separates:
 The plan does not edit `.agents/fork-ops.toml` and does not remove source
 materials. It is an input to migration dry run.
 
+Migration dry run previews a migration plan without mutating the repository.
+When no plan file is supplied, the CLI generates the current plan internally.
+
+```bash
+uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
+uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-plan.json
+```
+
+The dry-run output reports planned file edits, config changes, retained source
+materials, blocked steps, and expected verification commands. It fails closed
+while migration execution is unavailable: blockers remain explicit and no
+config, source material, or branch state is changed.
+
 ## Migration Lifecycle
 
 1. Migration assessment maps existing material to proposed Fork Ops config sections, docs, skills, tools, hooks, and portability hints.
@@ -58,9 +71,9 @@ materials. It is an input to migration dry run.
 4. Migration execution applies a validated plan and verifies the resulting Fork Ops capability level.
 
 The implementation supports migration assessment, non-mutating proposed config
-patch generation, and non-mutating migration plan generation. Dry run and
-execution are unavailable until target functionality exists for the material
-being migrated.
+patch generation, non-mutating migration plan generation, and non-mutating
+migration dry run. Execution is unavailable until target functionality exists
+for the material being migrated.
 
 ## Migration Boundaries
 

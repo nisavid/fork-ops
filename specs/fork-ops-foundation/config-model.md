@@ -16,8 +16,9 @@ Config validation is capability-based. A Maintained Fork can be valid at a lower
 The first fully operational implementation target is `track-aware`. `sync-ready` should be represented in the schema design so existing fork policy can be migrated cleanly, but sync mutation workflows can be implemented after the config and upstream-track surface is reliable.
 
 Migration support should start with read-only migration assessment, non-mutating
-proposed config patches, and non-mutating migration plans. Full migration should
-later progress through dry run and execution after target functionality exists.
+proposed config patches, non-mutating migration plans, and non-mutating dry
+runs. Full migration should later progress through execution after target
+functionality exists.
 
 ## Capability Levels
 
@@ -59,7 +60,7 @@ later progress through dry run and execution after target functionality exists.
 - Prescriptive policy conflicts require escalation unless a deterministic precedence rule exists.
 - Portability hints never block current Fork Ops behavior.
 - Release-channel resolution does not mutate config. Baseline-changing operations update Upstream Tracks or produce evidence artifacts according to policy.
-- Migration assessment, proposed config patch generation, and migration plan
-  generation are read-only. Migration execution is unavailable until the
-  corresponding dry-run and validation surfaces exist.
+- Migration assessment, proposed config patch generation, migration plan
+  generation, and migration dry run are non-mutating. Migration execution is
+  unavailable until the corresponding validation surfaces exist.
 - Config writes should use semantic operations by default. Advanced raw writes must validate parse and schema results and expose the proposed diff before mutation.

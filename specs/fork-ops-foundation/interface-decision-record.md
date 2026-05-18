@@ -14,8 +14,8 @@ The first fully operational target is the `track-aware` capability level. The co
 
 The first migration surface includes read-only migration assessment,
 non-mutating config proposal generation, and non-mutating migration plan
-generation. Full migration must later support dry-run preview, mutation, and
-verification.
+generation. Full migration must support dry-run preview before later mutation
+and verification.
 
 Use Python for the initial core library, CLI, and MCP server implementation.
 
@@ -32,7 +32,7 @@ Use Python for the initial core library, CLI, and MCP server implementation.
 
 ## Implementation Projection
 
-- Core package: `plugins/fork-ops/src/fork_ops/` for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, and migration plans.
+- Core package: `plugins/fork-ops/src/fork_ops/` for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, migration plans, and migration dry runs.
 - CLI adapter: a `fork-ops` console entry point over the core package.
 - MCP adapter: a stdio MCP server over the core package.
 
