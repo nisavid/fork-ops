@@ -1,51 +1,67 @@
-# Domain Docs
+# Domain Documentation
 
-How the engineering skills should consume this repo's domain documentation when exploring the codebase.
+Use this page to choose the right source before making fork-ops claims or edits.
 
-## Before exploring, read these
+## Required Vocabulary
 
-- **`CONTEXT.md`** at the repo root, or
-- **`CONTEXT-MAP.md`** at the repo root if it exists. It points at one `CONTEXT.md` per context. Read each one relevant to the topic.
-- **`docs/adr/`**. Read ADRs that touch the area you're about to work in. In multi-context repos, also check `src/<context>/docs/adr/` for context-scoped decisions.
+Read `CONTEXT.md` before naming domain concepts in docs, issues, tests, or code.
+Use the project terms there, especially:
 
-If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The producer skill (`/grill-with-docs`) creates them lazily when terms or decisions actually get resolved.
+- maintained fork
+- fork-local authority
+- fork ops config
+- upstream release channel
+- upstream track
+- default sync baseline
+- migration assessment
+- migration plan
+- migration dry run
+- migration execution
+- portability hint
 
-## File structure
+If a needed concept is missing, note the vocabulary gap instead of inventing a
+near-synonym.
 
-Single-context repo:
+In prose docs, render these concepts as ordinary lowercase language unless a
+heading, proper noun, acronym, or quoted source title requires capitalization.
 
-```text
-/
-|-- CONTEXT.md
-|-- docs/adr/
-|   |-- 0001-event-sourced-orders.md
-|   `-- 0002-postgres-for-write-model.md
-`-- src/
-```
+## Source Routing
 
-Multi-context repo, if `CONTEXT-MAP.md` exists at the root:
+Use the narrowest source that answers the question:
 
-```text
-/
-|-- CONTEXT-MAP.md
-|-- docs/adr/
-`-- src/
-    |-- ordering/
-    |   |-- CONTEXT.md
-    |   `-- docs/adr/
-    `-- billing/
-        |-- CONTEXT.md
-        `-- docs/adr/
-```
+- Human project status and entry points: `README.md`
+- Plugin package surfaces and local checks: `plugins/fork-ops/README.md`
+- Operation behavior: `plugins/fork-ops/docs/operation-guide.md`
+- Config shape and capability sections: `plugins/fork-ops/docs/config-schema.md`
+- Migration lifecycle and boundaries: `plugins/fork-ops/docs/migration.md`
+- Design rationale and pressure cases: `specs/fork-ops-foundation/`
+- Issue workflow and triage vocabulary: `docs/agents/issue-tracker.md` and
+  `docs/agents/triage-labels.md`
+- Current implementation: `plugins/fork-ops/src/fork_ops/`
 
-## Use the glossary's vocabulary
+## Current Implementation Boundary
 
-When your output names a domain concept in an issue title, refactor proposal, hypothesis, or test name, use the term as defined in `CONTEXT.md`. Don't drift to synonyms the glossary explicitly avoids.
+The foundation implementation is `track-aware` and non-mutating. It supports
+config discovery, schema validation, capability reporting, local Git diagnostics,
+migration assessment, and proposed config patch generation.
 
-If the concept you need isn't in the glossary yet, that's a signal: either you're inventing language the project doesn't use, or there's a real gap to note for `/grill-with-docs`.
+Treat these as planned, not implemented:
 
-## Flag ADR conflicts
+- migration plan generation
+- migration dry run
+- migration execution
+- Broad upstream sync mutation
+- PR publication closeout
+- General Repo Ops extraction
 
-If your output contradicts an existing ADR, surface it explicitly rather than silently overriding:
+## Documentation Placement
 
-> _Contradicts ADR-0007 (event-sourced orders), but worth reopening because..._
+Put durable facts where future readers will look first:
+
+- Root `README.md`: user-facing orientation, current status, and links.
+- Plugin docs: how to use the current plugin surfaces.
+- Specs: rationale, domain design, pressure cases, and implementation contracts.
+- `AGENTS.md`: always-loaded operating law and validation expectations.
+- Issues: next work, follow-up hardening, and unresolved design decisions.
+
+Do not put long maintainer process or agent-only policy in the root README.
