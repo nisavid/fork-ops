@@ -17,10 +17,10 @@ The first implementation target is `track-aware`. It supports config discovery, 
 ## Quick Checks
 
 ```bash
-uv run fork-ops schema print
-uv run fork-ops capability report --repo /path/to/fork
-uv run fork-ops migration assess --repo /path/to/fork
-uv run fork-ops migration propose-config --repo /path/to/fork --format toml
+uv run --package fork-ops fork-ops schema print
+uv run --package fork-ops fork-ops capability report --repo /path/to/fork
+uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
+uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 uv run ruff check --cache-dir .ruff_cache
 uv run mypy --cache-dir .mypy_cache
 ```

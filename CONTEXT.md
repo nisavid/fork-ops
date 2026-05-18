@@ -113,28 +113,20 @@ _Avoid_: Dry run, assessment.
 
 > **Dev:** "Should this rule live in the Fork Ops Plugin?"
 > **Domain expert:** "Only if it is reusable across Maintained Forks. If it defines how this fork operates, it belongs in Fork-local Authority."
-
 > **Dev:** "Is latest stable the sync branch?"
 > **Domain expert:** "No. Latest stable is an Upstream Release Channel. The fork may publish an Upstream Track from it, then use that track as the Default Sync Baseline."
-
 > **Dev:** "The config says main is protected, but GitHub says it is not."
 > **Domain expert:** "That is a Descriptive Fork Fact mismatch. Report it as diagnostics before applying Prescriptive Fork Policy."
-
 > **Dev:** "Can I push this sync branch even though checks are stale?"
 > **Domain expert:** "Only if the relevant Mutation Gate allows it or the human operator explicitly grants an exception."
-
 > **Dev:** "PR closeout is not fork-specific. Should we omit it?"
 > **Domain expert:** "No. Mark it as a Repo Ops Candidate, implement only the fork-specific needs here, and keep it easy to migrate later."
-
 > **Dev:** "External-contributor PR repair feels generic."
 > **Domain expert:** "Classify it as Shared with Fork Policy when fork branch protections, code scanning, or upstreaming rules change the workflow."
-
 > **Dev:** "Can Fork Ops decide this component definitely belongs in Repo Ops later?"
 > **Domain expert:** "No. Fork Ops can leave a Portability Hint, but Repo Ops migration design will make that decision."
-
 > **Dev:** "Does every Maintained Fork need package provenance rules?"
 > **Domain expert:** "No. That belongs to a later Fork Ops Capability Level; a simple fork can still be identified, scoutable, and sync-ready."
-
 > **Dev:** "Can the first plugin rewrite existing repo-local fork skills?"
 > **Domain expert:** "No. Start with Migration Assessment. Design, dry-run, and execute the full migration after the target functionality exists."
 

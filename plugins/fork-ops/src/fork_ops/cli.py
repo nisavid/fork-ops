@@ -177,6 +177,8 @@ def cmd_capability_report(args: argparse.Namespace) -> int:
             print(f"{level}: {status}")
             if details["missing"]:
                 print(f"  missing: {', '.join(details['missing'])}")
+        if report.get("diagnostics"):
+            _print_diagnostics(report)
     return 1 if _has_errors(report) else 0
 
 
@@ -189,9 +191,11 @@ def cmd_migration_propose_config(args: argparse.Namespace) -> int:
     patch = propose_migration_config_patch(args.repo)
     if args.format == "toml":
         print(patch["toml"], end="")
+        if patch["diagnostics"]:
+            print(json.dumps(patch["diagnostics"], indent=2, sort_keys=True), file=sys.stderr)
     else:
         print(json.dumps(patch, indent=2, sort_keys=True))
-    return 1 if patch["diagnostics"] else 0
+    return 1 if _diagnostics_have_errors(patch["diagnostics"]) else 0
 
 
 def cmd_schema_print(args: argparse.Namespace) -> int:
@@ -210,7 +214,11 @@ def _print_diagnostics(report: dict[str, Any]) -> None:
 
 
 def _has_errors(report: dict[str, Any]) -> bool:
-    return any(item.get("severity") == "error" for item in report.get("diagnostics", []))
+    return _diagnostics_have_errors(report.get("diagnostics", []))
+
+
+def _diagnostics_have_errors(diagnostics: list[dict[str, Any]]) -> bool:
+    return any(item.get("severity") == "error" for item in diagnostics)
 
 
 if __name__ == "__main__":
