@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from fork_ops.cli import main as cli_main
@@ -70,6 +71,32 @@ kind = "config"
 path = ".agents/fork-ops.toml"
 domain = "identity"
 portability_hint = "fork-specific"
+"""
+
+IDENTIFIED_CONFIG = """schema_version = "0.1"
+
+[repository]
+host = "github"
+owner = "nisavid"
+name = "lemonade"
+default_branch = "main"
+
+[authority]
+source_order = ["fork-ops-config"]
+
+[change_targets]
+default = "fork"
+
+[[fork_remotes]]
+name = "origin"
+url = "https://github.com/nisavid/lemonade.git"
+push = true
+
+[[upstreams]]
+id = "lemonade"
+remote = "upstream"
+url = "https://github.com/lemonade-sdk/lemonade.git"
+push = false
 """
 
 
@@ -704,8 +731,8 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["operation"], "migration-execution")
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["applied_edits"], [])
-        self.assertEqual(result["summary"]["blocker_count"], 1)
-        self.assertEqual(result["blockers"][0]["code"], "semantic_coverage.incomplete")
+        blocker_codes = {blocker["code"] for blocker in result["blockers"]}
+        self.assertIn("semantic_coverage.incomplete", blocker_codes)
         self.assertEqual(result["skipped_edits"][0]["reason"], "blocked_steps_present")
 
     def test_migration_execution_applies_config_and_preserves_source_material(self) -> None:
@@ -759,6 +786,25 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
+    def test_migration_execution_rejects_noncanonical_config_target(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["proposed_config_patch"]["target_path"] = ".agents/not-fork-ops.toml"
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / ".agents/not-fork-ops.toml").exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.unsupported_target_path",
+        )
+
     def test_migration_execution_does_not_overwrite_target_created_during_write(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -767,7 +813,15 @@ uncertainty_destination = "ask-human-operator"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            with patch.object(Path, "open", side_effect=FileExistsError):
+            original_open = Path.open
+
+            def late_target_create(path: Path, *args: Any, **kwargs: Any) -> Any:
+                mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+                if mode == "x":
+                    raise FileExistsError
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", late_target_create):
                 result = execute_migration_plan(plan)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
@@ -775,6 +829,80 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["applied_edits"], [])
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
+    def test_migration_execution_rejects_target_parent_symlink_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/working-with-upstream-refs.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            (repo_path / ".agents").symlink_to(outside, target_is_directory=True)
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((Path(outside) / "fork-ops.toml").exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.unsafe_target_path")
+
+    def test_migration_execution_rejects_target_parent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/working-with-upstream-refs.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            (repo_path / ".agents").write_text("not a directory\n")
+
+            result = execute_migration_plan(plan)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.target_parent_not_directory",
+        )
+
+    def test_migration_execution_rejects_config_without_required_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["proposed_config_patch"]["toml"] = IDENTIFIED_CONFIG
+            plan["proposed_config_patch"]["config"] = parse_config_text(IDENTIFIED_CONFIG)
+
+            dry_run = dry_run_migration_plan(plan)
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertFalse(dry_run["can_execute"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.required_capability_unavailable",
+        )
+
+    def test_migration_execution_rejects_changed_retained_source_material(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT + "\nChanged after plan.\n")
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.retained_source_changed",
+        )
 
     def test_execute_migration_uses_embedded_repo_path_for_supplied_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

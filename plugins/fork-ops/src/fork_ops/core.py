@@ -475,6 +475,9 @@ def dry_run_migration_plan(
             {"file_edits": file_edits},
         )
     )
+    blocked_steps.extend(
+        _retained_source_material_blockers(Path(normalized_repo_path), retained_materials)
+    )
     expected_verification_commands = _require_plan_list(plan, "validation_requirements")
     return {
         "repo_path": normalized_repo_path,
@@ -746,6 +749,14 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
                 "message": "Migration execution currently writes Fork Ops config content only.",
             }
         )
+    if edit.get("path") != CONFIG_RELATIVE_PATH.as_posix():
+        blockers.append(
+            {
+                "code": "migration_execution.unsupported_target_path",
+                "path": edit.get("path"),
+                "message": "Migration execution currently writes only .agents/fork-ops.toml.",
+            }
+        )
     if path.exists() and action == "create":
         blockers.append(
             {
@@ -788,6 +799,19 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
                 "diagnostics": error_diagnostics,
             }
         )
+    capability = capability_report(normalize_config(parsed), diagnostics)
+    if not capability["levels"]["track-aware"]["available"]:
+        blockers.append(
+            {
+                "code": "migration_execution.required_capability_unavailable",
+                "path": edit.get("path"),
+                "message": (
+                    "Migration execution requires the proposed config to satisfy track-aware."
+                ),
+                "required_level": "track-aware",
+                "missing": capability["levels"]["track-aware"]["missing"],
+            }
+        )
     return blockers
 
 
@@ -807,7 +831,58 @@ def _migration_edit_target(
             "path": raw_path,
             "message": "Migration execution refuses absolute paths and parent traversal.",
         }
+    repo_root = repo.resolve()
+    resolved_parent = (repo / target).parent.resolve(strict=False)
+    if not resolved_parent.is_relative_to(repo_root):
+        return repo, {
+            "code": "migration_execution.unsafe_target_path",
+            "path": raw_path,
+            "message": "Migration execution refuses target paths outside the repository.",
+        }
+    if resolved_parent.exists() and not resolved_parent.is_dir():
+        return repo, {
+            "code": "migration_execution.target_parent_not_directory",
+            "path": raw_path,
+            "message": "Migration execution target parent is not a directory.",
+        }
     return repo / target, None
+
+
+def _retained_source_material_blockers(
+    repo: Path,
+    retained_materials: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    blockers = []
+    for material in retained_materials:
+        raw_path = material.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            blockers.append(
+                {
+                    "code": "migration_execution.malformed_retained_source",
+                    "message": "Retained source material requires a non-empty relative path.",
+                }
+            )
+            continue
+        path = repo / raw_path
+        if not path.exists():
+            blockers.append(
+                {
+                    "code": "migration_execution.retained_source_missing",
+                    "path": raw_path,
+                    "message": "Retained source material is missing before migration execution.",
+                }
+            )
+            continue
+        expected_sha256 = material.get("content_sha256")
+        if expected_sha256 and _file_sha256(path) != expected_sha256:
+            blockers.append(
+                {
+                    "code": "migration_execution.retained_source_changed",
+                    "path": raw_path,
+                    "message": "Retained source material changed after migration planning.",
+                }
+            )
+    return blockers
 
 
 def _apply_migration_file_edits(
@@ -896,6 +971,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
             {
                 "path": rel,
                 "kind": _candidate_kind(rel),
+                "content_sha256": hashlib.sha256(raw_text.encode()).hexdigest(),
                 "signals": signals,
                 "domains": _candidate_domains(signals),
                 "extracted_facts": _extracted_facts(raw_text),
@@ -937,6 +1013,7 @@ def _retained_source_materials(candidates: list[dict[str, Any]]) -> list[dict[st
                 "domains": candidate["domains"],
                 "proposed_destination": candidate["proposed_destination"],
                 "portability_hint": candidate["portability_hint"],
+                "content_sha256": candidate["content_sha256"],
                 "replacement_status": "deferred",
                 "retention_policy": (
                     "Keep this source material until a reviewed migration dry run proves "
@@ -1895,6 +1972,10 @@ def _read_text(path: Path) -> str:
         return path.read_text(errors="ignore")
     except OSError:
         return ""
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(_read_text(path).encode()).hexdigest()
 
 
 def _fork_signals(text: str) -> list[str]:
