@@ -537,19 +537,20 @@ def execute_migration_plan(
             verification_results=[],
         )
 
-    execution_blockers = _migration_execution_blockers(repo, preview)
-    if execution_blockers:
+    applied_edits, apply_blockers = _apply_migration_file_edits(
+        repo,
+        _require_preview_list(preview, "file_edits"),
+    )
+    if apply_blockers:
         return _migration_execution_result(
             repo=repo,
             preview=preview,
             status="blocked",
-            applied_edits=[],
-            skipped_edits=_skipped_preview_edits(preview, "execution_guard_blocked"),
-            blockers=execution_blockers,
+            applied_edits=applied_edits,
+            skipped_edits=_skipped_preview_edits(preview, "write_guard_blocked"),
+            blockers=apply_blockers,
             verification_results=[],
         )
-
-    applied_edits = _apply_migration_file_edits(repo, _require_preview_list(preview, "file_edits"))
     skipped_edits = _preserved_source_materials(preview)
     verification_results, verification_blockers = _verify_migration_execution(repo, preview)
     status = "applied" if not verification_blockers else "verification_failed"
@@ -812,15 +813,28 @@ def _migration_edit_target(
 def _apply_migration_file_edits(
     repo: Path,
     file_edits: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     applied = []
+    blockers = []
     for edit in file_edits:
         path, blocker = _migration_edit_target(repo, edit.get("path"))
         if blocker:
-            raise ForkOpsError(blocker["message"])
+            blockers.append(blocker)
+            continue
         content = edit["content"]
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        try:
+            with path.open("x") as handle:
+                handle.write(content)
+        except FileExistsError:
+            blockers.append(
+                {
+                    "code": "migration_execution.target_exists",
+                    "path": edit.get("path"),
+                    "message": "Refusing to overwrite a target created before config write.",
+                }
+            )
+            continue
         applied.append(
             {
                 "path": edit["path"],
@@ -831,7 +845,7 @@ def _apply_migration_file_edits(
                 "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
             }
         )
-    return applied
+    return applied, blockers
 
 
 def _verify_migration_execution(
