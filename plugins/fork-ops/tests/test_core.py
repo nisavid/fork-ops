@@ -107,6 +107,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             assessment = assess_migration(repo)
 
         [candidate] = assessment["candidates"]
+        self.assertNotIn("proposed_config_patch", assessment)
         facts = {
             (fact["kind"], fact["value"], fact["suggested_config"])
             for fact in candidate["extracted_facts"]
@@ -213,6 +214,11 @@ class ForkOpsCoreTests(unittest.TestCase):
             tracks["upstream-stable"]["evidence_checks"],
         )
         self.assertEqual(config["sync_policy"]["default_sync_baseline"], "upstream-stable")
+        self.assertEqual(
+            config["divergence_policy"]["uncertainty_destination"],
+            "ask-human-operator",
+        )
+        self.assertNotIn("uncertainty_destination", config["sync_policy"])
         self.assertEqual(config["sync_policy"]["default_sync_ref"], "origin/upstream-stable")
         self.assertEqual(config["sync_policy"]["fork_sync_start_ref"], "origin/main")
         self.assertTrue(config["sync_policy"]["preserve_commit_identity"])
@@ -260,6 +266,10 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertNotIn("upstream:https://github.com/lemonade-sdk/lemonade/releases", remote_facts)
         parsed = parse_config_text(patch["toml"])
         self.assertEqual(parsed["sync_policy"]["default_sync_baseline"], "upstream-stable")
+        self.assertEqual(
+            parsed["divergence_policy"]["uncertainty_destination"],
+            "ask-human-operator",
+        )
 
 
 UPSTREAM_REF_PRESSURE_TEXT = """# Working With Upstream Refs

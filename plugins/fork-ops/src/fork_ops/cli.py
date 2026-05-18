@@ -93,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     migration_subcommands = migration.add_subparsers(dest="migration_command", required=True)
     assess = migration_subcommands.add_parser("assess", help="Run read-only Migration Assessment.")
     _add_repo_arg(assess)
+    assess.add_argument(
+        "--with-proposed-config",
+        action="store_true",
+        help="Include the non-mutating proposed config patch in the assessment output.",
+    )
     assess.set_defaults(func=cmd_migration_assess)
     propose = migration_subcommands.add_parser(
         "propose-config",
@@ -134,11 +139,18 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
         _print_diagnostics(report)
         highest = report["capability"]["highest_available"] or "none"
         print(f"highest_available={highest}")
+    required_available = True
+    if args.required_level:
+        required_available = bool(report["capability"]["levels"][args.required_level]["available"])
+        if not required_available:
+            if not args.json:
+                missing = report["capability"]["levels"][args.required_level]["missing"]
+                print(f"required_level={args.required_level}: unavailable")
+                print(f"missing_for_required_level={', '.join(missing) or 'none'}")
     if _has_errors(report):
         return 1
     if args.required_level:
-        available = report["capability"]["levels"][args.required_level]["available"]
-        if not available:
+        if not required_available:
             return 1
     return 0
 
@@ -183,7 +195,16 @@ def cmd_capability_report(args: argparse.Namespace) -> int:
 
 
 def cmd_migration_assess(args: argparse.Namespace) -> int:
-    print(json.dumps(assess_migration(args.repo), indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            assess_migration(
+                args.repo,
+                include_proposed_config_patch=args.with_proposed_config,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

@@ -21,6 +21,7 @@ Migration Assessment candidates into a draft `.agents/fork-ops.toml` payload for
 review.
 
 ```bash
+uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 ```
 

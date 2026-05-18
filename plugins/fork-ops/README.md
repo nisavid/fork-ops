@@ -20,6 +20,7 @@ The first implementation target is `track-aware`. It supports config discovery, 
 uv run --package fork-ops fork-ops schema print
 uv run --package fork-ops fork-ops capability report --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
+uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 uv run ruff check --cache-dir .ruff_cache
 uv run mypy --cache-dir .mypy_cache
