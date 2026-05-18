@@ -8,6 +8,8 @@ from __future__ import annotations
 from typing import Any, cast
 
 from .core import (
+    CONFIG_RELATIVE_PATH,
+    ForkOpsError,
     assess_migration,
     build_status_report,
     find_config_path,
@@ -32,9 +34,26 @@ def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[
     """Read the Fork Ops config for a repository."""
     if normalized:
         return build_status_report(repo_path, include_config=True)
+    path = find_config_path(repo_path)
+    try:
+        raw = load_raw_config(repo_path)
+    except ForkOpsError as exc:
+        return {
+            "path": str(path),
+            "raw": "",
+            "diagnostics": [
+                {
+                    "severity": "error",
+                    "code": "config.read_failed",
+                    "message": str(exc),
+                    "path": str(CONFIG_RELATIVE_PATH),
+                }
+            ],
+        }
     return {
-        "path": str(find_config_path(repo_path)),
-        "raw": load_raw_config(repo_path),
+        "path": str(path),
+        "raw": raw,
+        "diagnostics": [],
     }
 
 
