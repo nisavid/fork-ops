@@ -529,7 +529,7 @@ def execute_migration(
 ) -> dict[str, Any]:
     migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
     if plan is None:
-        return execute_migration_plan(migration_plan, repo_path=repo_path)
+        return execute_migration_plan(migration_plan)
     if str(repo_path) not in ("", "."):
         plan_repo_path = _dry_run_repo_path(migration_plan, None)
         requested_repo_path = str(Path(repo_path).expanduser().resolve())

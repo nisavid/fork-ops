@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1046,6 +1047,25 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
 
+        self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+
+    def test_mcp_migration_execution_defaults_to_current_directory(self) -> None:
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+
+            try:
+                os.chdir(repo_path)
+                result = fork_ops_migration_execute()
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "applied")
         self.assertEqual(result["repo_path"], str(repo_path.resolve()))
 
     def test_cli_exposes_migration_execute(self) -> None:
