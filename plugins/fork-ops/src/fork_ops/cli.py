@@ -264,7 +264,7 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
 
 def cmd_migration_execute(args: argparse.Namespace) -> int:
     if args.plan:
-        result = execute_migration(args.repo or Path.cwd(), plan=_read_json_plan(args.plan))
+        result = execute_migration(args.repo or "", plan=_read_json_plan(args.plan))
     else:
         result = execute_migration(args.repo or ".")
     print(json.dumps(result, indent=2, sort_keys=True))

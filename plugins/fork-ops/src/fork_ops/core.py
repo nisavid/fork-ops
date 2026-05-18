@@ -534,29 +534,9 @@ def execute_migration(
     migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
     if plan is None:
         return execute_migration_plan(migration_plan)
-    if str(repo_path) not in ("", "."):
-        plan_repo_path = _dry_run_repo_path(migration_plan, None)
-        requested_repo_path = str(Path(repo_path).expanduser().resolve())
-        if requested_repo_path != plan_repo_path:
-            return _migration_execution_result(
-                repo=Path(requested_repo_path),
-                preview={"plan_operation": migration_plan.get("operation")},
-                status="blocked",
-                applied_edits=[],
-                skipped_edits=[],
-                blockers=[
-                    {
-                        "code": "migration_execution.repo_path_mismatch",
-                        "message": (
-                            "Supplied migration plan repo_path does not match the requested "
-                            "execution repo_path."
-                        ),
-                        "plan_repo_path": plan_repo_path,
-                        "requested_repo_path": requested_repo_path,
-                    }
-                ],
-                verification_results=[],
-            )
+    mismatch_result = _repo_path_mismatch_result(migration_plan, repo_path)
+    if mismatch_result is not None:
+        return mismatch_result
     return execute_migration_plan(migration_plan)
 
 
@@ -564,6 +544,9 @@ def execute_migration_plan(
     plan: dict[str, Any],
     repo_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    mismatch_result = _repo_path_mismatch_result(plan, repo_path)
+    if mismatch_result is not None:
+        return mismatch_result
     preview = dry_run_migration_plan(plan, repo_path)
     repo = Path(preview["repo_path"]).expanduser().resolve()
     preview_blockers = _require_preview_list(preview, "blocked_steps")
@@ -603,6 +586,39 @@ def execute_migration_plan(
         skipped_edits=skipped_edits,
         blockers=verification_blockers,
         verification_results=verification_results,
+    )
+
+
+def _repo_path_mismatch_result(
+    migration_plan: dict[str, Any],
+    repo_path: str | Path | None,
+) -> dict[str, Any] | None:
+    if migration_plan.get("operation") != "migration-plan":
+        return None
+    if repo_path is None or str(repo_path) == "":
+        return None
+    plan_repo_path = _dry_run_repo_path(migration_plan, None)
+    requested_repo_path = str(Path(repo_path).expanduser().resolve())
+    if requested_repo_path == plan_repo_path:
+        return None
+    return _migration_execution_result(
+        repo=Path(requested_repo_path),
+        preview={"plan_operation": migration_plan.get("operation")},
+        status="blocked",
+        applied_edits=[],
+        skipped_edits=[],
+        blockers=[
+            {
+                "code": "migration_execution.repo_path_mismatch",
+                "message": (
+                    "Supplied migration plan repo_path does not match the requested "
+                    "execution repo_path."
+                ),
+                "plan_repo_path": plan_repo_path,
+                "requested_repo_path": requested_repo_path,
+            }
+        ],
+        verification_results=[],
     )
 
 
@@ -797,7 +813,7 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
                 "message": "Migration execution currently writes only .agents/fork-ops.toml.",
             }
         )
-    if path.exists() and action == "create":
+    if (path.exists() or path.is_symlink()) and action == "create":
         blockers.append(
             {
                 "code": "migration_execution.target_exists",
@@ -1017,8 +1033,8 @@ def _apply_migration_file_edits(
                 "action": edit["action"],
                 "status": "applied",
                 "content_kind": edit.get("content_kind"),
-                "bytes": len(content.encode()),
-                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "bytes": len(_config_content_bytes(content)),
+                "content_sha256": hashlib.sha256(_config_content_bytes(content)).hexdigest(),
             }
         )
     return applied, blockers
@@ -1047,14 +1063,19 @@ def _migration_target_parent_blocker(
 
 def _write_new_file_atomically(path: Path, content: str) -> None:
     temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    content_bytes = _config_content_bytes(content)
     try:
-        with temp_path.open("x") as handle:
-            handle.write(content)
+        with temp_path.open("xb") as handle:
+            handle.write(content_bytes)
             handle.flush()
             os.fsync(handle.fileno())
         os.link(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _config_content_bytes(content: str) -> bytes:
+    return content.encode()
 
 
 def _remove_created_parent(parent: Path, parent_existed: bool) -> None:
@@ -1108,7 +1129,8 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for path in _iter_candidate_paths(repo):
         rel = path.relative_to(repo).as_posix()
-        raw_text = _read_text(path)
+        raw_bytes = _read_bytes(path)
+        raw_text = raw_bytes.decode(errors="ignore")
         lowered_text = raw_text.lower()
         signals = _fork_signals(lowered_text)
         if not signals:
@@ -1118,7 +1140,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
             {
                 "path": rel,
                 "kind": _candidate_kind(rel),
-                "content_sha256": _file_sha256(path),
+                "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
                 "signals": signals,
                 "domains": _candidate_domains(signals),
                 "extracted_facts": _extracted_facts(raw_text),
@@ -2149,11 +2171,15 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _file_sha256(path: Path) -> str:
+def _read_bytes(path: Path) -> bytes:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return path.read_bytes()
     except OSError:
-        return hashlib.sha256(b"").hexdigest()
+        return b""
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(_read_bytes(path)).hexdigest()
 
 
 def _fork_signals(text: str) -> list[str]:

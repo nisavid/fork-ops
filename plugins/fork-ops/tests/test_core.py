@@ -751,6 +751,7 @@ uncertainty_destination = "ask-human-operator"
             self.assertTrue(config_path.exists())
             self.assertEqual(source_path.read_text(), UPSTREAM_REF_PRESSURE_TEXT)
             parsed = parse_config_text(config_path.read_text())
+            config_bytes = config_path.read_bytes()
 
         self.assertEqual(result["mode"], "mutating")
         self.assertEqual(result["operation"], "migration-execution")
@@ -759,6 +760,11 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["summary"]["blocker_count"], 0)
         self.assertEqual(result["applied_edits"][0]["path"], ".agents/fork-ops.toml")
         self.assertEqual(result["applied_edits"][0]["action"], "create")
+        self.assertEqual(result["applied_edits"][0]["bytes"], len(config_bytes))
+        self.assertEqual(
+            result["applied_edits"][0]["content_sha256"],
+            hashlib.sha256(config_bytes).hexdigest(),
+        )
         self.assertEqual(result["skipped_edits"][0]["action"], "preserve")
         self.assertEqual(
             result["skipped_edits"][0]["path"],
@@ -856,7 +862,7 @@ uncertainty_destination = "ask-human-operator"
 
             def late_target_create(path: Path, *args: Any, **kwargs: Any) -> Any:
                 mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
-                if mode == "x":
+                if "x" in mode:
                     raise FileExistsError
                 return original_open(path, *args, **kwargs)
 
@@ -867,6 +873,23 @@ uncertainty_destination = "ask-human-operator"
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["applied_edits"], [])
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
+    def test_migration_execution_rejects_dangling_target_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.symlink_to(repo_path / "missing-target")
+
+            dry_run = dry_run_migration_plan(plan)
+            result = execute_migration_plan(plan)
+
+        self.assertFalse(dry_run["can_execute"])
+        self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
     def test_migration_execution_rejects_target_parent_symlink_outside_repo(self) -> None:
@@ -1070,7 +1093,7 @@ uncertainty_destination = "ask-human-operator"
 
             def fail_during_write(path: Path, *args: Any, **kwargs: Any) -> Any:
                 mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
-                if mode == "x":
+                if "x" in mode:
                     return FailingWriter()
                 return original_open(path, *args, **kwargs)
 
@@ -1125,11 +1148,47 @@ uncertainty_destination = "ask-human-operator"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            result = execute_migration(".", plan=plan)
+            result = execute_migration("", plan=plan)
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
 
         self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+
+    def test_execute_migration_rejects_dot_repo_path_mismatch_for_supplied_plan(self) -> None:
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            try:
+                os.chdir(other)
+                result = execute_migration(".", plan=plan)
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
+
+    def test_execute_migration_plan_rejects_repo_path_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            result = execute_migration_plan(plan, repo_path=other)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((Path(other) / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_mcp_migration_execution_defaults_to_current_directory(self) -> None:
         original_cwd = Path.cwd()
@@ -1177,9 +1236,7 @@ uncertainty_destination = "ask-human-operator"
             output = io.StringIO()
 
             with redirect_stdout(output):
-                exit_code = cli_main(
-                    ["migration", "execute", "--repo", str(repo_path), "--plan", str(plan_path)]
-                )
+                exit_code = cli_main(["migration", "execute", "--plan", str(plan_path)])
 
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
