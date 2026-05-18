@@ -19,6 +19,7 @@ from .core import (
     propose_migration_config_patch,
     schema_json,
 )
+from .schema import CAPABILITY_LEVELS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,14 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_repo_arg(validate)
     validate.add_argument(
         "--required-level",
-        choices=[
-            "identified",
-            "scoutable",
-            "track-aware",
-            "sync-ready",
-            "review-ready",
-            "provenance-ready",
-        ],
+        choices=CAPABILITY_LEVELS,
     )
     validate.add_argument("--json", action="store_true", help="Print full JSON report.")
     validate.set_defaults(func=cmd_config_validate)

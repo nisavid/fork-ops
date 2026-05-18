@@ -11,7 +11,7 @@ The first implementation target is `track-aware`. It supports config discovery, 
 - Skill: `skills/fork-ops/SKILL.md`
 - CLI: `uv run --package fork-ops fork-ops ...`
 - MCP: `fork_ops_migration_config_patch` and related tools exposed through `.mcp.json`
-- Schema: `schema/fork-ops.schema.json`
+- Schema: `src/fork_ops/fork-ops.schema.json`
 - Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
 
 ## Quick Checks
