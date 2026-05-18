@@ -1079,7 +1079,7 @@ def _missing_requirements(config: dict[str, Any], level: str) -> Iterable[str]:
         if candidate == level:
             break
     for path in cumulative:
-        if not _path_has_value(config, path):
+        if not _requirement_satisfied(config, path):
             yield path
 
 
@@ -1097,17 +1097,27 @@ def _level_enables(level: str) -> str:
     }[level]
 
 
-def _path_has_value(config: dict[str, Any], dotted_path: str) -> bool:
-    current: Any = config
-    for part in dotted_path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return False
-        current = current[part]
-    if current is None:
+def _requirement_satisfied(config: dict[str, Any], dotted_path: str) -> bool:
+    exists, current = _path_value(config, dotted_path)
+    if not exists or current is None:
         return False
+    if dotted_path in {
+        "sync_policy.preserve_commit_identity",
+        "sync_policy.forbid_history_rewrites",
+    }:
+        return current is True
     if isinstance(current, str | list | dict) and not current:
         return False
     return True
+
+
+def _path_value(config: dict[str, Any], dotted_path: str) -> tuple[bool, Any]:
+    current: Any = config
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
 
 
 def _section_items(config: dict[str, Any], key: str) -> list[Any]:
