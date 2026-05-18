@@ -20,7 +20,7 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
 ## Tool Surfaces
 
 - CLI: `uv run --project ${PLUGIN_ROOT} fork-ops ...`
-- MCP: `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_config_patch`, `fork_ops_schema`
+- MCP: `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, `fork_ops_schema`
 - Schema: `${PLUGIN_ROOT}/schema/fork-ops.schema.json`
 - Operation docs: `${PLUGIN_ROOT}/docs/operation-guide.md`
 
@@ -56,13 +56,19 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
    uv run --project ${PLUGIN_ROOT} fork-ops migration dry-run --repo /path/to/fork
    ```
 
-6. For a first config draft, generate a non-mutating proposed config patch and review it against the source materials before applying it:
+6. For a reviewed, blocker-free config migration, run guarded migration execution:
+
+   ```bash
+   uv run --project ${PLUGIN_ROOT} fork-ops migration execute --repo /path/to/fork
+   ```
+
+7. For a first config draft, generate a non-mutating proposed config patch and review it against the source materials before applying it:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration propose-config --repo /path/to/fork --format toml
    ```
 
-7. Treat sync, publication, and migration mutations as unavailable unless the config capability level and tool surface explicitly support them.
+8. Treat sync, publication, source-material removal, and arbitrary migration mutations as unavailable unless the config capability level and tool surface explicitly support them.
 
 ## Escalation Boundaries
 
@@ -70,4 +76,4 @@ Escalate when fork-local authority is missing, contradictory, or insufficient fo
 
 ## Current Capability
 
-This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs and generate reviewed non-mutating migration plans, dry runs, and config proposals. It does not execute broad upstream sync, PR publication closeout, or migration execution.
+This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans, dry runs, and config proposals, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.

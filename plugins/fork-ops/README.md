@@ -42,8 +42,13 @@ Assess existing fork-related materials without editing the fork:
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
-uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
+```
+
+Apply a reviewed, blocker-free migration plan through guarded config creation:
+
+```bash
+uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 ```
 
 ## Quick Checks
