@@ -41,16 +41,18 @@ Use the narrowest source that answers the question:
 
 ## Current Implementation Boundary
 
-The foundation implementation is `track-aware` and non-mutating. It supports
-config discovery, schema validation, capability reporting, local Git diagnostics,
-migration assessment, proposed config patch generation, and migration plan
-generation, and migration dry run.
+The foundation implementation is `track-aware`. It supports config discovery,
+schema validation, capability reporting, local Git diagnostics, migration
+assessment, proposed config patch generation, migration plan generation,
+migration dry run, and guarded migration execution for blocker-free config
+creation plans.
 
 Treat these as planned, not implemented:
 
-- migration execution
 - Broad upstream sync mutation
 - PR publication closeout
+- source-material removal during migration execution
+- arbitrary migration edits beyond guarded fork ops config creation
 - General Repo Ops extraction
 
 ## Documentation Placement

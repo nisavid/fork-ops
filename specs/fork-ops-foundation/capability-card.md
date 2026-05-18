@@ -14,8 +14,8 @@ The first implementation should fully support the `track-aware` Fork Ops Capabil
 The first implementation should include read-only migration assessment,
 non-mutating config proposal generation, non-mutating migration plan generation,
 and non-mutating migration dry run for existing fork-related materials.
-Migration execution support should follow after the target config, docs, and
-component surfaces exist.
+Migration execution should apply blocker-free plans through guarded operations,
+preserve retained source materials, and verify the resulting capability level.
 
 ## Users
 
@@ -66,7 +66,7 @@ component surfaces exist.
 
 ## Initial Implementation Shape
 
-- Python core library for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, and migration plans.
+- Python core library for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, migration plans, dry runs, and guarded execution.
 - `fork-ops` CLI as a thin adapter over the core library.
 - Stdio MCP server as a thin adapter over the core library.
 - Codex plugin packaging for skills, MCP config, scripts, docs, and assets.
@@ -116,6 +116,9 @@ The proposed config patch surface should convert assessment output into a non-mu
 
 Config-management output should distinguish raw TOML, parsed config, normalized config, diagnostics, capability levels, proposed diffs, and applied semantic operations.
 
+Migration execution output should distinguish applied edits, skipped preserved
+source materials, blockers, and verification results.
+
 ## Failure Modes
 
 - Missing config: report unconfigured status and offer onboarding steps.
@@ -136,4 +139,6 @@ Config-management output should distinguish raw TOML, parsed config, normalized 
 - `fork_ops_migration_assessment`: run read-only Migration Assessment.
 - `fork_ops_migration_plan`: generate a non-mutating migration plan for review.
 - `fork_ops_migration_config_patch`: generate a non-mutating proposed config patch for review.
+- `fork_ops_migration_dry_run`: preview migration edits without mutating the repository.
+- `fork_ops_migration_execute`: apply a blocker-free migration plan through guarded operations.
 - `fork_ops_schema`: return the config schema.

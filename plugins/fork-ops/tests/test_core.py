@@ -16,13 +16,15 @@ from fork_ops.core import (
     build_status_report,
     dry_run_migration,
     dry_run_migration_plan,
+    execute_migration,
+    execute_migration_plan,
     generate_migration_plan,
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
     schema_json,
 )
-from fork_ops.mcp_server import fork_ops_migration_dry_run
+from fork_ops.mcp_server import fork_ops_migration_dry_run, fork_ops_migration_execute
 from fork_ops.schema import schema_diagnostics
 
 TRACK_AWARE_CONFIG = """schema_version = "0.1"
@@ -515,7 +517,7 @@ uncertainty_destination = "ask-human-operator"
 
         self.assertEqual(dry_run["mode"], "non-mutating")
         self.assertEqual(dry_run["operation"], "migration-dry-run")
-        self.assertFalse(dry_run["can_execute"])
+        self.assertTrue(dry_run["can_execute"])
         self.assertEqual(dry_run["summary"]["file_edit_count"], 1)
         self.assertEqual(dry_run["file_edits"][0]["path"], ".agents/fork-ops.toml")
         self.assertEqual(dry_run["file_edits"][0]["action"], "create")
@@ -525,7 +527,7 @@ uncertainty_destination = "ask-human-operator"
             ".agents/skills/working-with-upstream-refs/SKILL.md",
         )
         blocker_codes = {item["code"] for item in dry_run["blocked_steps"]}
-        self.assertIn("migration_execution.unavailable", blocker_codes)
+        self.assertNotIn("migration_execution.unavailable", blocker_codes)
         verification_codes = {item["code"] for item in dry_run["expected_verification_commands"]}
         self.assertIn("validation.config_validate", verification_codes)
 
@@ -593,11 +595,7 @@ uncertainty_destination = "ask-human-operator"
 
         blocker_codes = [item["code"] for item in dry_run["blocked_steps"]]
         self.assertIn("semantic_coverage.incomplete", blocker_codes)
-        self.assertIn("migration_execution.unavailable", blocker_codes)
-        self.assertLess(
-            blocker_codes.index("semantic_coverage.incomplete"),
-            blocker_codes.index("migration_execution.unavailable"),
-        )
+        self.assertFalse(dry_run["can_execute"])
 
     def test_cli_exposes_migration_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -613,7 +611,7 @@ uncertainty_destination = "ask-human-operator"
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["operation"], "migration-dry-run")
-        self.assertFalse(payload["can_execute"])
+        self.assertTrue(payload["can_execute"])
 
     def test_cli_accepts_migration_plan_file_for_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -678,7 +676,147 @@ uncertainty_destination = "ask-human-operator"
             payload = fork_ops_migration_dry_run(str(repo_path))
 
         self.assertEqual(payload["operation"], "migration-dry-run")
-        self.assertFalse(payload["can_execute"])
+        self.assertTrue(payload["can_execute"])
+
+    def test_migration_execution_rejects_malformed_plan_before_mutating(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+
+            with self.assertRaisesRegex(ForkOpsError, "operation='migration-plan'"):
+                execute_migration_plan({"operation": "not-a-migration-plan"}, repo_path=repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+    def test_migration_execution_refuses_plan_blockers_without_mutating_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "AGENTS.md"
+            source_text = "Review bot policy lives here, but no structured fork facts yet.\n"
+            source_path.write_text(source_text)
+            plan = generate_migration_plan(repo_path)
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertEqual(source_path.read_text(), source_text)
+
+        self.assertEqual(result["operation"], "migration-execution")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["applied_edits"], [])
+        self.assertEqual(result["summary"]["blocker_count"], 1)
+        self.assertEqual(result["blockers"][0]["code"], "semantic_coverage.incomplete")
+        self.assertEqual(result["skipped_edits"][0]["reason"], "blocked_steps_present")
+
+    def test_migration_execution_applies_config_and_preserves_source_material(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            result = execute_migration_plan(plan)
+
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            self.assertTrue(config_path.exists())
+            self.assertEqual(source_path.read_text(), UPSTREAM_REF_PRESSURE_TEXT)
+            parsed = parse_config_text(config_path.read_text())
+
+        self.assertEqual(result["mode"], "mutating")
+        self.assertEqual(result["operation"], "migration-execution")
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["summary"]["applied_edit_count"], 1)
+        self.assertEqual(result["summary"]["blocker_count"], 0)
+        self.assertEqual(result["applied_edits"][0]["path"], ".agents/fork-ops.toml")
+        self.assertEqual(result["applied_edits"][0]["action"], "create")
+        self.assertEqual(result["skipped_edits"][0]["action"], "preserve")
+        self.assertEqual(
+            result["skipped_edits"][0]["path"],
+            ".agents/skills/working-with-upstream-refs/SKILL.md",
+        )
+        self.assertEqual(result["verification_results"][0]["status"], "passed")
+        self.assertTrue(result["verification_results"][0]["required_level_available"])
+        self.assertEqual(parsed["sync_policy"]["default_sync_baseline"], "upstream-stable")
+
+    def test_migration_execution_rejects_existing_config_create(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            plan = generate_migration_plan(repo_path)
+            plan["proposed_config_patch"]["operation"] = "create"
+            plan["blockers"] = []
+            original_config = config_path.read_text()
+
+            result = execute_migration_plan(plan)
+
+            self.assertEqual(config_path.read_text(), original_config)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
+    def test_execute_migration_uses_embedded_repo_path_for_supplied_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            result = execute_migration(".", plan=plan)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+
+    def test_cli_exposes_migration_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(["migration", "execute", "--repo", str(repo_path)])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["operation"], "migration-execution")
+        self.assertEqual(payload["status"], "applied")
+
+    def test_cli_accepts_migration_plan_file_for_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            plan_path = repo_path / "migration-plan.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan_path.write_text(json.dumps(generate_migration_plan(repo_path)))
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(["migration", "execute", "--plan", str(plan_path)])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["operation"], "migration-execution")
+        self.assertEqual(payload["status"], "applied")
+
+    def test_mcp_exposes_migration_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+
+            payload = fork_ops_migration_execute(str(repo_path))
+
+        self.assertEqual(payload["operation"], "migration-execution")
+        self.assertEqual(payload["status"], "applied")
 
 
 UPSTREAM_REF_PRESSURE_TEXT = """# Working With Upstream Refs

@@ -17,8 +17,9 @@ The first fully operational implementation target is `track-aware`. `sync-ready`
 
 Migration support should start with read-only migration assessment, non-mutating
 proposed config patches, non-mutating migration plans, and non-mutating dry
-runs. Full migration should later progress through execution after target
-functionality exists.
+runs. Migration execution should apply blocker-free plans through guarded
+operations and verify the resulting capability level before source-material
+removal is available.
 
 ## Capability Levels
 
@@ -61,6 +62,7 @@ functionality exists.
 - Portability hints never block current Fork Ops behavior.
 - Release-channel resolution does not mutate config. Baseline-changing operations update Upstream Tracks or produce evidence artifacts according to policy.
 - Migration assessment, proposed config patch generation, migration plan
-  generation, and migration dry run are non-mutating. Migration execution is
-  unavailable until the corresponding validation surfaces exist.
+  generation, and migration dry run are non-mutating. Migration execution uses
+  guarded operations and preserves retained source materials until replacement
+  validation succeeds.
 - Config writes should use semantic operations by default. Advanced raw writes must validate parse and schema results and expose the proposed diff before mutation.

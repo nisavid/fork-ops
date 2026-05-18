@@ -59,9 +59,24 @@ uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-p
 ```
 
 The dry-run output reports planned file edits, config changes, retained source
-materials, blocked steps, and expected verification commands. It fails closed
-while migration execution is unavailable: blockers remain explicit and no
-config, source material, or branch state is changed.
+materials, blocked steps, and expected verification commands. It does not edit
+config, source material, or branch state.
+
+Migration execution applies a blocker-free migration plan through guarded
+operations. When no plan file is supplied, the CLI generates the current plan
+internally.
+
+```bash
+uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
+uv run --package fork-ops fork-ops migration execute --plan /path/to/migration-plan.json
+```
+
+The current execution slice supports creating `.agents/fork-ops.toml` from the
+validated config proposal, preserving retained source materials, and verifying
+the resulting Fork Ops capability level. It returns structured evidence for
+applied edits, skipped preservation steps, blockers, and verification results.
+It refuses malformed plans, plans with blockers, unsupported edit actions,
+unsafe target paths, and config content that fails parse or validation checks.
 
 ## Migration Lifecycle
 
@@ -72,8 +87,8 @@ config, source material, or branch state is changed.
 
 The implementation supports migration assessment, non-mutating proposed config
 patch generation, non-mutating migration plan generation, and non-mutating
-migration dry run. Execution is unavailable until target functionality exists
-for the material being migrated.
+migration dry run. Migration execution supports guarded config creation and
+capability verification for blocker-free plans.
 
 ## Migration Boundaries
 

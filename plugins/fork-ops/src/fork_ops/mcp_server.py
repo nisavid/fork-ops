@@ -14,6 +14,7 @@ from .core import (
     assess_migration,
     build_status_report,
     dry_run_migration,
+    execute_migration,
     find_config_path,
     generate_migration_plan,
     load_raw_config,
@@ -111,6 +112,15 @@ def fork_ops_migration_dry_run(
 ) -> dict[str, Any]:
     """Preview a migration plan without mutating the repository."""
     return dry_run_migration(repo_path, plan=migration_plan)
+
+
+@_tool
+def fork_ops_migration_execute(
+    repo_path: str = ".",
+    migration_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply a validated migration plan through guarded operations."""
+    return execute_migration(repo_path, plan=migration_plan)
 
 
 @_tool

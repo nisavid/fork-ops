@@ -17,6 +17,8 @@ from .core import (
     create_initial_config_text,
     dry_run_migration,
     dry_run_migration_plan,
+    execute_migration,
+    execute_migration_plan,
     generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
@@ -113,6 +115,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read an existing migration plan JSON file instead of generating one from --repo.",
     )
     dry_run.set_defaults(func=cmd_migration_dry_run)
+    execute = migration_subcommands.add_parser(
+        "execute",
+        help="Apply a validated migration plan through guarded operations.",
+    )
+    execute_source = execute.add_mutually_exclusive_group()
+    execute_source.add_argument("--repo", default=".", help="Repository root to inspect.")
+    execute_source.add_argument(
+        "--plan",
+        help="Read an existing migration plan JSON file instead of generating one from --repo.",
+    )
+    execute.set_defaults(func=cmd_migration_execute)
     propose = migration_subcommands.add_parser(
         "propose-config",
         help="Generate a non-mutating Fork Ops config proposal.",
@@ -249,6 +262,15 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(dry_run_migration(args.repo), indent=2, sort_keys=True))
     return 0
+
+
+def cmd_migration_execute(args: argparse.Namespace) -> int:
+    if args.plan:
+        result = execute_migration_plan(_read_json_plan(args.plan))
+    else:
+        result = execute_migration(args.repo)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["status"] == "applied" else 1
 
 
 def cmd_migration_propose_config(args: argparse.Namespace) -> int:
