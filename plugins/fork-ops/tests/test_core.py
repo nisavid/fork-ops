@@ -12,6 +12,7 @@ from fork_ops.core import (
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
+    schema_json,
 )
 from fork_ops.schema import schema_diagnostics
 
@@ -85,6 +86,13 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertTrue(
             any("'fork_remotes' is a required property" in message for message in messages)
         )
+
+    def test_schema_artifacts_match_runtime_schema(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+        expected = schema_json()
+
+        self.assertEqual((plugin_root / "schema/fork-ops.schema.json").read_text(), expected)
+        self.assertEqual((plugin_root / "src/fork_ops/fork-ops.schema.json").read_text(), expected)
 
     def test_normalize_config_accepts_toml_datetime_values(self) -> None:
         config = parse_config_text(
