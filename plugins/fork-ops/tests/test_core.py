@@ -103,6 +103,40 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         self.assertEqual(normalized["repository"]["created_at"].year, 2026)
 
+    def test_malformed_sections_do_not_crash_diagnostics(self) -> None:
+        config = """schema_version = "0.1"
+repository = "not-a-table"
+fork_remotes = ["not-a-table"]
+upstreams = ["not-a-table"]
+release_channels = ["not-a-table"]
+upstream_tracks = ["not-a-table"]
+local_surfaces = ["not-a-table"]
+
+[authority]
+source_order = ["fork-ops-config"]
+
+[change_targets]
+default = "fork"
+
+[sync_policy]
+default_sync_baseline = "upstream-stable"
+preserve_commit_identity = true
+forbid_history_rewrites = true
+allowed_merge_methods = ["merge"]
+
+[divergence_policy]
+uncertainty_destination = "ask-human-operator"
+"""
+        with tempfile.TemporaryDirectory() as repo:
+            path = Path(repo) / CONFIG_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            path.write_text(config)
+
+            report = build_status_report(repo)
+
+        self.assertEqual(report["config"]["repository"], "not-a-table")
+        self.assertTrue(report["diagnostics"])
+
     def test_unknown_track_release_channel_is_reference_error(self) -> None:
         config = TRACK_AWARE_CONFIG.replace('source = "stable"', 'source = "preview"')
         with tempfile.TemporaryDirectory() as repo:
