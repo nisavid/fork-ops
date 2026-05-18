@@ -371,6 +371,7 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
     origin_slug = _github_slug_from_url(origin_url) or ("OWNER", "REPO")
     upstream_slug = _github_slug_from_url(upstream_url) or ("UPSTREAM_OWNER", "UPSTREAM_REPO")
     default_branch = _default_branch(repo)
+    upstream_default_branch = _upstream_default_branch(repo) or "main"
     upstream_id = _slug_id(upstream_slug[1])
     facts = _flatten_facts(candidates)
     urls = _candidate_urls(repo, candidates)
@@ -393,7 +394,7 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
         "owner": upstream_slug[0],
         "remote": "upstream",
         "push": False,
-        "default_branch": "main",
+        "default_branch": upstream_default_branch,
     }
     if upstream_url:
         upstream_remote["url"] = upstream_url
@@ -689,6 +690,13 @@ def _default_branch(repo: Path) -> str:
         return "main"
     current = _git_output(repo, "branch", "--show-current")
     return current or "main"
+
+
+def _upstream_default_branch(repo: Path) -> str:
+    upstream_head = _git_output(repo, "symbolic-ref", "--short", "refs/remotes/upstream/HEAD")
+    if upstream_head and "/" in upstream_head:
+        return upstream_head.split("/", 1)[1]
+    return ""
 
 
 def _candidate_urls(repo: Path, candidates: list[dict[str, Any]]) -> list[str]:
@@ -1067,7 +1075,8 @@ def _check_remote_url(
     path: str,
     diagnostics: list[Diagnostic],
 ) -> None:
-    name = item.get("remote") or item.get("name")
+    name_field = "remote" if isinstance(item.get("remote"), str) else "name"
+    name = item.get(name_field)
     expected_url = item.get("url")
     if not isinstance(name, str):
         return
@@ -1078,7 +1087,7 @@ def _check_remote_url(
                 severity="warning",
                 code="git.remote_missing",
                 message=f"Configured remote does not exist locally: {name}",
-                path=f"{path}.remote",
+                path=f"{path}.{name_field}",
             )
         )
         return

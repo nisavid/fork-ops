@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,40 @@ class ForkOpsCoreTests(unittest.TestCase):
         codes = [item["code"] for item in report["diagnostics"]]
         self.assertIn("reference.unknown_release_channel", codes)
         self.assertIsNone(report["capability"]["highest_available"])
+
+    def test_git_missing_remote_diagnostics_point_to_config_key(self) -> None:
+        config = TRACK_AWARE_CONFIG.replace('name = "origin"', 'name = "fork-origin"', 1)
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            _run_git(repo_path, "init")
+            path = repo_path / CONFIG_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            path.write_text(config)
+
+            report = build_status_report(repo_path)
+
+        missing_paths = {
+            item["path"] for item in report["diagnostics"] if item["code"] == "git.remote_missing"
+        }
+        self.assertIn("fork_remotes.0.name", missing_paths)
+        self.assertIn("upstreams.0.remote", missing_paths)
+
+    def test_proposed_config_uses_upstream_head_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            _run_git(repo_path, "init")
+            _run_git(repo_path, "remote", "add", "origin", "https://github.com/fork/repo.git")
+            _run_git(repo_path, "remote", "add", "upstream", "https://github.com/up/repo.git")
+            _run_git(
+                repo_path,
+                "symbolic-ref",
+                "refs/remotes/upstream/HEAD",
+                "refs/remotes/upstream/trunk",
+            )
+
+            patch = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(patch["config"]["upstreams"][0]["default_branch"], "trunk")
 
     def test_migration_assessment_extracts_upstream_ref_pressure_case(self) -> None:
         skill_text = UPSTREAM_REF_PRESSURE_TEXT
@@ -315,6 +350,15 @@ Run `git rev-parse <release-tag> upstream-stable origin/upstream-stable` for
 baseline update closeout.
 Run `git merge-base --is-ancestor origin/upstream-stable HEAD` for closeout.
 """
+
+
+def _run_git(repo_path: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
 
 
 if __name__ == "__main__":
