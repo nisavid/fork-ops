@@ -142,6 +142,22 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         self.assertEqual(patch["config"]["upstreams"][0]["default_branch"], "trunk")
 
+    def test_upstream_stable_track_does_not_require_release_channel_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("Use `origin/upstream-stable` as the fork baseline ref.\n")
+
+            patch = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(patch["diagnostics"], [])
+        self.assertEqual(patch["config"]["release_channels"], [])
+        [track] = patch["config"]["upstream_tracks"]
+        self.assertEqual(track["id"], "upstream-stable")
+        self.assertEqual(track["source_type"], "upstream_ref")
+        self.assertEqual(track["source"], "refs/remotes/origin/upstream-stable")
+
     def test_migration_assessment_extracts_upstream_ref_pressure_case(self) -> None:
         skill_text = UPSTREAM_REF_PRESSURE_TEXT
         with tempfile.TemporaryDirectory() as repo:
