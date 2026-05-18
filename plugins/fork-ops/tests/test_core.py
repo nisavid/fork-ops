@@ -74,6 +74,33 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertTrue(report["capability"]["levels"]["track-aware"]["available"])
         self.assertFalse(report["capability"]["levels"]["sync-ready"]["available"])
 
+    def test_sync_ready_requires_safe_boolean_policy_values(self) -> None:
+        config = (
+            TRACK_AWARE_CONFIG
+            + """
+[sync_policy]
+default_sync_baseline = "upstream-stable"
+preserve_commit_identity = false
+forbid_history_rewrites = true
+allowed_merge_methods = ["merge"]
+
+[divergence_policy]
+uncertainty_destination = "ask-human-operator"
+"""
+        )
+        with tempfile.TemporaryDirectory() as repo:
+            path = Path(repo) / CONFIG_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            path.write_text(config)
+
+            report = build_status_report(repo)
+
+        self.assertFalse(report["capability"]["levels"]["sync-ready"]["available"])
+        self.assertIn(
+            "sync_policy.preserve_commit_identity",
+            report["capability"]["levels"]["sync-ready"]["missing"],
+        )
+
     def test_schema_rejects_missing_required_foundation_sections(self) -> None:
         config = parse_config_text('schema_version = "0.1"\n')
 
