@@ -10,6 +10,7 @@ from typing import Any, cast
 from .core import (
     assess_migration,
     build_status_report,
+    find_config_path,
     load_raw_config,
     propose_migration_config_patch,
     schema_json,
@@ -27,11 +28,14 @@ mcp = FastMCP("Fork Ops")
 
 
 @mcp.tool()
-def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[str, Any] | str:
+def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[str, Any]:
     """Read the Fork Ops config for a repository."""
     if normalized:
         return build_status_report(repo_path, include_config=True)
-    return load_raw_config(repo_path)
+    return {
+        "path": str(find_config_path(repo_path)),
+        "raw": load_raw_config(repo_path),
+    }
 
 
 @mcp.tool()
@@ -54,9 +58,12 @@ def fork_ops_capability_report(repo_path: str = ".") -> dict[str, Any]:
 
 
 @mcp.tool()
-def fork_ops_migration_assessment(repo_path: str = ".") -> dict[str, Any]:
+def fork_ops_migration_assessment(
+    repo_path: str = ".",
+    include_proposed_config_patch: bool = False,
+) -> dict[str, Any]:
     """Run a read-only Migration Assessment for fork-related materials."""
-    return assess_migration(repo_path)
+    return assess_migration(repo_path, include_proposed_config_patch=include_proposed_config_patch)
 
 
 @mcp.tool()

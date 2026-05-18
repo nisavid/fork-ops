@@ -83,9 +83,7 @@ def build_status_report(
 ) -> dict[str, Any]:
     repo = Path(repo_path).expanduser().resolve()
     config_file = (
-        Path(config_path).expanduser().resolve()
-        if config_path
-        else find_config_path(repo)
+        Path(config_path).expanduser().resolve() if config_path else find_config_path(repo)
     )
     diagnostics: list[Diagnostic] = []
 
@@ -283,10 +281,13 @@ def git_diagnostics(repo: Path, config: dict[str, Any]) -> list[Diagnostic]:
     return diagnostics
 
 
-def assess_migration(repo_path: str | Path = ".") -> dict[str, Any]:
+def assess_migration(
+    repo_path: str | Path = ".",
+    include_proposed_config_patch: bool = False,
+) -> dict[str, Any]:
     repo = Path(repo_path).expanduser().resolve()
     candidates = _migration_candidates(repo)
-    return {
+    assessment: dict[str, Any] = {
         "repo_path": str(repo),
         "mode": "read-only",
         "summary": {
@@ -294,13 +295,16 @@ def assess_migration(repo_path: str | Path = ".") -> dict[str, Any]:
             "has_fork_ops_config": (repo / CONFIG_RELATIVE_PATH).exists(),
         },
         "candidates": sorted(candidates, key=lambda item: item["path"]),
-        "proposed_config_patch": propose_migration_config_patch(repo, candidates),
         "next_actions": [
             "Review candidates before creating a Migration Plan.",
+            "Generate a proposed config patch only when the migration plan needs one.",
             "Prefer semantic config writes over raw TOML edits.",
             "Run a Migration Dry Run before Migration Execution once those surfaces exist.",
         ],
     }
+    if include_proposed_config_patch:
+        assessment["proposed_config_patch"] = propose_migration_config_patch(repo, candidates)
+    return assessment
 
 
 def propose_migration_config_patch(
@@ -338,8 +342,9 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for path in _iter_candidate_paths(repo):
         rel = path.relative_to(repo).as_posix()
-        text = _read_lower(path)
-        signals = _fork_signals(text)
+        raw_text = _read_text(path)
+        lowered_text = raw_text.lower()
+        signals = _fork_signals(lowered_text)
         if not signals:
             continue
         candidates.append(
@@ -348,7 +353,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
                 "kind": _candidate_kind(rel),
                 "signals": signals,
                 "domains": _candidate_domains(signals),
-                "extracted_facts": _extracted_facts(text),
+                "extracted_facts": _extracted_facts(raw_text),
                 "proposed_destination": _proposed_destination(rel, signals),
                 "portability_hint": _portability_hint(rel, signals),
             }
@@ -373,6 +378,31 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
     product_site = _infer_product_site_url(urls, docs_url)
     context_paths = _required_context_paths(repo)
 
+    fork_remote: dict[str, Any] = {
+        "name": "origin",
+        "push": True,
+        "owner": origin_slug[0],
+        "purpose": "fork-origin",
+    }
+    if origin_url:
+        fork_remote["url"] = origin_url
+
+    upstream_remote: dict[str, Any] = {
+        "id": upstream_id,
+        "name": upstream_slug[1],
+        "owner": upstream_slug[0],
+        "remote": "upstream",
+        "push": False,
+        "default_branch": "main",
+    }
+    if upstream_url:
+        upstream_remote["url"] = upstream_url
+    upstream_push_url = _git_output(repo, "remote", "get-url", "--push", "upstream")
+    if upstream_push_url:
+        upstream_remote["push_url"] = upstream_push_url
+    elif upstream_url:
+        upstream_remote["push_url"] = "DISABLED"
+
     config: dict[str, Any] = {
         "schema_version": "0.1",
         "repository": {
@@ -394,7 +424,6 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
                 "are product-truth sources unless fork-local authority defines a divergence."
             ),
             "inference_labeling": "Label important inferences when direct evidence is unavailable.",
-            "upstream_contribution": "explicit-user-direction-only",
         },
         "change_targets": {
             "default": "fork",
@@ -402,28 +431,8 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
             "upstream_issues": "explicit-only",
             "selective_upstreaming": "explicit-only",
         },
-        "fork_remotes": [
-            {
-                "name": "origin",
-                "url": origin_url,
-                "push": True,
-                "owner": origin_slug[0],
-                "purpose": "fork-origin",
-            }
-        ],
-        "upstreams": [
-            {
-                "id": upstream_id,
-                "name": upstream_slug[1],
-                "owner": upstream_slug[0],
-                "remote": "upstream",
-                "url": upstream_url,
-                "push": False,
-                "push_url": _git_output(repo, "remote", "get-url", "--push", "upstream")
-                or "DISABLED",
-                "default_branch": "main",
-            }
-        ],
+        "fork_remotes": [fork_remote],
+        "upstreams": [upstream_remote],
         "release_channels": [],
         "upstream_tracks": [],
         "sync_policy": {},
@@ -450,10 +459,10 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
         config["upstreams"][0]["docs_url"] = docs_url
 
     fact_values = {(fact["kind"], fact["value"]) for fact in facts}
-    if (
-        ("release_channel", "stable") in fact_values
-        or ("release_channel_source", "github-releases") in fact_values
-    ):
+    if ("release_channel", "stable") in fact_values or (
+        "release_channel_source",
+        "github-releases",
+    ) in fact_values:
         config["release_channels"].append(
             {
                 "id": "stable",
@@ -508,8 +517,7 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
                 "local_branch": "upstream-stable",
                 "tracking_ref": "refs/remotes/origin/upstream-stable",
                 "local_branch_policy": (
-                    "Use local upstream-stable only when maintaining the published "
-                    "stable baseline."
+                    "Use local upstream-stable only when maintaining the published stable baseline."
                 ),
                 "update_policy": (
                     "Advance only for fork sync or fork versioning work that chooses "
@@ -560,6 +568,8 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
                 "patch-equivalent sync without upstream ancestry",
             ],
             "unreleased_upstream_main": "explicit-user-request-only",
+        }
+        config["divergence_policy"] = {
             "uncertainty_destination": "ask-human-operator",
         }
 
@@ -597,31 +607,20 @@ def _proposed_local_surfaces(candidates: list[dict[str, Any]]) -> list[dict[str,
         scope = _repo_ops_candidate_scope(candidate)
         if scope:
             surface["repo_ops_candidate_scope"] = scope
-        surfaces.append(
-            surface
-        )
+        surfaces.append(surface)
     return surfaces
 
 
 def _primary_domain(candidate: dict[str, Any]) -> str:
-    path = str(candidate["path"])
     domains = [str(domain) for domain in candidate["domains"]]
     if not domains:
         return "authority"
-    if path in {"AGENTS.md", "CLAUDE.md"} or "fork-stewardship" in path:
-        return "authority"
-    if "issue-tracker" in path and "review_publication" in domains:
-        return "review_publication"
-    if "working-with-upstream-refs" in path:
-        return "upstream_intelligence"
-    if "research-map" in path and "sync" in domains:
-        return "sync"
     for domain in (
-        "sync",
-        "upstream_intelligence",
-        "authority",
-        "divergence",
         "review_publication",
+        "upstream_intelligence",
+        "sync",
+        "divergence",
+        "authority",
     ):
         if domain in domains:
             return domain
@@ -679,11 +678,7 @@ def _durable_discovery_destinations(repo: Path) -> list[str]:
         "docs/agents/fork-stewardship.md": "fork operating policy",
         "AGENTS.md": "always-loaded high-impact rules",
     }
-    return [
-        f"{path}: {purpose}"
-        for path, purpose in candidates.items()
-        if (repo / path).exists()
-    ]
+    return [f"{path}: {purpose}" for path, purpose in candidates.items() if (repo / path).exists()]
 
 
 def _default_branch(repo: Path) -> str:
@@ -768,9 +763,7 @@ def _infer_product_site_url(urls: list[str], docs_url: str = "") -> str:
 def _is_public_web_url(url: str) -> bool:
     parsed = urlparse(url)
     return (
-        parsed.scheme in {"http", "https"}
-        and parsed.netloc != ""
-        and parsed.netloc != "github.com"
+        parsed.scheme in {"http", "https"} and parsed.netloc != "" and parsed.netloc != "github.com"
     )
 
 
@@ -789,7 +782,7 @@ def _site_root(url: str) -> str:
 
 
 def _extract_urls(text: str) -> list[str]:
-    return [url.rstrip(".,)>") for url in re.findall(r"https?://[^\s<)]+", text)]
+    return [url.rstrip(".,)>`;'\"") for url in re.findall(r"https?://[^\s<)]+", text)]
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -847,12 +840,36 @@ def _toml_value(value: Any) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, str):
-        return json.dumps(value)
+        return _toml_string(value)
     raise ForkOpsError(f"Unsupported TOML value type: {type(value).__name__}")
 
 
+def _toml_string(value: str) -> str:
+    escaped: list[str] = []
+    for char in value:
+        if char == "\b":
+            escaped.append("\\b")
+        elif char == "\t":
+            escaped.append("\\t")
+        elif char == "\n":
+            escaped.append("\\n")
+        elif char == "\f":
+            escaped.append("\\f")
+        elif char == "\r":
+            escaped.append("\\r")
+        elif char == '"':
+            escaped.append('\\"')
+        elif char == "\\":
+            escaped.append("\\\\")
+        elif ord(char) <= 0x1F or ord(char) == 0x7F:
+            escaped.append(f"\\u{ord(char):04X}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
 def _is_array_of_tables(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    return bool(value) and isinstance(value, list) and all(isinstance(item, dict) for item in value)
 
 
 def create_initial_config_text(
@@ -867,64 +884,78 @@ def create_initial_config_text(
     origin_url = _git_output(repo, "remote", "get-url", "origin") or ""
     upstream_url = _git_output(repo, "remote", "get-url", "upstream") or ""
     upstream_id = _slug_id(upstream_name)
-    upstream_canon = (
-        "Upstream source and docs are canonical unless fork-local authority defines a "
-        "divergence."
+    fork_remote: dict[str, Any] = {
+        "name": "origin",
+        "push": True,
+    }
+    if origin_url:
+        fork_remote["url"] = origin_url
+    upstream: dict[str, Any] = {
+        "id": upstream_id,
+        "name": upstream_name,
+        "owner": upstream_owner,
+        "remote": "upstream",
+        "default_branch": default_branch,
+        "push": False,
+    }
+    if upstream_url:
+        upstream["url"] = upstream_url
+    return _toml_dumps(
+        {
+            "schema_version": "0.1",
+            "repository": {
+                "host": "github",
+                "owner": repository_owner,
+                "name": repository_name,
+                "default_branch": default_branch,
+                "protected_branches": [default_branch],
+            },
+            "authority": {
+                "source_order": ["fork-ops-config", "repo-docs", "upstream-docs", "live-state"],
+                "upstream_canon": (
+                    "Upstream source and docs are canonical unless fork-local authority "
+                    "defines a divergence."
+                ),
+                "inference_labeling": (
+                    "Label inferred conclusions when direct evidence is unavailable."
+                ),
+            },
+            "change_targets": {
+                "default": "fork",
+                "upstream_contribution": "explicit-only",
+            },
+            "fork_remotes": [fork_remote],
+            "upstreams": [upstream],
+            "release_channels": [
+                {
+                    "id": "stable",
+                    "upstream": upstream_id,
+                    "kind": "github_latest_release",
+                    "include_prereleases": False,
+                }
+            ],
+            "upstream_tracks": [
+                {
+                    "id": "upstream-stable",
+                    "upstream": upstream_id,
+                    "ref": "refs/remotes/origin/upstream-stable",
+                    "source_type": "release_channel",
+                    "source": "stable",
+                    "owner_remote": "origin",
+                    "update_policy": "manual",
+                    "sync_eligible": True,
+                }
+            ],
+            "local_surfaces": [
+                {
+                    "kind": "config",
+                    "path": ".agents/fork-ops.toml",
+                    "domain": "identity",
+                    "portability_hint": "fork-specific",
+                }
+            ],
+        }
     )
-    return f'''schema_version = "0.1"
-
-[repository]
-host = "github"
-owner = "{repository_owner}"
-name = "{repository_name}"
-default_branch = "{default_branch}"
-protected_branches = ["{default_branch}"]
-
-[authority]
-source_order = ["fork-ops-config", "repo-docs", "upstream-docs", "live-state"]
-upstream_canon = "{upstream_canon}"
-inference_labeling = "Label inferred conclusions when direct evidence is unavailable."
-
-[change_targets]
-default = "fork"
-upstream_contribution = "explicit-only"
-
-[[fork_remotes]]
-name = "origin"
-url = "{origin_url}"
-push = true
-
-[[upstreams]]
-id = "{upstream_id}"
-name = "{upstream_name}"
-owner = "{upstream_owner}"
-remote = "upstream"
-url = "{upstream_url}"
-default_branch = "{default_branch}"
-push = false
-
-[[release_channels]]
-id = "stable"
-upstream = "{upstream_id}"
-kind = "github_latest_release"
-include_prereleases = false
-
-[[upstream_tracks]]
-id = "upstream-stable"
-upstream = "{upstream_id}"
-ref = "refs/remotes/origin/upstream-stable"
-source_type = "release_channel"
-source = "stable"
-owner_remote = "origin"
-update_policy = "manual"
-sync_eligible = true
-
-[[local_surfaces]]
-kind = "config"
-path = ".agents/fork-ops.toml"
-domain = "identity"
-portability_hint = "fork-specific"
-'''
 
 
 def schema_json() -> str:
@@ -999,16 +1030,14 @@ def _path_has_value(config: dict[str, Any], dotted_path: str) -> bool:
         current = current[part]
     if current is None:
         return False
-    if isinstance(current, (str, list, dict)) and not current:
+    if isinstance(current, str | list | dict) and not current:
         return False
     return True
 
 
 def _ids(items: list[dict[str, Any]]) -> set[str]:
     return {
-        item["id"]
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        item["id"] for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
 
 
@@ -1187,8 +1216,11 @@ def _candidate_domains(signals: list[str]) -> list[str]:
 
 
 def _extracted_facts(text: str) -> list[dict[str, str]]:
+    lowered_text = text.lower()
     facts: list[dict[str, str]] = []
-    refs = sorted(set(re.findall(r"`([^`]*(?:upstream|origin/upstream)[^`]*)`", text)))
+    refs = sorted(
+        set(re.findall(r"`([^`]*(?:upstream|origin/upstream)[^`]*)`", text, re.IGNORECASE))
+    )
     for ref in refs:
         if _looks_like_ref_role(ref):
             facts.append(
@@ -1199,7 +1231,7 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
                 }
             )
 
-    if "github releases" in text or "gh release list" in text:
+    if "github releases" in lowered_text or "gh release list" in lowered_text:
         facts.append(
             {
                 "kind": "release_channel_source",
@@ -1208,7 +1240,11 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    if "stable release" in text or "latest stable" in text or "exclude-pre-releases" in text:
+    if (
+        "stable release" in lowered_text
+        or "latest stable" in lowered_text
+        or "exclude-pre-releases" in lowered_text
+    ):
         facts.append(
             {
                 "kind": "release_channel",
@@ -1217,15 +1253,11 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    if "origin/upstream-stable" in text and "default upstream baseline" in text:
-        facts.append(
-            {
-                "kind": "default_sync_baseline",
-                "value": "origin/upstream-stable",
-                "suggested_config": "sync_policy.default_sync_baseline",
-            }
-        )
-    elif "origin/upstream-stable" in text and "default" in text and "baseline" in text:
+    if (
+        "origin/upstream-stable" in lowered_text
+        and "default" in lowered_text
+        and "baseline" in lowered_text
+    ):
         facts.append(
             {
                 "kind": "default_sync_baseline",
@@ -1235,9 +1267,9 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
         )
 
     if (
-        "push url `disabled`" in text
-        or "push url is disabled" in text
-        or "push url disabled" in text
+        "push url `disabled`" in lowered_text
+        or "push url is disabled" in lowered_text
+        or "push url disabled" in lowered_text
     ):
         facts.append(
             {
@@ -1247,7 +1279,7 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    if "force-push" in text or "do not force-push" in text:
+    if "force-push" in lowered_text:
         facts.append(
             {
                 "kind": "forbidden_history_rewrite",
@@ -1256,7 +1288,7 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    if "merge-base --is-ancestor" in text:
+    if "merge-base --is-ancestor" in lowered_text:
         facts.append(
             {
                 "kind": "ancestry_check",
@@ -1267,20 +1299,14 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
 
     for url in _extract_urls(text):
         slug = _github_repo_root_slug_from_url(url)
-        if slug == ("nisavid", "lemonade"):
+        remote_name = _remote_name_for_url_context(text, url)
+        if slug and remote_name:
+            suggested_config = "fork_remotes.url" if remote_name == "origin" else "upstreams.url"
             facts.append(
                 {
                     "kind": "remote_url",
-                    "value": f"origin:{url}",
-                    "suggested_config": "fork_remotes.url",
-                }
-            )
-        elif slug == ("lemonade-sdk", "lemonade"):
-            facts.append(
-                {
-                    "kind": "remote_url",
-                    "value": f"upstream:{url}",
-                    "suggested_config": "upstreams.url",
+                    "value": f"{remote_name}:{url}",
+                    "suggested_config": suggested_config,
                 }
             )
 
@@ -1288,11 +1314,24 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
 
 
 def _looks_like_ref_role(ref: str) -> bool:
+    normalized = ref.lower()
     return (
-        ref.startswith("upstream/")
-        or ref.startswith("origin/upstream-")
-        or ref in {"upstream-main", "upstream-stable"}
+        normalized.startswith("upstream/")
+        or normalized.startswith("origin/upstream-")
+        or normalized in {"upstream-main", "upstream-stable"}
     )
+
+
+def _remote_name_for_url_context(text: str, url: str) -> str:
+    for line in text.splitlines():
+        if url not in line:
+            continue
+        lowered = line.lower()
+        if "upstream" in lowered:
+            return "upstream"
+        if "origin" in lowered or "fork" in lowered:
+            return "origin"
+    return ""
 
 
 def _unique_facts(facts: list[dict[str, str]]) -> list[dict[str, str]]:
