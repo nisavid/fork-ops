@@ -18,7 +18,6 @@ from .core import (
     dry_run_migration,
     dry_run_migration_plan,
     execute_migration,
-    execute_migration_plan,
     generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
@@ -119,9 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         "execute",
         help="Apply a validated migration plan through guarded operations.",
     )
-    execute_source = execute.add_mutually_exclusive_group()
-    execute_source.add_argument("--repo", default=".", help="Repository root to inspect.")
-    execute_source.add_argument(
+    execute.add_argument("--repo", help="Repository root to inspect or confirm.")
+    execute.add_argument(
         "--plan",
         help="Read an existing migration plan JSON file instead of generating one from --repo.",
     )
@@ -266,9 +264,9 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
 
 def cmd_migration_execute(args: argparse.Namespace) -> int:
     if args.plan:
-        result = execute_migration_plan(_read_json_plan(args.plan))
+        result = execute_migration(args.repo or Path.cwd(), plan=_read_json_plan(args.plan))
     else:
-        result = execute_migration(args.repo)
+        result = execute_migration(args.repo or ".")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "applied" else 1
 
