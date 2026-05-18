@@ -1,0 +1,45 @@
+{
+  "name": "fork-ops",
+  "version": "0.1.0",
+  "description": "Agentic operations for maintained repository forks.",
+  "author": {
+    "name": "nisavid",
+    "email": "nisavid@users.noreply.github.com",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/fork-ops",
+  "repository": "https://github.com/nisavid/fork-ops",
+  "license": "MIT",
+  "keywords": [
+    "forks",
+    "repository-operations",
+    "agentic-ops"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Fork Ops",
+    "shortDescription": "Operate maintained forks from checked-in fork authority.",
+    "longDescription": "Fork Ops provides Codex skills, CLI commands, and an MCP server for discovering fork-local authority, validating .agents/fork-ops.toml, reporting fork capability levels, and assessing migration from existing fork-related materials.",
+    "developerName": "nisavid",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/nisavid/fork-ops",
+    "privacyPolicyURL": "https://github.com/nisavid/fork-ops",
+    "termsOfServiceURL": "https://github.com/nisavid/fork-ops",
+    "defaultPrompt": [
+      "Assess this fork for Fork Ops readiness.",
+      "Validate .agents/fork-ops.toml.",
+      "Find fork guidance to migrate."
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.svg",
+    "screenshots": []
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "fork-ops",
+  "interface": {
+    "displayName": "Fork Ops"
+  },
+  "plugins": [
+    {
+      "name": "fork-ops",
+      "source": {
+        "source": "local",
+        "path": "./plugins/fork-ops"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

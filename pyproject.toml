@@ -1,0 +1,42 @@
+[project]
+name = "fork-ops-workspace"
+version = "0.1.0"
+description = "Workspace configuration for Fork Ops."
+requires-python = ">=3.11"
+dependencies = [
+  "fork-ops[mcp]"
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18",
+  "pytest>=8.0",
+  "ruff>=0.14",
+  "types-jsonschema>=4.25"
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.uv.sources]
+fork-ops = { workspace = true }
+
+[tool.uv.workspace]
+members = ["plugins/fork-ops"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["plugins/fork-ops/src", "plugins/fork-ops/tests"]
+cache-dir = ".ruff_cache"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "plugins/fork-ops/src"
+files = ["plugins/fork-ops/src", "plugins/fork-ops/tests"]
+cache_dir = ".mypy_cache"

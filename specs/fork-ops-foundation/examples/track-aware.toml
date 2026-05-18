@@ -1,0 +1,59 @@
+schema_version = "0.1"
+
+[repository]
+host = "github"
+owner = "nisavid"
+name = "lemonade"
+default_branch = "main"
+protected_branches = ["main"]
+
+[authority]
+source_order = ["fork-ops-config", "repo-docs", "upstream-docs", "live-state"]
+upstream_canon = "Upstream source and docs are canonical unless fork-local authority defines a divergence."
+inference_labeling = "Label inferred conclusions when direct evidence is unavailable."
+
+[change_targets]
+default = "fork"
+upstream_contribution = "explicit-only"
+
+[[fork_remotes]]
+name = "origin"
+url = "https://github.com/nisavid/lemonade.git"
+push = true
+
+[[upstreams]]
+id = "lemonade"
+name = "lemonade"
+owner = "lemonade-sdk"
+remote = "upstream"
+url = "https://github.com/lemonade-sdk/lemonade.git"
+default_branch = "main"
+push = false
+
+[[release_channels]]
+id = "stable"
+upstream = "lemonade"
+kind = "github_latest_release"
+include_prereleases = false
+
+[[upstream_tracks]]
+id = "upstream-stable"
+upstream = "lemonade"
+ref = "refs/remotes/origin/upstream-stable"
+source_type = "release_channel"
+source = "stable"
+owner_remote = "origin"
+update_policy = "manual"
+sync_eligible = true
+
+[[local_surfaces]]
+kind = "config"
+path = ".agents/fork-ops.toml"
+domain = "identity"
+portability_hint = "fork-specific"
+
+[[local_surfaces]]
+kind = "doc"
+path = "docs/agents/fork-stewardship.md"
+domain = "authority"
+portability_hint = "fork-specific"

@@ -1,0 +1,1357 @@
+"""Fork Ops config loading, validation, reporting, and migration assessment."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import tomllib
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, cast
+
+from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
+
+CONFIG_RELATIVE_PATH = Path(".agents/fork-ops.toml")
+
+
+class ForkOpsError(RuntimeError):
+    """Base error for expected Fork Ops failures."""
+
+
+def find_config_path(repo_path: str | Path = ".") -> Path:
+    return Path(repo_path).expanduser().resolve() / CONFIG_RELATIVE_PATH
+
+
+def load_raw_config(repo_path: str | Path = ".", config_path: str | Path | None = None) -> str:
+    path = Path(config_path).expanduser().resolve() if config_path else find_config_path(repo_path)
+    try:
+        return path.read_text()
+    except FileNotFoundError as exc:
+        raise ForkOpsError(f"Fork Ops config not found: {path}") from exc
+
+
+def parse_config_text(raw: str) -> dict[str, Any]:
+    try:
+        parsed = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as exc:
+        raise ForkOpsError(f"Fork Ops config TOML parse failed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ForkOpsError("Fork Ops config must parse to a TOML table.")
+    return parsed
+
+
+def load_config(
+    repo_path: str | Path = ".",
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    return parse_config_text(load_raw_config(repo_path, config_path))
+
+
+def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = cast(dict[str, Any], json.loads(json.dumps(config)))
+    repository = normalized.setdefault("repository", {})
+    if repository.get("owner") and repository.get("name"):
+        repository.setdefault("slug", f"{repository['owner']}/{repository['name']}")
+    for key in (
+        "fork_remotes",
+        "upstreams",
+        "release_channels",
+        "upstream_tracks",
+        "local_surfaces",
+    ):
+        normalized.setdefault(key, [])
+    for key in (
+        "authority",
+        "change_targets",
+        "sync_policy",
+        "divergence_policy",
+        "review_policy",
+        "publication_policy",
+        "local_gates",
+        "portability",
+    ):
+        normalized.setdefault(key, {})
+    return normalized
+
+
+def build_status_report(
+    repo_path: str | Path = ".",
+    config_path: str | Path | None = None,
+    include_config: bool = True,
+) -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    config_file = (
+        Path(config_path).expanduser().resolve()
+        if config_path
+        else find_config_path(repo)
+    )
+    diagnostics: list[Diagnostic] = []
+
+    if not config_file.exists():
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                code="config.missing",
+                message=f"Fork Ops config not found at {config_file}",
+                path=str(CONFIG_RELATIVE_PATH),
+            )
+        )
+        return {
+            "repo_path": str(repo),
+            "config_path": str(config_file),
+            "config_exists": False,
+            "capability": capability_report({}, diagnostics),
+            "diagnostics": [item.to_dict() for item in diagnostics],
+        }
+
+    try:
+        config = parse_config_text(config_file.read_text())
+    except ForkOpsError as exc:
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                code="config.parse_failed",
+                message=str(exc),
+                path=str(CONFIG_RELATIVE_PATH),
+            )
+        )
+        return {
+            "repo_path": str(repo),
+            "config_path": str(config_file),
+            "config_exists": True,
+            "capability": capability_report({}, diagnostics),
+            "diagnostics": [item.to_dict() for item in diagnostics],
+        }
+
+    normalized = normalize_config(config)
+    diagnostics.extend(schema_diagnostics(normalized))
+    diagnostics.extend(reference_diagnostics(normalized))
+    diagnostics.extend(git_diagnostics(repo, normalized))
+
+    payload: dict[str, Any] = {
+        "repo_path": str(repo),
+        "config_path": str(config_file),
+        "config_exists": True,
+        "schema_version": normalized.get("schema_version"),
+        "capability": capability_report(normalized, diagnostics),
+        "diagnostics": [item.to_dict() for item in diagnostics],
+    }
+    if include_config:
+        payload["config"] = normalized
+    return payload
+
+
+def capability_report(
+    config: dict[str, Any],
+    diagnostics: Iterable[Diagnostic] | None = None,
+) -> dict[str, Any]:
+    diagnostics = list(diagnostics or [])
+    blocking_errors = [item for item in diagnostics if item.severity == "error"]
+    levels: dict[str, Any] = {}
+    highest: str | None = None
+
+    for level in CAPABILITY_LEVELS:
+        missing = list(_missing_requirements(config, level))
+        if blocking_errors:
+            available = False
+        else:
+            available = not missing
+        levels[level] = {
+            "available": available,
+            "missing": missing,
+            "enables": _level_enables(level),
+        }
+        if available:
+            highest = level
+
+    return {
+        "highest_available": highest,
+        "levels": levels,
+    }
+
+
+def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    upstream_ids = _ids(config.get("upstreams", []))
+    release_channel_ids = _ids(config.get("release_channels", []))
+    track_ids = _ids(config.get("upstream_tracks", []))
+
+    diagnostics.extend(_duplicate_id_diagnostics("upstreams", config.get("upstreams", [])))
+    diagnostics.extend(
+        _duplicate_id_diagnostics("release_channels", config.get("release_channels", []))
+    )
+    diagnostics.extend(
+        _duplicate_id_diagnostics("upstream_tracks", config.get("upstream_tracks", []))
+    )
+
+    for index, channel in enumerate(config.get("release_channels", [])):
+        upstream = channel.get("upstream")
+        if upstream and upstream not in upstream_ids:
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    code="reference.unknown_upstream",
+                    message=(
+                        f"Release channel '{channel.get('id')}' references unknown "
+                        f"upstream '{upstream}'."
+                    ),
+                    path=f"release_channels.{index}.upstream",
+                )
+            )
+
+    for index, track in enumerate(config.get("upstream_tracks", [])):
+        upstream = track.get("upstream")
+        if upstream and upstream not in upstream_ids:
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    code="reference.unknown_upstream",
+                    message=(
+                        f"Upstream Track '{track.get('id')}' references unknown "
+                        f"upstream '{upstream}'."
+                    ),
+                    path=f"upstream_tracks.{index}.upstream",
+                )
+            )
+        if (
+            track.get("source_type") == "release_channel"
+            and track.get("source") not in release_channel_ids
+        ):
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    code="reference.unknown_release_channel",
+                    message=(
+                        f"Upstream Track '{track.get('id')}' references unknown release channel "
+                        f"'{track.get('source')}'."
+                    ),
+                    path=f"upstream_tracks.{index}.source",
+                )
+            )
+
+    default_baseline = config.get("sync_policy", {}).get("default_sync_baseline")
+    if default_baseline and default_baseline not in track_ids:
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                code="reference.unknown_upstream_track",
+                message=(
+                    "sync_policy.default_sync_baseline references unknown "
+                    f"Upstream Track '{default_baseline}'."
+                ),
+                path="sync_policy.default_sync_baseline",
+            )
+        )
+
+    return diagnostics
+
+
+def git_diagnostics(repo: Path, config: dict[str, Any]) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    if not _git_ok(repo, "rev-parse", "--is-inside-work-tree"):
+        diagnostics.append(
+            Diagnostic(
+                severity="warning",
+                code="git.unavailable",
+                message=f"{repo} is not available as a Git worktree for live checks.",
+            )
+        )
+        return diagnostics
+
+    for index, remote in enumerate(config.get("fork_remotes", [])):
+        _check_remote_url(repo, remote, f"fork_remotes.{index}", diagnostics)
+    for index, upstream in enumerate(config.get("upstreams", [])):
+        _check_remote_url(repo, upstream, f"upstreams.{index}", diagnostics)
+    for index, track in enumerate(config.get("upstream_tracks", [])):
+        ref = track.get("ref")
+        if (
+            isinstance(ref, str)
+            and ref.startswith("refs/")
+            and not _git_ok(repo, "show-ref", "--verify", ref)
+        ):
+            diagnostics.append(
+                Diagnostic(
+                    severity="warning",
+                    code="git.ref_missing",
+                    message=f"Configured Upstream Track ref does not exist locally: {ref}",
+                    path=f"upstream_tracks.{index}.ref",
+                )
+            )
+
+    return diagnostics
+
+
+def assess_migration(repo_path: str | Path = ".") -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    candidates = _migration_candidates(repo)
+    return {
+        "repo_path": str(repo),
+        "mode": "read-only",
+        "summary": {
+            "candidate_count": len(candidates),
+            "has_fork_ops_config": (repo / CONFIG_RELATIVE_PATH).exists(),
+        },
+        "candidates": sorted(candidates, key=lambda item: item["path"]),
+        "proposed_config_patch": propose_migration_config_patch(repo, candidates),
+        "next_actions": [
+            "Review candidates before creating a Migration Plan.",
+            "Prefer semantic config writes over raw TOML edits.",
+            "Run a Migration Dry Run before Migration Execution once those surfaces exist.",
+        ],
+    }
+
+
+def propose_migration_config_patch(
+    repo_path: str | Path = ".",
+    candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    migration_candidates = candidates if candidates is not None else _migration_candidates(repo)
+    proposed_config = _build_proposed_config(repo, migration_candidates)
+    toml = _toml_dumps(proposed_config)
+    parsed = parse_config_text(toml)
+    diagnostics = schema_diagnostics(parsed) + reference_diagnostics(normalize_config(parsed))
+    return {
+        "mode": "non-mutating",
+        "purpose": "Migration Plan input",
+        "target_path": str(CONFIG_RELATIVE_PATH),
+        "operation": "create" if not find_config_path(repo).exists() else "review-and-merge",
+        "requires_review": True,
+        "config": proposed_config,
+        "toml": toml,
+        "diagnostics": [item.to_dict() for item in diagnostics],
+        "evidence": _proposal_evidence(migration_candidates),
+        "limitations": [
+            "This deterministic proposal is not a Migration Execution.",
+            "Review against source materials before applying.",
+            (
+                "Escalate to an LLM-based migration planner if important source "
+                "semantics are not represented."
+            ),
+        ],
+    }
+
+
+def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for path in _iter_candidate_paths(repo):
+        rel = path.relative_to(repo).as_posix()
+        text = _read_lower(path)
+        signals = _fork_signals(text)
+        if not signals:
+            continue
+        candidates.append(
+            {
+                "path": rel,
+                "kind": _candidate_kind(rel),
+                "signals": signals,
+                "domains": _candidate_domains(signals),
+                "extracted_facts": _extracted_facts(text),
+                "proposed_destination": _proposed_destination(rel, signals),
+                "portability_hint": _portability_hint(rel, signals),
+            }
+        )
+    return sorted(candidates, key=lambda item: item["path"])
+
+
+def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    origin_url = _git_output(repo, "remote", "get-url", "origin") or _find_remote_url(
+        candidates, "origin"
+    )
+    upstream_url = _git_output(repo, "remote", "get-url", "upstream") or _find_remote_url(
+        candidates, "upstream"
+    )
+    origin_slug = _github_slug_from_url(origin_url) or ("OWNER", "REPO")
+    upstream_slug = _github_slug_from_url(upstream_url) or ("UPSTREAM_OWNER", "UPSTREAM_REPO")
+    default_branch = _default_branch(repo)
+    upstream_id = _slug_id(upstream_slug[1])
+    facts = _flatten_facts(candidates)
+    urls = _candidate_urls(repo, candidates)
+    product_site = _first_matching_url(urls, "lemonade-server.ai", exclude="/docs")
+    docs_url = _first_matching_url(urls, "lemonade-server.ai/docs")
+    context_paths = _required_context_paths(repo)
+
+    config: dict[str, Any] = {
+        "schema_version": "0.1",
+        "repository": {
+            "host": "github",
+            "owner": origin_slug[0],
+            "name": origin_slug[1],
+            "default_branch": default_branch,
+        },
+        "authority": {
+            "source_order": [
+                "explicit-user-direction",
+                "current-upstream-source-website-docs-release-notes-maintainer-guidance",
+                "fork-local-agents-context-docs-agents",
+                "source-structure-and-tests-inference",
+                "prior-agent-notes-after-current-state-check",
+            ],
+            "upstream_canon": (
+                "Upstream source, website, docs, release notes, and maintainer guidance "
+                "are product-truth sources unless fork-local authority defines a divergence."
+            ),
+            "inference_labeling": "Label important inferences when direct evidence is unavailable.",
+            "upstream_contribution": "explicit-user-direction-only",
+        },
+        "change_targets": {
+            "default": "fork",
+            "upstream_contribution": "explicit-only",
+            "upstream_issues": "explicit-only",
+            "selective_upstreaming": "explicit-only",
+        },
+        "fork_remotes": [
+            {
+                "name": "origin",
+                "url": origin_url,
+                "push": True,
+                "owner": origin_slug[0],
+                "purpose": "fork-origin",
+            }
+        ],
+        "upstreams": [
+            {
+                "id": upstream_id,
+                "name": upstream_slug[1],
+                "owner": upstream_slug[0],
+                "remote": "upstream",
+                "url": upstream_url,
+                "push": False,
+                "push_url": _git_output(repo, "remote", "get-url", "--push", "upstream")
+                or "DISABLED",
+                "default_branch": "main",
+            }
+        ],
+        "release_channels": [],
+        "upstream_tracks": [],
+        "sync_policy": {},
+        "local_surfaces": _proposed_local_surfaces(candidates),
+    }
+    if context_paths:
+        config["authority"]["required_context_paths"] = context_paths
+        config["authority"]["pre_change_requirements"] = [
+            (
+                "For non-trivial changes, read required_context_paths before specs, "
+                "plans, or implementation."
+            ),
+            "Identify relevant upstream docs and source paths.",
+            "Verify current upstream state when drift could affect the task.",
+            "Record durable discoveries in the narrowest useful place.",
+        ]
+        durable_destinations = _durable_discovery_destinations(repo)
+        if durable_destinations:
+            config["authority"]["durable_discovery_destinations"] = durable_destinations
+    if product_site:
+        config["repository"]["product_site"] = product_site
+        config["upstreams"][0]["site_url"] = product_site
+    if docs_url:
+        config["upstreams"][0]["docs_url"] = docs_url
+
+    fact_values = {(fact["kind"], fact["value"]) for fact in facts}
+    if (
+        ("release_channel", "stable") in fact_values
+        or ("release_channel_source", "github-releases") in fact_values
+    ):
+        config["release_channels"].append(
+            {
+                "id": "stable",
+                "upstream": upstream_id,
+                "kind": "github_latest_release",
+                "selection_source": "github-releases",
+                "include_drafts": False,
+                "include_prereleases": False,
+                "notes": "Choose from live GitHub Releases, not tag sorting.",
+            }
+        )
+
+    if _has_any_fact(fact_values, "ref_role", {"origin/upstream-main", "upstream-main"}):
+        config["upstream_tracks"].append(
+            {
+                "id": "upstream-main",
+                "upstream": upstream_id,
+                "ref": "refs/remotes/origin/upstream-main",
+                "role": "shared upstream main scouting baseline",
+                "source_type": "upstream_ref",
+                "source": "refs/remotes/upstream/main",
+                "source_ref": "refs/remotes/upstream/main",
+                "owner_remote": "origin",
+                "local_branch": "upstream-main",
+                "tracking_ref": "refs/remotes/upstream/main",
+                "update_policy": (
+                    "Update and push when a task depends on a shared current view "
+                    "of upstream main, including upstream commit investigations, "
+                    "proactive sync estimates, handoffs, issues, or PR descriptions."
+                ),
+                "evidence_checks": [
+                    "git rev-parse upstream/main upstream-main origin/upstream-main",
+                ],
+                "sync_eligible": False,
+                "notes": (
+                    "Use for unreleased changes and scouting unless explicitly "
+                    "syncing upstream main."
+                ),
+            }
+        )
+
+    if _has_any_fact(fact_values, "ref_role", {"origin/upstream-stable", "upstream-stable"}):
+        config["upstream_tracks"].append(
+            {
+                "id": "upstream-stable",
+                "upstream": upstream_id,
+                "ref": "refs/remotes/origin/upstream-stable",
+                "role": "stable upstream release baseline",
+                "source_type": "release_channel",
+                "source": "stable",
+                "owner_remote": "origin",
+                "local_branch": "upstream-stable",
+                "tracking_ref": "refs/remotes/origin/upstream-stable",
+                "local_branch_policy": (
+                    "Use local upstream-stable only when maintaining the published "
+                    "stable baseline."
+                ),
+                "update_policy": (
+                    "Advance only for fork sync or fork versioning work that chooses "
+                    "a new stable upstream release baseline."
+                ),
+                "non_fast_forward_policy": (
+                    "If the selected release tag is not a fast-forward from the "
+                    "published baseline, stop and ask whether to move the baseline."
+                ),
+                "evidence_checks": [
+                    "git rev-parse <release-tag> upstream-stable origin/upstream-stable",
+                ],
+                "sync_eligible": True,
+                "notes": (
+                    "Published stable upstream baseline for sync and fork release "
+                    "versioning. Do not advance just because a new tag exists."
+                ),
+            }
+        )
+
+    if ("default_sync_baseline", "origin/upstream-stable") in fact_values:
+        config["sync_policy"] = {
+            "default_sync_baseline": "upstream-stable",
+            "default_sync_ref": "origin/upstream-stable",
+            "fork_sync_start_ref": f"origin/{default_branch}",
+            "preserve_commit_identity": True,
+            "forbid_history_rewrites": True,
+            "allowed_merge_methods": ["merge", "ff-only"],
+            "fork_sync_methods": ["merge"],
+            "track_update_methods": ["ff-only"],
+            "ancestry_checks": [
+                "git merge-base --is-ancestor origin/upstream-stable HEAD",
+            ],
+            "conditional_ancestry_checks": [
+                (
+                    "user-requested upstream main sync: "
+                    "git merge-base --is-ancestor upstream/main HEAD"
+                ),
+            ],
+            "pre_sync_fetches": [
+                "git fetch origin",
+                "git fetch upstream --prune --tags",
+            ],
+            "forbidden_flows": [
+                "rebase upstream commits",
+                "force-push routine baseline updates",
+                "gh repo sync --force",
+                "patch-equivalent sync without upstream ancestry",
+            ],
+            "unreleased_upstream_main": "explicit-user-request-only",
+            "uncertainty_destination": "ask-human-operator",
+        }
+
+    return config
+
+
+def _proposal_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence = []
+    for candidate in candidates:
+        if not candidate["extracted_facts"]:
+            continue
+        evidence.append(
+            {
+                "path": candidate["path"],
+                "domains": candidate["domains"],
+                "facts": candidate["extracted_facts"],
+            }
+        )
+    return evidence
+
+
+def _proposed_local_surfaces(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    surfaces = []
+    for candidate in candidates:
+        domains = candidate["domains"]
+        surface = {
+            "kind": candidate["kind"],
+            "path": candidate["path"],
+            "domain": _primary_domain(candidate),
+            "domains": domains,
+            "portability_hint": candidate["portability_hint"],
+            "portability_hints": _portability_hints(candidate),
+            "notes": "Migration Assessment candidate; review before replacing source material.",
+        }
+        scope = _repo_ops_candidate_scope(candidate)
+        if scope:
+            surface["repo_ops_candidate_scope"] = scope
+        surfaces.append(
+            surface
+        )
+    return surfaces
+
+
+def _primary_domain(candidate: dict[str, Any]) -> str:
+    path = str(candidate["path"])
+    domains = [str(domain) for domain in candidate["domains"]]
+    if not domains:
+        return "authority"
+    if path in {"AGENTS.md", "CLAUDE.md"} or "fork-stewardship" in path:
+        return "authority"
+    if "issue-tracker" in path and "review_publication" in domains:
+        return "review_publication"
+    if "working-with-upstream-refs" in path:
+        return "upstream_intelligence"
+    if "research-map" in path and "sync" in domains:
+        return "sync"
+    for domain in (
+        "sync",
+        "upstream_intelligence",
+        "authority",
+        "divergence",
+        "review_publication",
+    ):
+        if domain in domains:
+            return domain
+    return domains[0]
+
+
+def _portability_hints(candidate: dict[str, Any]) -> list[str]:
+    hints = [str(candidate["portability_hint"])]
+    signals = set(candidate["signals"])
+    if _has_review_publication_signal(signals) and "repo-ops-candidate" not in hints:
+        hints.append("repo-ops-candidate")
+    if _has_fork_specific_signal(signals) and "fork-specific" not in hints:
+        hints.append("fork-specific")
+    return hints
+
+
+def _repo_ops_candidate_scope(candidate: dict[str, Any]) -> str:
+    signals = set(candidate["signals"])
+    if not _has_review_publication_signal(signals):
+        return ""
+    if _has_fork_specific_signal(signals):
+        return "partial review/publication workflow; preserve fork-specific policy here."
+    return "review/publication workflow."
+
+
+def _flatten_facts(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+    facts: list[dict[str, str]] = []
+    for candidate in candidates:
+        facts.extend(candidate["extracted_facts"])
+    return _unique_facts(facts)
+
+
+def _has_any_fact(
+    fact_values: set[tuple[str, str]],
+    kind: str,
+    values: set[str],
+) -> bool:
+    return any((kind, value) in fact_values for value in values)
+
+
+def _required_context_paths(repo: Path) -> list[str]:
+    candidates = [
+        "AGENTS.md",
+        "CONTEXT.md",
+        "docs/agents/domain.md",
+        "docs/agents/research-map.md",
+    ]
+    return [path for path in candidates if (repo / path).exists()]
+
+
+def _durable_discovery_destinations(repo: Path) -> list[str]:
+    candidates = {
+        "CONTEXT.md": "stable vocabulary and relationships",
+        "docs/agents/research-map.md": "source maps and scout routes",
+        "docs/agents/fork-stewardship.md": "fork operating policy",
+        "AGENTS.md": "always-loaded high-impact rules",
+    }
+    return [
+        f"{path}: {purpose}"
+        for path, purpose in candidates.items()
+        if (repo / path).exists()
+    ]
+
+
+def _default_branch(repo: Path) -> str:
+    origin_head = _git_output(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if origin_head and "/" in origin_head:
+        return origin_head.split("/", 1)[1]
+    if _git_ok(repo, "show-ref", "--verify", "refs/remotes/origin/main"):
+        return "main"
+    current = _git_output(repo, "branch", "--show-current")
+    return current or "main"
+
+
+def _candidate_urls(repo: Path, candidates: list[dict[str, Any]]) -> list[str]:
+    urls: list[str] = []
+    for candidate in candidates:
+        path = repo / candidate["path"]
+        text = _read_text(path)
+        urls.extend(_extract_urls(text))
+    return _dedupe_strings(urls)
+
+
+def _find_remote_url(candidates: list[dict[str, Any]], remote_name: str) -> str:
+    marker = f"{remote_name}:"
+    for candidate in candidates:
+        for fact in candidate["extracted_facts"]:
+            if fact["kind"] == "remote_url" and fact["value"].startswith(marker):
+                return str(fact["value"][len(marker) :])
+    return ""
+
+
+def _github_slug_from_url(url: str) -> tuple[str, str] | None:
+    if not url:
+        return None
+    normalized = url.removesuffix(".git")
+    if normalized.startswith("git@github.com:"):
+        path = normalized.split(":", 1)[1]
+    elif "github.com/" in normalized:
+        path = normalized.split("github.com/", 1)[1]
+    else:
+        return None
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _github_repo_root_slug_from_url(url: str) -> tuple[str, str] | None:
+    if not url:
+        return None
+    normalized = url.strip().rstrip("/").removesuffix(".git")
+    if normalized.startswith("git@github.com:"):
+        path = normalized.split(":", 1)[1]
+    elif "github.com/" in normalized:
+        path = normalized.split("github.com/", 1)[1]
+    else:
+        return None
+    parts = path.strip("/").split("/")
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _first_matching_url(urls: list[str], needle: str, exclude: str = "") -> str:
+    for url in urls:
+        if needle in url and (not exclude or exclude not in url):
+            return url
+    return ""
+
+
+def _extract_urls(text: str) -> list[str]:
+    return [url.rstrip(".,)>") for url in re.findall(r"https?://[^\s<)]+", text)]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _toml_dumps(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, dict) or _is_array_of_tables(value):
+            continue
+        lines.append(f"{key} = {_toml_value(value)}")
+    if lines:
+        lines.append("")
+
+    for key, value in data.items():
+        if isinstance(value, dict):
+            _emit_toml_table(lines, key, value)
+        elif _is_array_of_tables(value):
+            for item in value:
+                lines.append(f"[[{key}]]")
+                _emit_toml_body(lines, item)
+                lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _emit_toml_table(lines: list[str], name: str, table: dict[str, Any]) -> None:
+    if not table:
+        return
+    lines.append(f"[{name}]")
+    _emit_toml_body(lines, table)
+    lines.append("")
+
+
+def _emit_toml_body(lines: list[str], table: dict[str, Any]) -> None:
+    for key, value in table.items():
+        if isinstance(value, dict):
+            raise ForkOpsError(f"Nested TOML table rendering is unsupported for key: {key}")
+        lines.append(f"{key} = {_toml_value(value)}")
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, str):
+        return json.dumps(value)
+    raise ForkOpsError(f"Unsupported TOML value type: {type(value).__name__}")
+
+
+def _is_array_of_tables(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+def create_initial_config_text(
+    repo_path: str | Path = ".",
+    repository_owner: str = "OWNER",
+    repository_name: str = "REPO",
+    upstream_owner: str = "UPSTREAM_OWNER",
+    upstream_name: str = "UPSTREAM_REPO",
+    default_branch: str = "main",
+) -> str:
+    repo = Path(repo_path).expanduser().resolve()
+    origin_url = _git_output(repo, "remote", "get-url", "origin") or ""
+    upstream_url = _git_output(repo, "remote", "get-url", "upstream") or ""
+    upstream_id = _slug_id(upstream_name)
+    upstream_canon = (
+        "Upstream source and docs are canonical unless fork-local authority defines a "
+        "divergence."
+    )
+    return f'''schema_version = "0.1"
+
+[repository]
+host = "github"
+owner = "{repository_owner}"
+name = "{repository_name}"
+default_branch = "{default_branch}"
+protected_branches = ["{default_branch}"]
+
+[authority]
+source_order = ["fork-ops-config", "repo-docs", "upstream-docs", "live-state"]
+upstream_canon = "{upstream_canon}"
+inference_labeling = "Label inferred conclusions when direct evidence is unavailable."
+
+[change_targets]
+default = "fork"
+upstream_contribution = "explicit-only"
+
+[[fork_remotes]]
+name = "origin"
+url = "{origin_url}"
+push = true
+
+[[upstreams]]
+id = "{upstream_id}"
+name = "{upstream_name}"
+owner = "{upstream_owner}"
+remote = "upstream"
+url = "{upstream_url}"
+default_branch = "{default_branch}"
+push = false
+
+[[release_channels]]
+id = "stable"
+upstream = "{upstream_id}"
+kind = "github_latest_release"
+include_prereleases = false
+
+[[upstream_tracks]]
+id = "upstream-stable"
+upstream = "{upstream_id}"
+ref = "refs/remotes/origin/upstream-stable"
+source_type = "release_channel"
+source = "stable"
+owner_remote = "origin"
+update_policy = "manual"
+sync_eligible = true
+
+[[local_surfaces]]
+kind = "config"
+path = ".agents/fork-ops.toml"
+domain = "identity"
+portability_hint = "fork-specific"
+'''
+
+
+def schema_json() -> str:
+    return json.dumps(CONFIG_SCHEMA, indent=2, sort_keys=True) + "\n"
+
+
+def _missing_requirements(config: dict[str, Any], level: str) -> Iterable[str]:
+    requirements = {
+        "identified": [
+            "schema_version",
+            "repository.host",
+            "repository.owner",
+            "repository.name",
+            "repository.default_branch",
+            "fork_remotes",
+            "upstreams",
+            "change_targets.default",
+        ],
+        "scoutable": [
+            "authority.source_order",
+            "local_surfaces",
+        ],
+        "track-aware": [
+            "release_channels",
+            "upstream_tracks",
+        ],
+        "sync-ready": [
+            "sync_policy.default_sync_baseline",
+            "sync_policy.preserve_commit_identity",
+            "sync_policy.forbid_history_rewrites",
+            "sync_policy.allowed_merge_methods",
+            "divergence_policy.uncertainty_destination",
+        ],
+        "review-ready": [
+            "review_policy",
+            "publication_policy",
+            "local_gates",
+        ],
+        "provenance-ready": [
+            "local_gates.provenance",
+        ],
+    }
+    cumulative: list[str] = []
+    for candidate in CAPABILITY_LEVELS:
+        cumulative.extend(requirements[candidate])
+        if candidate == level:
+            break
+    for path in cumulative:
+        if not _path_has_value(config, path):
+            yield path
+
+
+def _level_enables(level: str) -> str:
+    return {
+        "identified": "Basic fork recognition and authority discovery.",
+        "scoutable": "Upstream and fork research with source-quality guidance.",
+        "track-aware": (
+            "Baseline comparison, upstream freshness reports, and upstream-ref "
+            "maintenance planning."
+        ),
+        "sync-ready": "Ancestry-preserving upstream sync planning and validation.",
+        "review-ready": "End-to-end PR review and publication closeout.",
+        "provenance-ready": "Source, artifact, runtime, or install-state provenance diagnosis.",
+    }[level]
+
+
+def _path_has_value(config: dict[str, Any], dotted_path: str) -> bool:
+    current: Any = config
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    if current is None:
+        return False
+    if isinstance(current, (str, list, dict)) and not current:
+        return False
+    return True
+
+
+def _ids(items: list[dict[str, Any]]) -> set[str]:
+    return {
+        item["id"]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+
+def _duplicate_id_diagnostics(section: str, items: list[dict[str, Any]]) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str):
+            continue
+        if item_id in seen:
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    code="reference.duplicate_id",
+                    message=f"Duplicate id '{item_id}' in {section}.",
+                    path=f"{section}.{index}.id",
+                )
+            )
+        seen.add(item_id)
+    return diagnostics
+
+
+def _check_remote_url(
+    repo: Path,
+    item: dict[str, Any],
+    path: str,
+    diagnostics: list[Diagnostic],
+) -> None:
+    name = item.get("remote") or item.get("name")
+    expected_url = item.get("url")
+    if not isinstance(name, str):
+        return
+    actual_url = _git_output(repo, "remote", "get-url", name)
+    if actual_url is None:
+        diagnostics.append(
+            Diagnostic(
+                severity="warning",
+                code="git.remote_missing",
+                message=f"Configured remote does not exist locally: {name}",
+                path=f"{path}.remote",
+            )
+        )
+        return
+    if expected_url and actual_url != expected_url:
+        diagnostics.append(
+            Diagnostic(
+                severity="warning",
+                code="git.remote_url_mismatch",
+                message=f"Configured URL for remote '{name}' differs from local Git.",
+                path=f"{path}.url",
+                detail={"configured": expected_url, "actual": actual_url},
+            )
+        )
+
+
+def _git_ok(repo: Path, *args: str) -> bool:
+    return _run_git(repo, *args).returncode == 0
+
+
+def _git_output(repo: Path, *args: str) -> str | None:
+    result = _run_git(repo, *args)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def _iter_candidate_paths(repo: Path) -> Iterable[Path]:
+    roots = [
+        repo / "AGENTS.md",
+        repo / "CLAUDE.md",
+        repo / "docs" / "agents",
+        repo / "docs" / "adr",
+        repo / "docs" / "maintainers",
+        repo / ".agents",
+        repo / ".codex",
+    ]
+    for root in roots:
+        if root.is_file():
+            yield root
+        elif root.is_dir():
+            for path in root.rglob("*"):
+                if path.is_file() and path.suffix.lower() in {
+                    ".md",
+                    ".toml",
+                    ".json",
+                    ".yaml",
+                    ".yml",
+                }:
+                    yield path
+
+
+def _read_lower(path: Path) -> str:
+    return _read_text(path).lower()
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore")
+    except OSError:
+        return ""
+
+
+def _fork_signals(text: str) -> list[str]:
+    signals = []
+    for needle in (
+        "baseline",
+        "disabled",
+        "fork",
+        "force-push",
+        "github releases",
+        "merge-base",
+        "release channel",
+        "release tag",
+        "review automation",
+        "review bot",
+        "stable release",
+        "sync",
+        "issue tracker",
+        "pull request",
+        "upstream",
+        "upstream issue",
+        "upstream-main",
+        "upstream-stable",
+        "upstream track",
+        "divergence",
+        "code scanning",
+        "review thread",
+    ):
+        if needle in text:
+            signals.append(needle)
+    return signals
+
+
+def _candidate_domains(signals: list[str]) -> list[str]:
+    domains = []
+    if any(signal in signals for signal in ("upstream", "release tag", "upstream-main")):
+        domains.append("upstream_intelligence")
+    if any(signal in signals for signal in ("sync", "baseline", "merge-base")):
+        domains.append("sync")
+    if "divergence" in signals:
+        domains.append("divergence")
+    if any(signal in signals for signal in ("force-push", "disabled")):
+        domains.append("authority")
+    if "upstream issue" in signals:
+        domains.append("authority")
+    if any(
+        signal in signals
+        for signal in (
+            "code scanning",
+            "issue tracker",
+            "pull request",
+            "review automation",
+            "review bot",
+            "review thread",
+        )
+    ):
+        domains.append("review_publication")
+    return sorted(set(domains))
+
+
+def _extracted_facts(text: str) -> list[dict[str, str]]:
+    facts: list[dict[str, str]] = []
+    refs = sorted(set(re.findall(r"`([^`]*(?:upstream|origin/upstream)[^`]*)`", text)))
+    for ref in refs:
+        if _looks_like_ref_role(ref):
+            facts.append(
+                {
+                    "kind": "ref_role",
+                    "value": ref,
+                    "suggested_config": "upstream_tracks",
+                }
+            )
+
+    if "github releases" in text or "gh release list" in text:
+        facts.append(
+            {
+                "kind": "release_channel_source",
+                "value": "github-releases",
+                "suggested_config": "release_channels",
+            }
+        )
+
+    if "stable release" in text or "latest stable" in text or "exclude-pre-releases" in text:
+        facts.append(
+            {
+                "kind": "release_channel",
+                "value": "stable",
+                "suggested_config": "release_channels",
+            }
+        )
+
+    if "origin/upstream-stable" in text and "default upstream baseline" in text:
+        facts.append(
+            {
+                "kind": "default_sync_baseline",
+                "value": "origin/upstream-stable",
+                "suggested_config": "sync_policy.default_sync_baseline",
+            }
+        )
+    elif "origin/upstream-stable" in text and "default" in text and "baseline" in text:
+        facts.append(
+            {
+                "kind": "default_sync_baseline",
+                "value": "origin/upstream-stable",
+                "suggested_config": "sync_policy.default_sync_baseline",
+            }
+        )
+
+    if (
+        "push url `disabled`" in text
+        or "push url is disabled" in text
+        or "push url disabled" in text
+    ):
+        facts.append(
+            {
+                "kind": "disabled_upstream_push",
+                "value": "upstream",
+                "suggested_config": "upstreams.push",
+            }
+        )
+
+    if "force-push" in text or "do not force-push" in text:
+        facts.append(
+            {
+                "kind": "forbidden_history_rewrite",
+                "value": "force-push",
+                "suggested_config": "sync_policy.forbid_history_rewrites",
+            }
+        )
+
+    if "merge-base --is-ancestor" in text:
+        facts.append(
+            {
+                "kind": "ancestry_check",
+                "value": "merge-base --is-ancestor",
+                "suggested_config": "sync_policy.ancestry_checks",
+            }
+        )
+
+    for url in _extract_urls(text):
+        slug = _github_repo_root_slug_from_url(url)
+        if slug == ("nisavid", "lemonade"):
+            facts.append(
+                {
+                    "kind": "remote_url",
+                    "value": f"origin:{url}",
+                    "suggested_config": "fork_remotes.url",
+                }
+            )
+        elif slug == ("lemonade-sdk", "lemonade"):
+            facts.append(
+                {
+                    "kind": "remote_url",
+                    "value": f"upstream:{url}",
+                    "suggested_config": "upstreams.url",
+                }
+            )
+
+    return _unique_facts(facts)
+
+
+def _looks_like_ref_role(ref: str) -> bool:
+    return (
+        ref.startswith("upstream/")
+        or ref.startswith("origin/upstream-")
+        or ref in {"upstream-main", "upstream-stable"}
+    )
+
+
+def _unique_facts(facts: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for fact in facts:
+        key = (fact["kind"], fact["value"], fact["suggested_config"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(fact)
+    return unique
+
+
+def _candidate_kind(rel_path: str) -> str:
+    if rel_path.endswith("AGENTS.md") or rel_path.endswith("CLAUDE.md"):
+        return "agent_instruction"
+    if "/skills/" in rel_path:
+        return "skill"
+    if rel_path.endswith(".toml"):
+        return "config"
+    if rel_path.endswith(".md"):
+        return "doc"
+    return "other"
+
+
+def _proposed_destination(rel_path: str, signals: list[str]) -> str:
+    if any(
+        signal in signals
+        for signal in (
+            "upstream track",
+            "release channel",
+            "release tag",
+            "stable release",
+            "upstream-main",
+            "upstream-stable",
+        )
+    ):
+        return "Fork Ops Config release_channels/upstream_tracks plus operation guide"
+    if "merge-base" in signals or "sync" in signals:
+        return "Fork Ops Config sync_policy/divergence_policy plus sync runbook"
+    if any(
+        signal in signals
+        for signal in (
+            "code scanning",
+            "issue tracker",
+            "pull request",
+            "review automation",
+            "review bot",
+            "review thread",
+        )
+    ):
+        return "review_policy/publication_policy or future Repo Ops equipment"
+    if "/skills/" in rel_path:
+        return "Fork Ops skill or migration note"
+    return "Fork-local authority or Migration Assessment evidence"
+
+
+def _portability_hint(rel_path: str, signals: list[str]) -> str:
+    signal_set = set(signals)
+    if "issue-tracker" in rel_path or "triage-labels" in rel_path:
+        return "repo-ops-candidate"
+    if _has_fork_specific_signal(signal_set):
+        return "fork-specific"
+    if _has_review_publication_signal(signal_set):
+        return "repo-ops-candidate"
+    return "shared-with-fork-policy"
+
+
+def _has_review_publication_signal(signals: set[str]) -> bool:
+    return any(
+        signal in signals
+        for signal in (
+            "code scanning",
+            "issue tracker",
+            "pull request",
+            "review automation",
+            "review bot",
+            "review thread",
+        )
+    )
+
+
+def _has_fork_specific_signal(signals: set[str]) -> bool:
+    return any(
+        signal in signals
+        for signal in (
+            "divergence",
+            "merge-base",
+            "release channel",
+            "release tag",
+            "stable release",
+            "sync",
+            "upstream",
+            "upstream issue",
+            "upstream-main",
+            "upstream-stable",
+            "upstream track",
+        )
+    )
+
+
+def _slug_id(value: str) -> str:
+    return value.lower().replace("_", "-").replace(" ", "-")

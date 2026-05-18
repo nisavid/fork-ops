@@ -1,0 +1,9 @@
+{
+  "fork-ops": {
+    "command": "bash",
+    "args": [
+      "-lc",
+      "root=\"${PLUGIN_ROOT:-$(pwd)}\"; exec uv run --project \"$root\" --extra mcp fork-ops-mcp"
+    ]
+  }
+}
