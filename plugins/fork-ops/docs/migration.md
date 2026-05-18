@@ -13,6 +13,8 @@ For each candidate, assessment should preserve enough structure to support a lat
 - ref roles that likely become `upstream_tracks`
 - release-channel hints that likely become `release_channels`
 - default baseline hints that likely become `sync_policy.default_sync_baseline`
+- detected `origin/upstream-*` default baseline refs that become matching
+  `upstream_tracks` entries
 - disabled upstream push policy that likely becomes `upstreams.push = false`
 - ancestry checks and forbidden history rewrites that likely become sync Mutation Gates
 
@@ -30,6 +32,11 @@ must be scrutinized against source materials before application. If important
 source semantics are not represented, improve the deterministic generator or
 switch that migration slice to an LLM-guided planner with a rubric and a
 structured config patch output contract.
+
+The proposal TOML renderer intentionally supports top-level scalar fields,
+top-level tables, and arrays of flat tables. Config proposal output should stay
+inside that flat contract; introduce a TOML writer library or expand the
+renderer before nested config output is emitted.
 
 A migration plan combines the assessment and proposed config patch into a
 reviewable non-mutating plan.

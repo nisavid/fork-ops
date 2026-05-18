@@ -26,9 +26,17 @@ from fork_ops.core import (
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
+    schema_artifact_report,
     schema_json,
 )
-from fork_ops.mcp_server import fork_ops_migration_dry_run, fork_ops_migration_execute
+from fork_ops.mcp_server import (
+    fork_ops_capability_report,
+    fork_ops_config_read,
+    fork_ops_config_validate,
+    fork_ops_migration_dry_run,
+    fork_ops_migration_execute,
+    fork_ops_schema,
+)
 from fork_ops.schema import schema_diagnostics
 
 TRACK_AWARE_CONFIG = """schema_version = "0.1"
@@ -162,6 +170,48 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual((plugin_root / "schema/fork-ops.schema.json").read_text(), expected)
         self.assertEqual((plugin_root / "src/fork_ops/fork-ops.schema.json").read_text(), expected)
 
+    def test_schema_artifact_report_flags_documented_schema_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as plugin:
+            plugin_root = Path(plugin)
+            docs_schema = plugin_root / "schema/fork-ops.schema.json"
+            runtime_schema = plugin_root / "src/fork_ops/fork-ops.schema.json"
+            docs_schema.parent.mkdir(parents=True)
+            runtime_schema.parent.mkdir(parents=True)
+            docs_schema.write_text('{"title": "drifted"}\n')
+            runtime_schema.write_text(schema_json())
+
+            report = schema_artifact_report(plugin_root)
+
+        self.assertFalse(report["ok"])
+        artifacts = {artifact["path"]: artifact for artifact in report["artifacts"]}
+        self.assertFalse(artifacts["schema/fork-ops.schema.json"]["matches_runtime_schema"])
+        self.assertTrue(artifacts["src/fork_ops/fork-ops.schema.json"]["matches_runtime_schema"])
+
+    def test_schema_artifact_report_records_unreadable_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as plugin:
+            plugin_root = Path(plugin)
+            docs_schema = plugin_root / "schema/fork-ops.schema.json"
+            runtime_schema = plugin_root / "src/fork_ops/fork-ops.schema.json"
+            docs_schema.parent.mkdir(parents=True)
+            runtime_schema.parent.mkdir(parents=True)
+            docs_schema.write_text(schema_json())
+            runtime_schema.write_text(schema_json())
+            original_read_bytes = Path.read_bytes
+
+            def unreadable(path: Path) -> bytes:
+                if path == docs_schema:
+                    raise PermissionError("permission denied")
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", unreadable):
+                report = schema_artifact_report(plugin_root)
+
+        artifacts = {artifact["path"]: artifact for artifact in report["artifacts"]}
+        self.assertFalse(report["ok"])
+        self.assertFalse(artifacts["schema/fork-ops.schema.json"]["matches_runtime_schema"])
+        self.assertEqual(artifacts["schema/fork-ops.schema.json"]["error"], "permission denied")
+        self.assertTrue(artifacts["src/fork_ops/fork-ops.schema.json"]["matches_runtime_schema"])
+
     def test_normalize_config_accepts_toml_datetime_values(self) -> None:
         config = parse_config_text(
             'schema_version = "0.1"\n\n[repository]\ncreated_at = 2026-05-18T00:00:00Z\n'
@@ -282,6 +332,95 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(track["id"], "upstream-stable")
         self.assertEqual(track["source_type"], "upstream_ref")
         self.assertEqual(track["source"], "refs/remotes/origin/upstream-stable")
+
+    def test_default_sync_baseline_uses_detected_origin_upstream_track(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "Use `origin/upstream-lts` as the default upstream baseline for sync work.\n"
+            )
+
+            patch = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(patch["diagnostics"], [])
+        [track] = patch["config"]["upstream_tracks"]
+        self.assertEqual(track["id"], "upstream-lts")
+        self.assertEqual(track["ref"], "refs/remotes/origin/upstream-lts")
+        self.assertEqual(track["source"], "refs/remotes/origin/upstream-lts")
+        self.assertTrue(track["sync_eligible"])
+        self.assertEqual(patch["config"]["sync_policy"]["default_sync_baseline"], "upstream-lts")
+        self.assertEqual(patch["config"]["sync_policy"]["default_sync_ref"], "origin/upstream-lts")
+        self.assertIn(
+            "git merge-base --is-ancestor origin/upstream-lts HEAD",
+            patch["config"]["sync_policy"]["ancestry_checks"],
+        )
+
+    def test_default_sync_baseline_accepts_nested_origin_upstream_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/working-with-release-refs/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "Use origin/upstream-release/v1 as the default upstream baseline for sync work.\n"
+            )
+
+            patch = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(patch["diagnostics"], [])
+        [track] = patch["config"]["upstream_tracks"]
+        self.assertEqual(track["id"], "upstream-release-v1")
+        self.assertEqual(track["ref"], "refs/remotes/origin/upstream-release/v1")
+        self.assertEqual(
+            patch["config"]["sync_policy"]["default_sync_ref"],
+            "origin/upstream-release/v1",
+        )
+
+    def test_default_sync_baseline_ignores_trailing_sentence_period(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/working-with-default-ref/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "Use origin/upstream-stable. It is the default upstream baseline for sync work.\n"
+            )
+
+            patch = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(patch["diagnostics"], [])
+        [track] = patch["config"]["upstream_tracks"]
+        self.assertEqual(track["id"], "upstream-stable")
+        self.assertEqual(track["ref"], "refs/remotes/origin/upstream-stable")
+        self.assertEqual(
+            patch["config"]["sync_policy"]["default_sync_ref"],
+            "origin/upstream-stable",
+        )
+
+    def test_multiple_default_sync_baselines_require_review(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            lts_path = repo_path / ".agents/skills/default-lts/SKILL.md"
+            stable_path = repo_path / "docs/agents/default-stable.md"
+            lts_path.parent.mkdir(parents=True)
+            stable_path.parent.mkdir(parents=True)
+            lts_path.write_text(
+                "Use origin/upstream-lts as the default upstream baseline for sync work.\n"
+            )
+            stable_path.write_text(
+                "Use origin/upstream-stable as the default upstream baseline for sync work.\n"
+            )
+
+            patch = propose_migration_config_patch(repo_path)
+            plan = generate_migration_plan(repo_path)
+
+        track_ids = {track["id"] for track in patch["config"]["upstream_tracks"]}
+        diagnostic_codes = {item["code"] for item in patch["diagnostics"]}
+        blocker_codes = {item["code"] for item in plan["blockers"]}
+        self.assertEqual(track_ids, {"upstream-lts", "upstream-stable"})
+        self.assertEqual(patch["config"]["sync_policy"], {})
+        self.assertIn("migration.default_sync_baseline_ambiguous", diagnostic_codes)
+        self.assertIn("proposed_config_patch.diagnostics_failed", blocker_codes)
 
     def test_migration_assessment_extracts_upstream_ref_pressure_case(self) -> None:
         skill_text = UPSTREAM_REF_PRESSURE_TEXT
@@ -456,6 +595,8 @@ uncertainty_destination = "ask-human-operator"
             parsed["divergence_policy"]["uncertainty_destination"],
             "ask-human-operator",
         )
+        self.assertIn("toml_renderer.flat_config_contract", patch["contract_tags"])
+        self.assertNotIn("toml_renderer.flat_config_contract", patch["limitations"])
 
     def test_migration_plan_distinguishes_plan_sections_for_lemonade_pressure_case(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -516,7 +657,7 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(plan["blockers"][0]["code"], "semantic_coverage.incomplete")
         self.assertEqual(plan["blockers"][0]["paths"], ["AGENTS.md"])
 
-    def test_migration_plan_semantic_coverage_ignores_config_diagnostic_blockers(self) -> None:
+    def test_migration_plan_accepts_default_baseline_without_separate_ref_role(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             path = repo_path / ".agents/skills/default-baseline/SKILL.md"
@@ -528,9 +669,10 @@ uncertainty_destination = "ask-human-operator"
             plan = generate_migration_plan(repo)
 
         self.assertEqual(plan["summary"]["semantic_coverage"], "complete")
-        blocker_codes = {blocker["code"] for blocker in plan["blockers"]}
-        self.assertIn("proposed_config_patch.diagnostics_failed", blocker_codes)
-        self.assertNotIn("semantic_coverage.incomplete", blocker_codes)
+        self.assertEqual(plan["blockers"], [])
+        patch_config = plan["proposed_config_patch"]["config"]
+        self.assertEqual(patch_config["upstream_tracks"][0]["id"], "upstream-stable")
+        self.assertEqual(patch_config["sync_policy"]["default_sync_baseline"], "upstream-stable")
 
     def test_migration_dry_run_previews_plan_without_mutating_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -696,6 +838,103 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(exit_code, 2)
         self.assertIn(str(plan_path), error.getvalue())
 
+    def test_cli_smokes_config_init_show_validate(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            init_output = io.StringIO()
+            show_output = io.StringIO()
+            validate_output = io.StringIO()
+
+            with redirect_stdout(init_output):
+                init_exit = cli_main(
+                    [
+                        "config",
+                        "init",
+                        "--repo",
+                        str(repo_path),
+                        "--repository-owner",
+                        "nisavid",
+                        "--repository-name",
+                        "demo",
+                        "--upstream-owner",
+                        "upstream",
+                        "--upstream-name",
+                        "demo",
+                        "--write",
+                    ]
+                )
+            with redirect_stdout(show_output):
+                show_exit = cli_main(
+                    ["config", "show", "--repo", str(repo_path), "--format", "json"]
+                )
+            with redirect_stdout(validate_output):
+                validate_exit = cli_main(
+                    [
+                        "config",
+                        "validate",
+                        "--repo",
+                        str(repo_path),
+                        "--required-level",
+                        "track-aware",
+                        "--json",
+                    ]
+                )
+
+        shown = json.loads(show_output.getvalue())
+        validated = json.loads(validate_output.getvalue())
+        self.assertEqual(init_exit, 0)
+        self.assertEqual(show_exit, 0)
+        self.assertEqual(validate_exit, 0)
+        self.assertEqual(Path(init_output.getvalue().strip()).name, "fork-ops.toml")
+        self.assertEqual(shown["repository"]["owner"], "nisavid")
+        self.assertTrue(validated["required_level"]["available"])
+
+    def test_cli_schema_check_reports_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as plugin:
+            plugin_root = Path(plugin)
+            docs_schema = plugin_root / "schema/fork-ops.schema.json"
+            runtime_schema = plugin_root / "src/fork_ops/fork-ops.schema.json"
+            docs_schema.parent.mkdir(parents=True)
+            runtime_schema.parent.mkdir(parents=True)
+            docs_schema.write_text(schema_json())
+            runtime_schema.write_text("{}\n")
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    ["schema", "check", "--plugin-root", str(plugin_root), "--json"]
+                )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(payload["ok"])
+        artifacts = {artifact["path"]: artifact for artifact in payload["artifacts"]}
+        self.assertFalse(artifacts["src/fork_ops/fork-ops.schema.json"]["matches_runtime_schema"])
+
+    def test_cli_schema_check_plain_output_distinguishes_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as plugin:
+            plugin_root = Path(plugin)
+            docs_schema = plugin_root / "schema/fork-ops.schema.json"
+            runtime_schema = plugin_root / "src/fork_ops/fork-ops.schema.json"
+            docs_schema.parent.mkdir(parents=True)
+            runtime_schema.parent.mkdir(parents=True)
+            docs_schema.write_text(schema_json())
+            runtime_schema.write_text(schema_json())
+            original_read_bytes = Path.read_bytes
+            output = io.StringIO()
+
+            def unreadable(path: Path) -> bytes:
+                if path == docs_schema:
+                    raise PermissionError("permission denied")
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", unreadable), redirect_stdout(output):
+                exit_code = cli_main(["schema", "check", "--plugin-root", str(plugin_root)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("error\tschema/fork-ops.schema.json", output.getvalue())
+        self.assertIn("ok\tsrc/fork_ops/fork-ops.schema.json", output.getvalue())
+
     def test_mcp_exposes_migration_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -707,6 +946,25 @@ uncertainty_destination = "ask-human-operator"
 
         self.assertEqual(payload["operation"], "migration-dry-run")
         self.assertTrue(payload["can_execute"])
+
+    def test_mcp_smokes_config_tools_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+
+            raw = fork_ops_config_read(str(repo_path), normalized=False)
+            normalized = fork_ops_config_read(str(repo_path), normalized=True)
+            validation = fork_ops_config_validate(str(repo_path), required_level="track-aware")
+            capability = fork_ops_capability_report(str(repo_path))
+            schema = fork_ops_schema()
+
+        self.assertEqual(raw["raw"], TRACK_AWARE_CONFIG)
+        self.assertEqual(normalized["config"]["repository"]["owner"], "nisavid")
+        self.assertTrue(validation["required_level"]["available"])
+        self.assertTrue(capability["levels"]["track-aware"]["available"])
+        self.assertEqual(schema, schema_json())
 
     def test_migration_execution_rejects_malformed_plan_before_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

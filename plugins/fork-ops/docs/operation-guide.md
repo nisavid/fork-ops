@@ -25,6 +25,13 @@ uv run --package fork-ops fork-ops config show --repo /path/to/configured-fork -
 uv run --package fork-ops fork-ops config validate --repo /path/to/configured-fork --required-level track-aware
 ```
 
+Create a starter config when fork-local authority already identifies the fork
+and upstream repository:
+
+```bash
+uv run --package fork-ops fork-ops config init --repo /path/to/fork --repository-owner OWNER --repository-name REPO --upstream-owner UPSTREAM_OWNER --upstream-name UPSTREAM_REPO --write
+```
+
 MCP tools expose the same surface for agents:
 
 - `fork_ops_config_read`
@@ -36,6 +43,15 @@ MCP tools expose the same surface for agents:
 - `fork_ops_migration_execute`
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
+
+## Schema Artifacts
+
+The documented schema copy and packaged runtime schema copy should stay aligned
+with the runtime schema printer.
+
+```bash
+uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
+```
 
 ## Capability Routing
 
