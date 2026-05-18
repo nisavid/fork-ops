@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -129,6 +130,21 @@ uncertainty_destination = "ask-human-operator"
         normalized = normalize_config(config)
 
         self.assertEqual(normalized["repository"]["created_at"].year, 2026)
+
+    def test_status_report_config_is_json_safe(self) -> None:
+        config = TRACK_AWARE_CONFIG.replace(
+            'default_branch = "main"',
+            'default_branch = "main"\ncreated_at = 2026-05-18T00:00:00Z',
+        )
+        with tempfile.TemporaryDirectory() as repo:
+            path = Path(repo) / CONFIG_RELATIVE_PATH
+            path.parent.mkdir(parents=True)
+            path.write_text(config)
+
+            report = build_status_report(repo)
+
+        self.assertEqual(report["config"]["repository"]["created_at"], "2026-05-18T00:00:00+00:00")
+        json.dumps(report)
 
     def test_malformed_sections_do_not_crash_diagnostics(self) -> None:
         config = """schema_version = "0.1"
