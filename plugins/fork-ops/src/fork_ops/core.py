@@ -8,6 +8,7 @@ import re
 import subprocess
 import tomllib
 from collections.abc import Iterable
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -116,6 +117,16 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, datetime | date | time):
+        return value.isoformat()
+    return value
+
+
 def build_status_report(
     repo_path: str | Path = ".",
     config_path: str | Path | None = None,
@@ -177,7 +188,7 @@ def build_status_report(
         "diagnostics": [item.to_dict() for item in diagnostics],
     }
     if include_config:
-        payload["config"] = normalized
+        payload["config"] = _json_safe(normalized)
     return payload
 
 

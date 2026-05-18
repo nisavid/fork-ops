@@ -17,11 +17,13 @@ The first implementation target is `track-aware`. It supports config discovery, 
 ## Quick Checks
 
 ```bash
+export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
 uv run --package fork-ops fork-ops schema print
 uv run --package fork-ops fork-ops capability report --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 uv run --package fork-ops ruff check --cache-dir .ruff_cache
+uv run --package fork-ops pytest plugins/fork-ops/tests -q
 uv run --package fork-ops mypy --cache-dir .mypy_cache
 ```
