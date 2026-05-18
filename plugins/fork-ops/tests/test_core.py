@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -764,8 +765,30 @@ uncertainty_destination = "ask-human-operator"
             ".agents/skills/working-with-upstream-refs/SKILL.md",
         )
         self.assertEqual(result["verification_results"][0]["status"], "passed")
+        self.assertEqual(
+            result["verification_results"][0]["note"],
+            "Status reflects Fork Ops capability verification; listed commands are not executed.",
+        )
         self.assertTrue(result["verification_results"][0]["required_level_available"])
         self.assertEqual(parsed["sync_policy"]["default_sync_baseline"], "upstream-stable")
+
+    def test_migration_plan_hashes_retained_source_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_bytes = UPSTREAM_REF_PRESSURE_TEXT.encode() + b"\xff"
+            source_path.write_bytes(source_bytes)
+
+            plan = generate_migration_plan(repo_path)
+            result = execute_migration_plan(plan)
+
+            self.assertEqual(
+                plan["retained_source_materials"][0]["content_sha256"],
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
+
+        self.assertEqual(result["status"], "applied")
 
     def test_migration_execution_rejects_existing_config_create(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

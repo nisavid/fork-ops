@@ -1025,6 +1025,10 @@ def _verify_migration_execution(
                 "required_level": required_level,
                 "required_level_available": required_available,
                 "diagnostics": report.get("diagnostics", []),
+                "note": (
+                    "Status reflects Fork Ops capability verification; listed commands "
+                    "are not executed."
+                ),
             }
         )
     blockers = []
@@ -1053,7 +1057,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
             {
                 "path": rel,
                 "kind": _candidate_kind(rel),
-                "content_sha256": hashlib.sha256(raw_text.encode()).hexdigest(),
+                "content_sha256": _file_sha256(path),
                 "signals": signals,
                 "domains": _candidate_domains(signals),
                 "extracted_facts": _extracted_facts(raw_text),
@@ -2057,7 +2061,10 @@ def _read_text(path: Path) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(_read_text(path).encode()).hexdigest()
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return hashlib.sha256(b"").hexdigest()
 
 
 def _fork_signals(text: str) -> list[str]:
