@@ -864,6 +864,25 @@ def _retained_source_material_blockers(
             )
             continue
         path = repo / raw_path
+        retained_path = Path(raw_path)
+        if retained_path.is_absolute() or ".." in retained_path.parts:
+            blockers.append(
+                {
+                    "code": "migration_execution.unsafe_retained_source_path",
+                    "path": raw_path,
+                    "message": "Retained source material must stay inside the repository.",
+                }
+            )
+            continue
+        if not path.resolve(strict=False).is_relative_to(repo.resolve()):
+            blockers.append(
+                {
+                    "code": "migration_execution.unsafe_retained_source_path",
+                    "path": raw_path,
+                    "message": "Retained source material must stay inside the repository.",
+                }
+            )
+            continue
         if not path.exists():
             blockers.append(
                 {
@@ -897,7 +916,17 @@ def _apply_migration_file_edits(
             blockers.append(blocker)
             continue
         content = edit["content"]
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            blockers.append(
+                {
+                    "code": "migration_execution.target_parent_unavailable",
+                    "path": edit.get("path"),
+                    "message": f"Migration execution target parent is unavailable: {exc}",
+                }
+            )
+            continue
         try:
             with path.open("x") as handle:
                 handle.write(content)
@@ -907,6 +936,15 @@ def _apply_migration_file_edits(
                     "code": "migration_execution.target_exists",
                     "path": edit.get("path"),
                     "message": "Refusing to overwrite a target created before config write.",
+                }
+            )
+            continue
+        except OSError as exc:
+            blockers.append(
+                {
+                    "code": "migration_execution.write_failed",
+                    "path": edit.get("path"),
+                    "message": f"Migration execution config write failed: {exc}",
                 }
             )
             continue
