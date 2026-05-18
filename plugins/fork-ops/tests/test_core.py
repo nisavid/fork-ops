@@ -1012,6 +1012,45 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.validation_requirement_unsupported",
         )
 
+    def test_migration_execution_rejects_missing_validation_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["validation_requirements"] = plan["validation_requirements"][:1]
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.validation_requirement_missing",
+        )
+
+    def test_migration_execution_rejects_config_toml_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            patch_config = plan["proposed_config_patch"]["config"]
+            patch_config["repository"]["owner"] = "reviewed-owner"
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.proposed_config_patch_mismatch",
+        )
+
     def test_migration_execution_rejects_changed_retained_source_material(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -1097,7 +1136,7 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.unsafe_retained_source_path",
         )
 
-    def test_migration_execution_reports_write_failure_and_removes_partial_config(self) -> None:
+    def test_migration_execution_preserves_concurrent_target_on_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
@@ -1105,30 +1144,15 @@ uncertainty_destination = "ask-human-operator"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
             target_path = repo_path / CONFIG_RELATIVE_PATH
-            original_open = Path.open
 
-            class FailingWriter:
-                def __enter__(self) -> FailingWriter:
-                    return self
+            def concurrent_target_then_link_failure(src: Path, dst: Path) -> None:
+                target_path.write_text("created by another process")
+                raise OSError("link failed after concurrent target create")
 
-                def __exit__(self, *args: Any) -> None:
-                    return None
-
-                def write(self, content: str) -> None:
-                    with original_open(target_path, "w") as handle:
-                        handle.write("partial")
-                    raise OSError("disk full")
-
-            def fail_during_write(path: Path, *args: Any, **kwargs: Any) -> Any:
-                mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
-                if "x" in mode:
-                    return FailingWriter()
-                return original_open(path, *args, **kwargs)
-
-            with patch.object(Path, "open", fail_during_write):
+            with patch("fork_ops.core.os.link", concurrent_target_then_link_failure):
                 result = execute_migration_plan(plan)
 
-            self.assertFalse(target_path.exists())
+            self.assertEqual(target_path.read_text(), "created by another process")
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.write_failed")

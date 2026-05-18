@@ -471,6 +471,7 @@ def dry_run_migration_plan(
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
     blocked_steps = _dry_run_blocked_steps(plan)
+    blocked_steps.extend(_proposed_config_patch_consistency_blockers(proposed_config_patch))
     blocked_steps.extend(
         _migration_execution_blockers(
             Path(normalized_repo_path),
@@ -674,6 +675,39 @@ def _dry_run_config_changes(proposed_config_patch: dict[str, Any]) -> list[dict[
             "requires_review": bool(proposed_config_patch.get("requires_review", True)),
             "config": copy.deepcopy(config),
             "diagnostics": _require_patch_list(proposed_config_patch, "diagnostics"),
+        }
+    ]
+
+
+def _proposed_config_patch_consistency_blockers(
+    proposed_config_patch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    toml = proposed_config_patch.get("toml", "")
+    config = proposed_config_patch.get("config", {})
+    if not isinstance(toml, str) or not isinstance(config, dict):
+        return []
+    try:
+        parsed_config = parse_config_text(toml)
+    except ForkOpsError as exc:
+        return [
+            {
+                "code": "migration_execution.proposed_config_patch_invalid_toml",
+                "step": "apply_migration_file_edits",
+                "source": "migration_plan",
+                "message": f"Proposed config patch TOML cannot be parsed: {exc}",
+            }
+        ]
+    if parsed_config == config:
+        return []
+    return [
+        {
+            "code": "migration_execution.proposed_config_patch_mismatch",
+            "step": "apply_migration_file_edits",
+            "source": "migration_plan",
+            "message": (
+                "Proposed config patch TOML must match proposed_config_patch.config "
+                "before migration execution."
+            ),
         }
     ]
 
@@ -1017,7 +1051,6 @@ def _apply_migration_file_edits(
             )
             continue
         except OSError as exc:
-            path.unlink(missing_ok=True)
             _remove_created_parent(path.parent, parent_existed)
             blockers.append(
                 {
@@ -1330,6 +1363,22 @@ def _validation_requirement_blockers(
                     ),
                 }
             )
+    supplied_codes = {requirement.get("code") for requirement in requirements}
+    for code in expected_by_code:
+        if code in supplied_codes:
+            continue
+        blockers.append(
+            {
+                "code": "migration_execution.validation_requirement_missing",
+                "step": "verify_migration_execution",
+                "source": "migration_plan",
+                "validation_code": code,
+                "message": (
+                    "Migration execution requires the full Fork Ops validation "
+                    "requirement set."
+                ),
+            }
+        )
     return blockers
 
 
