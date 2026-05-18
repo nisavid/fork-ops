@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import subprocess
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from urllib.parse import urlparse
 
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
@@ -30,6 +31,8 @@ def load_raw_config(repo_path: str | Path = ".", config_path: str | Path | None 
         return path.read_text()
     except FileNotFoundError as exc:
         raise ForkOpsError(f"Fork Ops config not found: {path}") from exc
+    except OSError as exc:
+        raise ForkOpsError(f"Fork Ops config read failed: {path}: {exc}") from exc
 
 
 def parse_config_text(raw: str) -> dict[str, Any]:
@@ -50,7 +53,7 @@ def load_config(
 
 
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
-    normalized = cast(dict[str, Any], json.loads(json.dumps(config)))
+    normalized = copy.deepcopy(config)
     repository = normalized.setdefault("repository", {})
     if repository.get("owner") and repository.get("name"):
         repository.setdefault("slug", f"{repository['owner']}/{repository['name']}")
@@ -105,7 +108,7 @@ def build_status_report(
         }
 
     try:
-        config = parse_config_text(config_file.read_text())
+        config = parse_config_text(load_raw_config(repo, config_file))
     except ForkOpsError as exc:
         diagnostics.append(
             Diagnostic(

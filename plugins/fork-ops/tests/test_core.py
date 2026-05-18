@@ -9,6 +9,7 @@ from fork_ops.core import (
     CONFIG_RELATIVE_PATH,
     assess_migration,
     build_status_report,
+    normalize_config,
     parse_config_text,
     propose_migration_config_patch,
 )
@@ -84,6 +85,15 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertTrue(
             any("'fork_remotes' is a required property" in message for message in messages)
         )
+
+    def test_normalize_config_accepts_toml_datetime_values(self) -> None:
+        config = parse_config_text(
+            'schema_version = "0.1"\n\n[repository]\ncreated_at = 2026-05-18T00:00:00Z\n'
+        )
+
+        normalized = normalize_config(config)
+
+        self.assertEqual(normalized["repository"]["created_at"].year, 2026)
 
     def test_unknown_track_release_channel_is_reference_error(self) -> None:
         config = TRACK_AWARE_CONFIG.replace('source = "stable"', 'source = "preview"')
