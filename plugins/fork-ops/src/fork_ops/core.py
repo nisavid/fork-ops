@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import subprocess
@@ -468,13 +469,19 @@ def dry_run_migration_plan(
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
     blocked_steps = _dry_run_blocked_steps(plan)
+    blocked_steps.extend(
+        _migration_execution_blockers(
+            Path(normalized_repo_path),
+            {"file_edits": file_edits},
+        )
+    )
     expected_verification_commands = _require_plan_list(plan, "validation_requirements")
     return {
         "repo_path": normalized_repo_path,
         "mode": "non-mutating",
         "operation": "migration-dry-run",
         "plan_operation": plan.get("operation"),
-        "can_execute": False,
+        "can_execute": not blocked_steps,
         "summary": {
             "file_edit_count": len(file_edits),
             "config_change_count": len(config_changes),
@@ -490,21 +497,71 @@ def dry_run_migration_plan(
         "expected_verification_commands": expected_verification_commands,
         "limitations": [
             "This migration dry run is non-mutating and does not apply config or edit files.",
-            "Migration execution is unavailable; blocked steps must remain blocked.",
             (
-                "Retain source materials until migration execution exists and validates "
-                "the replacement."
+                "Retain source materials until migration execution validates the replacement."
             ),
         ],
         "next_actions": [
             "Review file_edits and config_changes against the migration plan evidence.",
             "Resolve or explicitly waive blocked_steps before migration execution.",
             (
-                "Run expected_verification_commands after a future migration execution "
-                "applies changes."
+                "Run expected_verification_commands after migration execution applies changes."
             ),
         ],
     }
+
+
+def execute_migration(
+    repo_path: str | Path = ".",
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
+    return execute_migration_plan(migration_plan, repo_path=None if plan is not None else repo_path)
+
+
+def execute_migration_plan(
+    plan: dict[str, Any],
+    repo_path: str | Path | None = None,
+) -> dict[str, Any]:
+    preview = dry_run_migration_plan(plan, repo_path)
+    repo = Path(preview["repo_path"]).expanduser().resolve()
+    preview_blockers = _require_preview_list(preview, "blocked_steps")
+    if preview_blockers:
+        return _migration_execution_result(
+            repo=repo,
+            preview=preview,
+            status="blocked",
+            applied_edits=[],
+            skipped_edits=_skipped_preview_edits(preview, "blocked_steps_present"),
+            blockers=preview_blockers,
+            verification_results=[],
+        )
+
+    execution_blockers = _migration_execution_blockers(repo, preview)
+    if execution_blockers:
+        return _migration_execution_result(
+            repo=repo,
+            preview=preview,
+            status="blocked",
+            applied_edits=[],
+            skipped_edits=_skipped_preview_edits(preview, "execution_guard_blocked"),
+            blockers=execution_blockers,
+            verification_results=[],
+        )
+
+    applied_edits = _apply_migration_file_edits(repo, _require_preview_list(preview, "file_edits"))
+    skipped_edits = _preserved_source_materials(preview)
+    verification_results, verification_blockers = _verify_migration_execution(repo, preview)
+    status = "applied" if not verification_blockers else "verification_failed"
+    return _migration_execution_result(
+        repo=repo,
+        preview=preview,
+        status=status,
+        applied_edits=applied_edits,
+        skipped_edits=skipped_edits,
+        blockers=verification_blockers,
+        verification_results=verification_results,
+    )
 
 
 def _dry_run_repo_path(plan: dict[str, Any], repo_path: str | Path | None) -> str:
@@ -567,17 +624,6 @@ def _dry_run_blocked_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
         blocker.setdefault("step", "review_migration_plan")
         blocker.setdefault("source", "migration_plan")
         blocked_steps.append(blocker)
-    blocked_steps.append(
-        {
-            "code": "migration_execution.unavailable",
-            "step": "apply_migration_plan",
-            "source": "fork_ops_capability",
-            "message": (
-                "Migration execution is not implemented; dry run cannot apply config, "
-                "edit files, or remove retained source materials."
-            ),
-        }
-    )
     return blocked_steps
 
 
@@ -595,6 +641,231 @@ def _require_patch_list(patch: dict[str, Any], key: str) -> list[dict[str, Any]]
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise ForkOpsError(f"Migration dry run input has malformed proposed_config_patch.{key}.")
     return [copy.deepcopy(item) for item in value]
+
+
+def _require_preview_list(preview: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = preview.get(key)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ForkOpsError(f"Migration execution preview has malformed {key}.")
+    return [copy.deepcopy(item) for item in value]
+
+
+def _migration_execution_result(
+    *,
+    repo: Path,
+    preview: dict[str, Any],
+    status: str,
+    applied_edits: list[dict[str, Any]],
+    skipped_edits: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    verification_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "repo_path": str(repo),
+        "mode": "mutating",
+        "operation": "migration-execution",
+        "plan_operation": preview.get("plan_operation"),
+        "status": status,
+        "summary": {
+            "applied_edit_count": len(applied_edits),
+            "skipped_edit_count": len(skipped_edits),
+            "blocker_count": len(blockers),
+            "verification_result_count": len(verification_results),
+        },
+        "applied_edits": applied_edits,
+        "skipped_edits": skipped_edits,
+        "blockers": blockers,
+        "verification_results": verification_results,
+    }
+
+
+def _skipped_preview_edits(preview: dict[str, Any], reason: str) -> list[dict[str, Any]]:
+    skipped = []
+    for edit in _require_preview_list(preview, "file_edits"):
+        skipped.append(
+            {
+                "path": edit.get("path"),
+                "action": edit.get("action"),
+                "status": "skipped",
+                "reason": reason,
+            }
+        )
+    skipped.extend(_preserved_source_materials(preview))
+    return skipped
+
+
+def _preserved_source_materials(preview: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": material.get("path"),
+            "action": "preserve",
+            "status": "skipped",
+            "reason": "source_material_retained_until_replacement_validates",
+        }
+        for material in _require_preview_list(preview, "retained_materials")
+    ]
+
+
+def _migration_execution_blockers(repo: Path, preview: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    file_edits = _require_preview_list(preview, "file_edits")
+    if len(file_edits) != 1:
+        blockers.append(
+            {
+                "code": "migration_execution.unsupported_edit_count",
+                "message": "Migration execution currently supports exactly one config file edit.",
+            }
+        )
+    for edit in file_edits:
+        blockers.extend(_migration_file_edit_blockers(repo, edit))
+    return blockers
+
+
+def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    path, path_blocker = _migration_edit_target(repo, edit.get("path"))
+    if path_blocker:
+        blockers.append(path_blocker)
+        return blockers
+
+    action = edit.get("action")
+    if action != "create":
+        blockers.append(
+            {
+                "code": "migration_execution.unsupported_action",
+                "path": edit.get("path"),
+                "message": "Migration execution currently supports guarded config creation only.",
+            }
+        )
+    if edit.get("content_kind") != "fork-ops-config":
+        blockers.append(
+            {
+                "code": "migration_execution.unsupported_content_kind",
+                "path": edit.get("path"),
+                "message": "Migration execution currently writes Fork Ops config content only.",
+            }
+        )
+    if path.exists() and action == "create":
+        blockers.append(
+            {
+                "code": "migration_execution.target_exists",
+                "path": edit.get("path"),
+                "message": "Refusing to overwrite an existing target during config creation.",
+            }
+        )
+
+    content = edit.get("content")
+    if not isinstance(content, str):
+        blockers.append(
+            {
+                "code": "migration_execution.malformed_content",
+                "path": edit.get("path"),
+                "message": "Migration execution requires string content for guarded config writes.",
+            }
+        )
+        return blockers
+    try:
+        parsed = parse_config_text(content)
+    except ForkOpsError as exc:
+        blockers.append(
+            {
+                "code": "migration_execution.config_parse_failed",
+                "path": edit.get("path"),
+                "message": str(exc),
+            }
+        )
+        return blockers
+
+    diagnostics = schema_diagnostics(parsed) + reference_diagnostics(normalize_config(parsed))
+    error_diagnostics = [item.to_dict() for item in diagnostics if item.severity == "error"]
+    if error_diagnostics:
+        blockers.append(
+            {
+                "code": "migration_execution.config_diagnostics_failed",
+                "path": edit.get("path"),
+                "message": "Refusing to apply config content with validation errors.",
+                "diagnostics": error_diagnostics,
+            }
+        )
+    return blockers
+
+
+def _migration_edit_target(
+    repo: Path,
+    raw_path: Any,
+) -> tuple[Path, dict[str, Any] | None]:
+    if not isinstance(raw_path, str) or not raw_path:
+        return repo, {
+            "code": "migration_execution.malformed_target_path",
+            "message": "Migration execution requires a non-empty relative target path.",
+        }
+    target = Path(raw_path)
+    if target.is_absolute() or ".." in target.parts:
+        return repo, {
+            "code": "migration_execution.unsafe_target_path",
+            "path": raw_path,
+            "message": "Migration execution refuses absolute paths and parent traversal.",
+        }
+    return repo / target, None
+
+
+def _apply_migration_file_edits(
+    repo: Path,
+    file_edits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    applied = []
+    for edit in file_edits:
+        path, blocker = _migration_edit_target(repo, edit.get("path"))
+        if blocker:
+            raise ForkOpsError(blocker["message"])
+        content = edit["content"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        applied.append(
+            {
+                "path": edit["path"],
+                "action": edit["action"],
+                "status": "applied",
+                "content_kind": edit.get("content_kind"),
+                "bytes": len(content.encode()),
+                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            }
+        )
+    return applied
+
+
+def _verify_migration_execution(
+    repo: Path,
+    preview: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    report = build_status_report(repo, include_config=False)
+    required_level = "track-aware"
+    required_available = bool(report["capability"]["levels"][required_level]["available"])
+    has_errors = any(item.get("severity") == "error" for item in report.get("diagnostics", []))
+    status = "passed" if required_available and not has_errors else "failed"
+    results = []
+    for requirement in _require_preview_list(preview, "expected_verification_commands"):
+        results.append(
+            {
+                "code": requirement.get("code"),
+                "command": requirement.get("command"),
+                "status": status,
+                "highest_available": report["capability"]["highest_available"],
+                "required_level": required_level,
+                "required_level_available": required_available,
+                "diagnostics": report.get("diagnostics", []),
+            }
+        )
+    blockers = []
+    if status != "passed":
+        blockers.append(
+            {
+                "code": "migration_execution.verification_failed",
+                "message": "Fork Ops config verification failed after migration execution.",
+                "diagnostics": report.get("diagnostics", []),
+            }
+        )
+    return results, blockers
 
 
 def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
@@ -668,8 +939,8 @@ def _deferred_removals(retained_source_materials: list[dict[str, Any]]) -> list[
             "path": material["path"],
             "status": "deferred",
             "reason": (
-                "Removal is deferred because migration execution is not available and "
-                "source material remains fork-local authority."
+                "Removal is deferred because source material remains fork-local authority "
+                "until replacement validation succeeds."
             ),
         }
         for material in retained_source_materials

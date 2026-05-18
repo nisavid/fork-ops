@@ -12,6 +12,7 @@ For an unconfigured fork, start with migration assessment instead.
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
+uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 ```
 
@@ -32,6 +33,7 @@ MCP tools expose the same surface for agents:
 - `fork_ops_migration_assessment`
 - `fork_ops_migration_plan`
 - `fork_ops_migration_dry_run`
+- `fork_ops_migration_execute`
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
 
@@ -51,7 +53,12 @@ Use `provenance-ready` only when source, artifact, package, runtime, or install-
 
 ## Mutation Policy
 
-The foundation implementation does not run broad sync mutations, PR publication closeout, or migration execution. Agents should report the missing capability and provide the smallest safe next step.
+The foundation implementation supports guarded migration execution for
+blocker-free plans that create `.agents/fork-ops.toml`, preserve retained source
+materials, and verify the resulting capability level. It does not run broad
+sync mutations, PR publication closeout, arbitrary migration edits, or
+source-material removal. Agents should report missing capabilities and provide
+the smallest safe next step.
 
 When mutation surfaces exist, they should share core mutation gate logic:
 

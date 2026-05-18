@@ -40,9 +40,13 @@ The merged foundation supports:
 - Read-only migration assessment, non-mutating config proposal generation, and
   non-mutating migration plan generation.
 - Non-mutating migration dry run for migration plan previews.
+- Guarded migration execution for blocker-free plans that create
+  `.agents/fork-ops.toml`, preserve retained source materials, and verify the
+  resulting capability level.
 
-Do not describe broad upstream sync, publication closeout, or migration
-execution as implemented. They are planned follow-up work.
+Do not describe broad upstream sync, publication closeout, source-material
+removal, or arbitrary migration edits as implemented. They are planned
+follow-up work.
 
 ## Source Map
 
