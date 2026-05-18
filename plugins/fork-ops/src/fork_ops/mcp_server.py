@@ -14,6 +14,7 @@ from .core import (
     assess_migration,
     build_status_report,
     find_config_path,
+    generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
     schema_json,
@@ -92,8 +93,14 @@ def fork_ops_migration_assessment(
     repo_path: str = ".",
     include_proposed_config_patch: bool = False,
 ) -> dict[str, Any]:
-    """Run a read-only Migration Assessment for fork-related materials."""
+    """Run a read-only migration assessment for fork-related materials."""
     return assess_migration(repo_path, include_proposed_config_patch=include_proposed_config_patch)
+
+
+@_tool
+def fork_ops_migration_plan(repo_path: str = ".") -> dict[str, Any]:
+    """Generate a non-mutating migration plan from fork-related materials."""
+    return generate_migration_plan(repo_path)
 
 
 @_tool

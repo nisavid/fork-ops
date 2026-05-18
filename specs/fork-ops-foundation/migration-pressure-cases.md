@@ -11,7 +11,7 @@ Source materials:
 
 This pressure case exercises the first migration target because it contains fork-specific upstream ref policy, stable-release selection, default sync baseline policy, forbidden sync flows, and closeout evidence.
 
-Expected Migration Assessment signals:
+Expected migration assessment signals:
 
 - `upstream/main`, `upstream-main`, `origin/upstream-stable`, and `upstream-stable` appear as candidate ref roles for `upstream_tracks`.
 - GitHub Releases appears as the release-channel source for the stable channel.
@@ -20,4 +20,12 @@ Expected Migration Assessment signals:
 - `merge-base --is-ancestor` appears as an ancestry check.
 - Force-push avoidance appears as a forbidden history rewrite policy.
 
-The assessment should not mutate Lemonade. It should preserve these facts as evidence for a later Migration Plan.
+The assessment should not mutate Lemonade. It should preserve these facts as evidence for the migration plan.
+
+Expected migration plan sections:
+
+- evidence for the upstream-ref source material and extracted facts
+- proposed config patch for `.agents/fork-ops.toml`
+- retained source material with removal deferred until dry run and execution
+- required review for the config proposal and retained source material
+- validation requirements for config validation and capability reporting

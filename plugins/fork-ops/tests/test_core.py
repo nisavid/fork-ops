@@ -10,6 +10,7 @@ from fork_ops.core import (
     CONFIG_RELATIVE_PATH,
     assess_migration,
     build_status_report,
+    generate_migration_plan,
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
@@ -416,6 +417,81 @@ uncertainty_destination = "ask-human-operator"
             parsed["divergence_policy"]["uncertainty_destination"],
             "ask-human-operator",
         )
+
+    def test_migration_plan_distinguishes_plan_sections_for_lemonade_pressure_case(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+
+            plan = generate_migration_plan(repo)
+
+        self.assertEqual(plan["mode"], "non-mutating")
+        self.assertEqual(plan["operation"], "migration-plan")
+        self.assertTrue(plan["requires_review"])
+        self.assertEqual(plan["summary"]["candidate_count"], 1)
+        self.assertEqual(plan["summary"]["retained_source_material_count"], 1)
+        self.assertIn("proposed_config_patch", plan)
+        self.assertEqual(plan["proposed_config_patch"]["operation"], "create")
+        self.assertEqual(plan["proposed_config_patch"]["target_path"], ".agents/fork-ops.toml")
+        self.assertEqual(plan["proposed_config_patch"]["diagnostics"], [])
+        evidence = plan["evidence"]
+        self.assertEqual(
+            evidence[0]["source_path"],
+            ".agents/skills/working-with-upstream-refs/SKILL.md",
+        )
+        self.assertIn("upstream_intelligence", evidence[0]["domains"])
+        facts = {
+            (fact["kind"], fact["value"], fact["suggested_config"])
+            for fact in evidence[0]["facts"]
+        }
+        self.assertIn(
+            (
+                "default_sync_baseline",
+                "origin/upstream-stable",
+                "sync_policy.default_sync_baseline",
+            ),
+            facts,
+        )
+        [retained] = plan["retained_source_materials"]
+        self.assertEqual(retained["path"], ".agents/skills/working-with-upstream-refs/SKILL.md")
+        self.assertEqual(retained["replacement_status"], "deferred")
+        self.assertEqual(plan["deferred_removals"][0]["path"], retained["path"])
+        self.assertEqual(plan["blockers"], [])
+        review_codes = {item["code"] for item in plan["required_review"]}
+        self.assertIn("review.proposed_config_patch", review_codes)
+        self.assertIn("review.retained_source_materials", review_codes)
+        validation_codes = {item["code"] for item in plan["validation_requirements"]}
+        self.assertIn("validation.config_validate", validation_codes)
+
+    def test_migration_plan_records_semantic_coverage_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / "AGENTS.md"
+            path.write_text("Review bot policy lives here, but no structured fork facts yet.\n")
+
+            plan = generate_migration_plan(repo)
+
+        self.assertEqual(plan["summary"]["semantic_coverage"], "incomplete")
+        self.assertEqual(plan["blockers"][0]["code"], "semantic_coverage.incomplete")
+        self.assertEqual(plan["blockers"][0]["paths"], ["AGENTS.md"])
+
+    def test_migration_plan_semantic_coverage_ignores_config_diagnostic_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / ".agents/skills/default-baseline/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "Use origin/upstream-stable as the default upstream baseline for sync work.\n"
+            )
+
+            plan = generate_migration_plan(repo)
+
+        self.assertEqual(plan["summary"]["semantic_coverage"], "complete")
+        blocker_codes = {blocker["code"] for blocker in plan["blockers"]}
+        self.assertIn("proposed_config_patch.diagnostics_failed", blocker_codes)
+        self.assertNotIn("semantic_coverage.incomplete", blocker_codes)
 
 
 UPSTREAM_REF_PRESSURE_TEXT = """# Working With Upstream Refs

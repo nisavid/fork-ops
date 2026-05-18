@@ -1,6 +1,6 @@
 # Fork Ops Migration
 
-Migration starts with read-only Migration Assessment.
+Migration starts with read-only migration assessment.
 
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
@@ -8,7 +8,7 @@ uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 
 Assessment scans likely fork-related agent materials and reports candidate docs, skills, scripts, configs, and instructions. It starts with agent-facing locations such as `AGENTS.md`, `CLAUDE.md`, `.agents/`, `.codex/`, `docs/agents/`, `docs/adr/`, and `docs/maintainers/`. It does not edit files.
 
-For each candidate, assessment should preserve enough structure to support a later Migration Plan. In particular, upstream-ref materials should expose:
+For each candidate, assessment should preserve enough structure to support a later migration plan. In particular, upstream-ref materials should expose:
 
 - ref roles that likely become `upstream_tracks`
 - release-channel hints that likely become `release_channels`
@@ -17,7 +17,7 @@ For each candidate, assessment should preserve enough structure to support a lat
 - ancestry checks and forbidden history rewrites that likely become sync Mutation Gates
 
 The foundation also exposes a non-mutating proposed config patch. It converts
-Migration Assessment candidates into a draft `.agents/fork-ops.toml` payload for
+migration assessment candidates into a draft `.agents/fork-ops.toml` payload for
 review.
 
 ```bash
@@ -25,20 +25,42 @@ uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 ```
 
-The proposed config patch is not a Migration Plan or Migration Execution. It
+The proposed config patch is not a migration plan or migration execution. It
 must be scrutinized against source materials before application. If important
 source semantics are not represented, improve the deterministic generator or
 switch that migration slice to an LLM-guided planner with a rubric and a
 structured config patch output contract.
 
+A migration plan combines the assessment and proposed config patch into a
+reviewable non-mutating plan.
+
+```bash
+uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
+```
+
+The plan output separates:
+
+- source evidence and extracted facts
+- the proposed config patch
+- retained source materials that remain fork-local authority
+- deferred removals
+- blockers such as incomplete semantic coverage or config diagnostics
+- required review and validation requirements
+
+The plan does not edit `.agents/fork-ops.toml` and does not remove source
+materials. It is an input to migration dry run.
+
 ## Migration Lifecycle
 
-1. Migration Assessment maps existing material to proposed Fork Ops config sections, docs, skills, tools, hooks, and portability hints.
-2. Migration Plan defines the specific edits, removals, replacements, and verification steps.
-3. Migration Dry Run previews the Migration Plan without mutating the repo.
-4. Migration Execution applies a validated plan and verifies the resulting Fork Ops capability level.
+1. Migration assessment maps existing material to proposed Fork Ops config sections, docs, skills, tools, hooks, and portability hints.
+2. Migration plan defines the specific edits, removals, replacements, blockers, and verification steps.
+3. Migration dry run previews the migration plan without mutating the repo.
+4. Migration execution applies a validated plan and verifies the resulting Fork Ops capability level.
 
-The foundation implementation supports Migration Assessment and non-mutating proposed config patch generation. Plan, dry run, and execution are unavailable until target functionality exists for the material being migrated.
+The implementation supports migration assessment, non-mutating proposed config
+patch generation, and non-mutating migration plan generation. Dry run and
+execution are unavailable until target functionality exists for the material
+being migrated.
 
 ## Migration Boundaries
 

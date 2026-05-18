@@ -15,6 +15,7 @@ from .core import (
     assess_migration,
     build_status_report,
     create_initial_config_text,
+    generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
     schema_json,
@@ -85,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assess migration from existing fork materials.",
     )
     migration_subcommands = migration.add_subparsers(dest="migration_command", required=True)
-    assess = migration_subcommands.add_parser("assess", help="Run read-only Migration Assessment.")
+    assess = migration_subcommands.add_parser("assess", help="Run read-only migration assessment.")
     _add_repo_arg(assess)
     assess.add_argument(
         "--with-proposed-config",
@@ -93,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include the non-mutating proposed config patch in the assessment output.",
     )
     assess.set_defaults(func=cmd_migration_assess)
+    plan = migration_subcommands.add_parser(
+        "plan",
+        help="Generate a non-mutating migration plan.",
+    )
+    _add_repo_arg(plan)
+    plan.set_defaults(func=cmd_migration_plan)
     propose = migration_subcommands.add_parser(
         "propose-config",
         help="Generate a non-mutating Fork Ops config proposal.",
@@ -209,6 +216,11 @@ def cmd_migration_assess(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    return 0
+
+
+def cmd_migration_plan(args: argparse.Namespace) -> int:
+    print(json.dumps(generate_migration_plan(args.repo), indent=2, sort_keys=True))
     return 0
 
 

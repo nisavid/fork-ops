@@ -17,11 +17,12 @@ config, but it does not mutate the fork.
 >
 > **Done:** Codex plugin foundation, `.agents/fork-ops.toml` schema, Python
 > core library, CLI, MCP server, capability reporting, live Git diagnostics,
-> read-only migration assessment, and non-mutating config proposal generation.
+> read-only migration assessment, non-mutating config proposal generation, and
+> non-mutating migration plan generation.
 >
-> **Planned:** migration plan generation, migration dry run, guarded migration
-> execution, Lemonade onboarding, and later mutation-capable sync, review, and
-> publication workflows.
+> **Planned:** migration dry run, guarded migration execution, Lemonade
+> onboarding, and later mutation-capable sync, review, and publication
+> workflows.
 
 ## Who this is for
 
@@ -49,6 +50,7 @@ docs, policies, and refs that are authoritative for that fork.
 | User need | Current support |
 | --- | --- |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
+| Plan a reviewed migration | Migration plan generation combines evidence, config patch, retained source material, blockers, and validation requirements without editing files. |
 | Draft a starting config | Config proposal generation emits review-required TOML without editing the fork. |
 | Validate fork authority | The schema and CLI validate `.agents/fork-ops.toml` for defined capability levels. |
 | See supported operations | Capability reporting combines config state with live Git remote and ref checks. |
@@ -76,6 +78,7 @@ Start here when a fork does not yet have `.agents/fork-ops.toml`.
 
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
+uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
 ```
 
@@ -105,10 +108,9 @@ uv run --package fork-ops fork-ops capability report --repo /path/to/configured-
 
 ## Roadmap
 
-Next, Fork Ops turns assessment into a reviewed migration workflow: plan, dry
-run, guarded execution, then Lemonade onboarding.
+Next, Fork Ops turns the non-mutating plan into a reviewed migration workflow:
+dry run, guarded execution, then Lemonade onboarding.
 
-- [#3](https://github.com/nisavid/fork-ops/issues/3): Implement migration plan generation.
 - [#4](https://github.com/nisavid/fork-ops/issues/4): Implement migration dry run.
 - [#5](https://github.com/nisavid/fork-ops/issues/5): Implement guarded migration execution.
 - [#6](https://github.com/nisavid/fork-ops/issues/6): Onboard Lemonade through the Fork Ops migration flow.
