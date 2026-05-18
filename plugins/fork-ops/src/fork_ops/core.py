@@ -441,6 +441,162 @@ def generate_migration_plan(
     }
 
 
+def dry_run_migration(
+    repo_path: str | Path = ".",
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
+    return dry_run_migration_plan(migration_plan)
+
+
+def dry_run_migration_plan(
+    plan: dict[str, Any],
+    repo_path: str | Path | None = None,
+) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        raise ForkOpsError("Migration dry run requires a migration plan object.")
+    if plan.get("operation") != "migration-plan":
+        raise ForkOpsError("Migration dry run input must have operation='migration-plan'.")
+
+    proposed_config_patch = plan.get("proposed_config_patch", {})
+    if not isinstance(proposed_config_patch, dict):
+        raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.")
+
+    normalized_repo_path = _dry_run_repo_path(plan, repo_path)
+    file_edits = _dry_run_file_edits(proposed_config_patch)
+    config_changes = _dry_run_config_changes(proposed_config_patch)
+    retained_materials = _require_plan_list(plan, "retained_source_materials")
+    deferred_removals = _require_plan_list(plan, "deferred_removals")
+    blocked_steps = _dry_run_blocked_steps(plan)
+    expected_verification_commands = _require_plan_list(plan, "validation_requirements")
+    return {
+        "repo_path": normalized_repo_path,
+        "mode": "non-mutating",
+        "operation": "migration-dry-run",
+        "plan_operation": plan.get("operation"),
+        "can_execute": False,
+        "summary": {
+            "file_edit_count": len(file_edits),
+            "config_change_count": len(config_changes),
+            "retained_material_count": len(retained_materials),
+            "blocked_step_count": len(blocked_steps),
+            "verification_command_count": len(expected_verification_commands),
+        },
+        "file_edits": file_edits,
+        "config_changes": config_changes,
+        "retained_materials": retained_materials,
+        "deferred_removals": deferred_removals,
+        "blocked_steps": blocked_steps,
+        "expected_verification_commands": expected_verification_commands,
+        "limitations": [
+            "This migration dry run is non-mutating and does not apply config or edit files.",
+            "Migration execution is unavailable; blocked steps must remain blocked.",
+            (
+                "Retain source materials until migration execution exists and validates "
+                "the replacement."
+            ),
+        ],
+        "next_actions": [
+            "Review file_edits and config_changes against the migration plan evidence.",
+            "Resolve or explicitly waive blocked_steps before migration execution.",
+            (
+                "Run expected_verification_commands after a future migration execution "
+                "applies changes."
+            ),
+        ],
+    }
+
+
+def _dry_run_repo_path(plan: dict[str, Any], repo_path: str | Path | None) -> str:
+    raw_path = repo_path if repo_path is not None else plan.get("repo_path")
+    if not isinstance(raw_path, str | Path) or not str(raw_path):
+        raise ForkOpsError("Migration dry run input has malformed repo_path.")
+    return str(Path(raw_path).expanduser().resolve())
+
+
+def _dry_run_file_edits(proposed_config_patch: dict[str, Any]) -> list[dict[str, Any]]:
+    target_path = proposed_config_patch.get("target_path")
+    if not isinstance(target_path, str) or not target_path:
+        raise ForkOpsError(
+            "Migration dry run input has malformed proposed_config_patch.target_path."
+        )
+    operation = proposed_config_patch.get("operation", "review-and-merge")
+    if not isinstance(operation, str):
+        raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.operation.")
+    content = proposed_config_patch.get("toml", "")
+    if not isinstance(content, str):
+        raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.toml.")
+    return [
+        {
+            "path": target_path,
+            "action": operation,
+            "status": "preview-only",
+            "content_kind": "fork-ops-config",
+            "content": content,
+            "diagnostics": _require_patch_list(proposed_config_patch, "diagnostics"),
+        }
+    ]
+
+
+def _dry_run_config_changes(proposed_config_patch: dict[str, Any]) -> list[dict[str, Any]]:
+    target_path = proposed_config_patch.get("target_path")
+    if not isinstance(target_path, str) or not target_path:
+        raise ForkOpsError(
+            "Migration dry run input has malformed proposed_config_patch.target_path."
+        )
+    operation = proposed_config_patch.get("operation", "review-and-merge")
+    if not isinstance(operation, str):
+        raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.operation.")
+    config = proposed_config_patch.get("config", {})
+    if not isinstance(config, dict):
+        raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.config.")
+    return [
+        {
+            "target_path": target_path,
+            "action": operation,
+            "requires_review": bool(proposed_config_patch.get("requires_review", True)),
+            "config": copy.deepcopy(config),
+            "diagnostics": _require_patch_list(proposed_config_patch, "diagnostics"),
+        }
+    ]
+
+
+def _dry_run_blocked_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    blocked_steps: list[dict[str, Any]] = []
+    for blocker in _require_plan_list(plan, "blockers"):
+        blocker.setdefault("step", "review_migration_plan")
+        blocker.setdefault("source", "migration_plan")
+        blocked_steps.append(blocker)
+    blocked_steps.append(
+        {
+            "code": "migration_execution.unavailable",
+            "step": "apply_migration_plan",
+            "source": "fork_ops_capability",
+            "message": (
+                "Migration execution is not implemented; dry run cannot apply config, "
+                "edit files, or remove retained source materials."
+            ),
+        }
+    )
+    return blocked_steps
+
+
+def _require_plan_list(plan: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    if key not in plan:
+        raise ForkOpsError(f"Migration dry run input is missing {key}.")
+    value = plan[key]
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ForkOpsError(f"Migration dry run input has malformed {key}.")
+    return [copy.deepcopy(item) for item in value]
+
+
+def _require_patch_list(patch: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = patch.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ForkOpsError(f"Migration dry run input has malformed proposed_config_patch.{key}.")
+    return [copy.deepcopy(item) for item in value]
+
+
 def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for path in _iter_candidate_paths(repo):

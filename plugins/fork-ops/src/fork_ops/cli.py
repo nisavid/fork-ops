@@ -15,6 +15,8 @@ from .core import (
     assess_migration,
     build_status_report,
     create_initial_config_text,
+    dry_run_migration,
+    dry_run_migration_plan,
     generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
@@ -100,6 +102,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_repo_arg(plan)
     plan.set_defaults(func=cmd_migration_plan)
+    dry_run = migration_subcommands.add_parser(
+        "dry-run",
+        help="Preview a migration plan without mutating the repository.",
+    )
+    dry_run_source = dry_run.add_mutually_exclusive_group()
+    dry_run_source.add_argument("--repo", default=".", help="Repository root to inspect.")
+    dry_run_source.add_argument(
+        "--plan",
+        help="Read an existing migration plan JSON file instead of generating one from --repo.",
+    )
+    dry_run.set_defaults(func=cmd_migration_dry_run)
     propose = migration_subcommands.add_parser(
         "propose-config",
         help="Generate a non-mutating Fork Ops config proposal.",
@@ -224,6 +237,20 @@ def cmd_migration_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_migration_dry_run(args: argparse.Namespace) -> int:
+    if args.plan:
+        print(
+            json.dumps(
+                dry_run_migration_plan(_read_json_plan(args.plan)),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(json.dumps(dry_run_migration(args.repo), indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_migration_propose_config(args: argparse.Namespace) -> int:
     patch = propose_migration_config_patch(args.repo)
     if args.format == "toml":
@@ -256,6 +283,19 @@ def _has_errors(report: dict[str, Any]) -> bool:
 
 def _diagnostics_have_errors(diagnostics: list[dict[str, Any]]) -> bool:
     return any(item.get("severity") == "error" for item in diagnostics)
+
+
+def _read_json_plan(path: str) -> dict[str, Any]:
+    try:
+        raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text()
+        parsed = json.loads(raw)
+    except OSError as exc:
+        raise ForkOpsError(f"Migration plan read failed: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ForkOpsError(f"Migration plan JSON parse failed for {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ForkOpsError("Migration plan JSON must parse to an object.")
+    return parsed
 
 
 if __name__ == "__main__":

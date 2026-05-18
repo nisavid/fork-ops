@@ -13,6 +13,7 @@ from .core import (
     ForkOpsError,
     assess_migration,
     build_status_report,
+    dry_run_migration,
     find_config_path,
     generate_migration_plan,
     load_raw_config,
@@ -24,7 +25,7 @@ _MCP_IMPORT_ERROR: ModuleNotFoundError | None = None
 _FAST_MCP_CLASS: Any = None
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without optional dependency.
     _MCP_IMPORT_ERROR = exc
 else:
@@ -101,6 +102,15 @@ def fork_ops_migration_assessment(
 def fork_ops_migration_plan(repo_path: str = ".") -> dict[str, Any]:
     """Generate a non-mutating migration plan from fork-related materials."""
     return generate_migration_plan(repo_path)
+
+
+@_tool
+def fork_ops_migration_dry_run(
+    repo_path: str = ".",
+    migration_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Preview a migration plan without mutating the repository."""
+    return dry_run_migration(repo_path, plan=migration_plan)
 
 
 @_tool
