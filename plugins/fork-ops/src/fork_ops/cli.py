@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = config_subcommands.add_parser("show", help="Show Fork Ops config.")
     _add_repo_arg(show)
-    show.add_argument("--format", choices=["toml", "json"], default="toml")
+    show.add_argument("--format", choices=["toml", "json"])
     show.add_argument("--normalized", action="store_true", help="Show normalized JSON config.")
     show.set_defaults(func=cmd_config_show)
 
@@ -114,7 +114,10 @@ def _add_repo_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
-    if args.normalized or args.format == "json":
+    output_format = args.format or ("json" if args.normalized else "toml")
+    if args.normalized and output_format == "toml":
+        raise ForkOpsError("--normalized requires JSON output; use --format json or omit --format.")
+    if output_format == "json":
         report = build_status_report(args.repo, include_config=True)
         if "config" not in report:
             print(json.dumps(report, indent=2, sort_keys=True), file=sys.stderr)
@@ -127,18 +130,25 @@ def cmd_config_show(args: argparse.Namespace) -> int:
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
     report = build_status_report(args.repo, include_config=args.json)
+    required_available = True
+    if args.required_level:
+        level = report["capability"]["levels"][args.required_level]
+        required_available = bool(level["available"])
+        report["required_level"] = {
+            "level": args.required_level,
+            "available": required_available,
+            "missing": level["missing"],
+        }
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         _print_diagnostics(report)
         highest = report["capability"]["highest_available"] or "none"
         print(f"highest_available={highest}")
-    required_available = True
     if args.required_level:
-        required_available = bool(report["capability"]["levels"][args.required_level]["available"])
         if not required_available:
             if not args.json:
-                missing = report["capability"]["levels"][args.required_level]["missing"]
+                missing = report["required_level"]["missing"]
                 print(f"required_level={args.required_level}: unavailable")
                 print(f"missing_for_required_level={', '.join(missing) or 'none'}")
     if _has_errors(report):

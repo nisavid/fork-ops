@@ -22,6 +22,6 @@ uv run --package fork-ops fork-ops capability report --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
-uv run ruff check --cache-dir .ruff_cache
-uv run mypy --cache-dir .mypy_cache
+uv run --package fork-ops ruff check --cache-dir .ruff_cache
+uv run --package fork-ops mypy --cache-dir .mypy_cache
 ```

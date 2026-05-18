@@ -5,6 +5,7 @@ This module requires the optional ``mcp`` dependency.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, cast
 
 from .core import (
@@ -18,18 +19,28 @@ from .core import (
     schema_json,
 )
 
+_MCP_IMPORT_ERROR: ModuleNotFoundError | None = None
+_FAST_MCP_CLASS: Any = None
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without optional dependency.
-    raise SystemExit(
-        "The Fork Ops MCP server requires the optional dependency: pip install 'fork-ops[mcp]'"
-    ) from exc
+    _MCP_IMPORT_ERROR = exc
+else:
+    _FAST_MCP_CLASS = FastMCP
 
 
-mcp = FastMCP("Fork Ops")
+ToolFunc = Callable[..., Any]
+mcp = _FAST_MCP_CLASS("Fork Ops") if _FAST_MCP_CLASS is not None else None
 
 
-@mcp.tool()
+def _tool(func: ToolFunc) -> ToolFunc:
+    if mcp is None:
+        return func
+    return cast(ToolFunc, mcp.tool()(func))
+
+
+@_tool
 def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[str, Any]:
     """Read the Fork Ops config for a repository."""
     if normalized:
@@ -57,7 +68,7 @@ def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[
     }
 
 
-@mcp.tool()
+@_tool
 def fork_ops_config_validate(repo_path: str = ".", required_level: str = "") -> dict[str, Any]:
     """Validate Fork Ops config and optionally check a required capability level."""
     report = build_status_report(repo_path, include_config=False)
@@ -70,13 +81,13 @@ def fork_ops_config_validate(repo_path: str = ".", required_level: str = "") -> 
     return report
 
 
-@mcp.tool()
+@_tool
 def fork_ops_capability_report(repo_path: str = ".") -> dict[str, Any]:
     """Report Fork Ops capability levels for a repository."""
     return cast(dict[str, Any], build_status_report(repo_path, include_config=False)["capability"])
 
 
-@mcp.tool()
+@_tool
 def fork_ops_migration_assessment(
     repo_path: str = ".",
     include_proposed_config_patch: bool = False,
@@ -85,19 +96,23 @@ def fork_ops_migration_assessment(
     return assess_migration(repo_path, include_proposed_config_patch=include_proposed_config_patch)
 
 
-@mcp.tool()
+@_tool
 def fork_ops_migration_config_patch(repo_path: str = ".") -> dict[str, Any]:
     """Generate a non-mutating Fork Ops config proposal for migration planning."""
     return propose_migration_config_patch(repo_path)
 
 
-@mcp.tool()
+@_tool
 def fork_ops_schema() -> str:
     """Return the Fork Ops config JSON Schema."""
     return schema_json()
 
 
 def main() -> None:
+    if mcp is None:
+        raise SystemExit(
+            "The Fork Ops MCP server requires the optional dependency: pip install 'fork-ops[mcp]'"
+        ) from _MCP_IMPORT_ERROR
     mcp.run()
 
 

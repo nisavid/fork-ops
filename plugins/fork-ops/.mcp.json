@@ -1,9 +1,11 @@
 {
-  "fork-ops": {
-    "command": "bash",
-    "args": [
-      "-lc",
-      "if [ -z \"${PLUGIN_ROOT:-}\" ]; then echo \"PLUGIN_ROOT is required\" >&2; exit 2; fi; exec uv run --project \"$PLUGIN_ROOT\" --extra mcp fork-ops-mcp"
-    ]
+  "mcpServers": {
+    "fork-ops": {
+      "command": "bash",
+      "args": [
+        "-lc",
+        "if [ -z \"${PLUGIN_ROOT:-}\" ]; then echo \"PLUGIN_ROOT is required\" >&2; exit 2; fi; exec uv run --project \"$PLUGIN_ROOT\" --extra mcp fork-ops-mcp"
+      ]
+    }
   }
 }

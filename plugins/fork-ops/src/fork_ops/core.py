@@ -15,6 +15,43 @@ from urllib.parse import urlparse
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
 
 CONFIG_RELATIVE_PATH = Path(".agents/fork-ops.toml")
+_CANDIDATE_FILE_SUFFIXES = {".json", ".md", ".toml", ".yaml", ".yml"}
+_CANDIDATE_SCAN_SKIP_DIRS = {
+    ".git",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+}
+_FORK_SIGNAL_NEEDLES = (
+    "baseline",
+    "disabled",
+    "fork",
+    "force-push",
+    "github releases",
+    "merge-base",
+    "release channel",
+    "release tag",
+    "review automation",
+    "review bot",
+    "stable release",
+    "sync",
+    "issue tracker",
+    "prs",
+    "pull request",
+    "pull requests",
+    "upstream",
+    "upstream issue",
+    "upstream issues",
+    "upstream-main",
+    "upstream-stable",
+    "upstream track",
+    "divergence",
+    "code scanning",
+    "review thread",
+)
 
 
 class ForkOpsError(RuntimeError):
@@ -297,7 +334,7 @@ def assess_migration(
             "candidate_count": len(candidates),
             "has_fork_ops_config": (repo / CONFIG_RELATIVE_PATH).exists(),
         },
-        "candidates": sorted(candidates, key=lambda item: item["path"]),
+        "candidates": candidates,
         "next_actions": [
             "Review candidates before creating a Migration Plan.",
             "Generate a proposed config patch only when the migration plan needs one.",
@@ -350,6 +387,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
         signals = _fork_signals(lowered_text)
         if not signals:
             continue
+        urls = _extract_urls(raw_text)
         candidates.append(
             {
                 "path": rel,
@@ -357,6 +395,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
                 "signals": signals,
                 "domains": _candidate_domains(signals),
                 "extracted_facts": _extracted_facts(raw_text),
+                "urls": urls,
                 "proposed_destination": _proposed_destination(rel, signals),
                 "portability_hint": _portability_hint(rel, signals),
             }
@@ -722,9 +761,7 @@ def _upstream_default_branch(repo: Path) -> str:
 def _candidate_urls(repo: Path, candidates: list[dict[str, Any]]) -> list[str]:
     urls: list[str] = []
     for candidate in candidates:
-        path = repo / candidate["path"]
-        text = _read_text(path)
-        urls.extend(_extract_urls(text))
+        urls.extend(str(url) for url in candidate.get("urls", []))
     return _dedupe_strings(urls)
 
 
@@ -1142,6 +1179,8 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
             check=False,
             text=True,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except subprocess.TimeoutExpired as exc:
@@ -1165,18 +1204,13 @@ def _iter_candidate_paths(repo: Path) -> Iterable[Path]:
             yield root
         elif root.is_dir():
             for path in root.rglob("*"):
-                if path.is_file() and path.suffix.lower() in {
-                    ".md",
-                    ".toml",
-                    ".json",
-                    ".yaml",
-                    ".yml",
-                }:
+                if not path.is_file():
+                    continue
+                relative_parts = path.relative_to(root).parts
+                if any(part in _CANDIDATE_SCAN_SKIP_DIRS for part in relative_parts[:-1]):
+                    continue
+                if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
                     yield path
-
-
-def _read_lower(path: Path) -> str:
-    return _read_text(path).lower()
 
 
 def _read_text(path: Path) -> str:
@@ -1188,38 +1222,26 @@ def _read_text(path: Path) -> str:
 
 def _fork_signals(text: str) -> list[str]:
     signals = []
-    for needle in (
-        "baseline",
-        "disabled",
-        "fork",
-        "force-push",
-        "github releases",
-        "merge-base",
-        "release channel",
-        "release tag",
-        "review automation",
-        "review bot",
-        "stable release",
-        "sync",
-        "issue tracker",
-        "pull request",
-        "upstream",
-        "upstream issue",
-        "upstream-main",
-        "upstream-stable",
-        "upstream track",
-        "divergence",
-        "code scanning",
-        "review thread",
-    ):
-        if needle in text:
+    for needle in _FORK_SIGNAL_NEEDLES:
+        if _contains_signal(text, needle):
             signals.append(needle)
     return signals
 
 
 def _candidate_domains(signals: list[str]) -> list[str]:
     domains = []
-    if any(signal in signals for signal in ("upstream", "release tag", "upstream-main")):
+    if any(
+        signal in signals
+        for signal in (
+            "github releases",
+            "release tag",
+            "stable release",
+            "upstream",
+            "upstream-main",
+            "upstream-stable",
+            "upstream track",
+        )
+    ):
         domains.append("upstream_intelligence")
     if any(signal in signals for signal in ("sync", "baseline", "merge-base")):
         domains.append("sync")
@@ -1227,14 +1249,16 @@ def _candidate_domains(signals: list[str]) -> list[str]:
         domains.append("divergence")
     if any(signal in signals for signal in ("force-push", "disabled")):
         domains.append("authority")
-    if "upstream issue" in signals:
+    if "upstream issue" in signals or "upstream issues" in signals:
         domains.append("authority")
     if any(
         signal in signals
         for signal in (
             "code scanning",
             "issue tracker",
+            "prs",
             "pull request",
+            "pull requests",
             "review automation",
             "review bot",
             "review thread",
@@ -1326,18 +1350,7 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    for url in _extract_urls(text):
-        slug = _github_repo_root_slug_from_url(url)
-        remote_name = _remote_name_for_url_context(text, url)
-        if slug and remote_name:
-            suggested_config = "fork_remotes.url" if remote_name == "origin" else "upstreams.url"
-            facts.append(
-                {
-                    "kind": "remote_url",
-                    "value": f"{remote_name}:{url}",
-                    "suggested_config": suggested_config,
-                }
-            )
+    facts.extend(_extract_remote_url_facts(text))
 
     return _unique_facts(facts)
 
@@ -1351,15 +1364,37 @@ def _looks_like_ref_role(ref: str) -> bool:
     )
 
 
-def _remote_name_for_url_context(text: str, url: str) -> str:
+def _contains_signal(text: str, needle: str) -> bool:
+    pattern = rf"(?<![a-z0-9_/-]){re.escape(needle)}(?![a-z0-9_/-])"
+    return re.search(pattern, text) is not None
+
+
+def _extract_remote_url_facts(text: str) -> list[dict[str, str]]:
+    facts: list[dict[str, str]] = []
     for line in text.splitlines():
-        if url not in line:
+        remote_name = _remote_name_for_line(line)
+        if not remote_name:
             continue
-        lowered = line.lower()
-        if "upstream" in lowered:
-            return "upstream"
-        if "origin" in lowered or "fork" in lowered:
-            return "origin"
+        for url in _extract_urls(line):
+            if not _github_repo_root_slug_from_url(url):
+                continue
+            suggested_config = "fork_remotes.url" if remote_name == "origin" else "upstreams.url"
+            facts.append(
+                {
+                    "kind": "remote_url",
+                    "value": f"{remote_name}:{url}",
+                    "suggested_config": suggested_config,
+                }
+            )
+    return facts
+
+
+def _remote_name_for_line(line: str) -> str:
+    lowered = line.lower()
+    if "upstream" in lowered:
+        return "upstream"
+    if "origin" in lowered or "fork" in lowered:
+        return "origin"
     return ""
 
 
@@ -1407,7 +1442,9 @@ def _proposed_destination(rel_path: str, signals: list[str]) -> str:
         for signal in (
             "code scanning",
             "issue tracker",
+            "prs",
             "pull request",
+            "pull requests",
             "review automation",
             "review bot",
             "review thread",
@@ -1436,7 +1473,9 @@ def _has_review_publication_signal(signals: set[str]) -> bool:
         for signal in (
             "code scanning",
             "issue tracker",
+            "prs",
             "pull request",
+            "pull requests",
             "review automation",
             "review bot",
             "review thread",
@@ -1456,6 +1495,7 @@ def _has_fork_specific_signal(signals: set[str]) -> bool:
             "sync",
             "upstream",
             "upstream issue",
+            "upstream issues",
             "upstream-main",
             "upstream-stable",
             "upstream track",
