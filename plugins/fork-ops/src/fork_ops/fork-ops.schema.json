@@ -1,0 +1,499 @@
+{
+  "$id": "https://github.com/nisavid/fork-ops/plugins/fork-ops/schema/fork-ops.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "authority": {
+      "additionalProperties": true,
+      "properties": {
+        "durable_discovery_destinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "escalation_policy": {
+          "type": "string"
+        },
+        "inference_labeling": {
+          "type": "string"
+        },
+        "pre_change_requirements": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "required_context_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "source_order": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "upstream_canon": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_order"
+      ],
+      "type": "object"
+    },
+    "change_targets": {
+      "additionalProperties": true,
+      "properties": {
+        "default": {
+          "enum": [
+            "fork",
+            "upstream",
+            "ask"
+          ],
+          "type": "string"
+        },
+        "replacement_prs": {
+          "type": "string"
+        },
+        "selective_upstreaming": {
+          "type": "string"
+        },
+        "upstream_contribution": {
+          "type": "string"
+        },
+        "upstream_issues": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "default"
+      ],
+      "type": "object"
+    },
+    "divergence_policy": {
+      "additionalProperties": true,
+      "properties": {
+        "inventory_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "preservation_checks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "uncertainty_destination": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "fork_remotes": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "push": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "local_gates": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "local_surfaces": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "kind": {
+            "enum": [
+              "config",
+              "doc",
+              "skill",
+              "script",
+              "hook",
+              "agent_instruction",
+              "migration_input",
+              "other"
+            ],
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "portability_hint": {
+            "enum": [
+              "fork-specific",
+              "shared-with-fork-policy",
+              "repo-ops-candidate"
+            ],
+            "type": "string"
+          },
+          "portability_hints": {
+            "items": {
+              "enum": [
+                "fork-specific",
+                "shared-with-fork-policy",
+                "repo-ops-candidate"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "repo_ops_candidate_scope": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "path"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "portability": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "publication_policy": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "release_channels": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "include_drafts": {
+            "type": "boolean"
+          },
+          "include_prereleases": {
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "github_latest_release",
+              "github_latest_prerelease",
+              "github_tag_pattern",
+              "manual"
+            ],
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "selection_source": {
+            "type": "string"
+          },
+          "tag_pattern": {
+            "type": "string"
+          },
+          "upstream": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "upstream",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "repository": {
+      "additionalProperties": true,
+      "properties": {
+        "default_branch": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "product_site": {
+          "type": "string"
+        },
+        "protected_branches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "host",
+        "owner",
+        "name",
+        "default_branch"
+      ],
+      "type": "object"
+    },
+    "review_policy": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "schema_version": {
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "type": "string"
+    },
+    "sync_policy": {
+      "additionalProperties": true,
+      "properties": {
+        "allowed_merge_methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "ancestry_checks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "conditional_ancestry_checks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "default_sync_baseline": {
+          "type": "string"
+        },
+        "default_sync_ref": {
+          "type": "string"
+        },
+        "forbid_history_rewrites": {
+          "type": "boolean"
+        },
+        "forbidden_flows": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "fork_sync_methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "fork_sync_start_ref": {
+          "type": "string"
+        },
+        "pre_sync_fetches": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "preserve_commit_identity": {
+          "type": "boolean"
+        },
+        "track_update_methods": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "uncertainty_destination": {
+          "type": "string"
+        },
+        "unreleased_upstream_main": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "upstream_tracks": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "evidence_checks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "id": {
+            "type": "string"
+          },
+          "local_branch": {
+            "type": "string"
+          },
+          "local_branch_policy": {
+            "type": "string"
+          },
+          "non_fast_forward_policy": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "owner_remote": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_ref": {
+            "type": "string"
+          },
+          "source_type": {
+            "enum": [
+              "release_channel",
+              "upstream_ref",
+              "manual"
+            ],
+            "type": "string"
+          },
+          "sync_eligible": {
+            "type": "boolean"
+          },
+          "tracking_ref": {
+            "type": "string"
+          },
+          "update_policy": {
+            "type": "string"
+          },
+          "upstream": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "upstream",
+          "ref",
+          "source_type",
+          "source"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "upstreams": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "default_branch": {
+            "type": "string"
+          },
+          "docs_url": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "push": {
+            "type": "boolean"
+          },
+          "push_url": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string"
+          },
+          "site_url": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "remote"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "repository",
+    "fork_remotes",
+    "upstreams",
+    "authority",
+    "change_targets"
+  ],
+  "title": "Fork Ops Config",
+  "type": "object"
+}

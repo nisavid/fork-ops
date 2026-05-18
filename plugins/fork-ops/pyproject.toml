@@ -18,13 +18,13 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = [
-  "mcp>=1.12.4"
+  "mcp>=1.23.0"
 ]
 
 [dependency-groups]
 dev = [
   "mypy>=1.18",
-  "pytest>=8.0",
+  "pytest>=9.0.3",
   "ruff>=0.14",
   "types-jsonschema>=4.25"
 ]
@@ -35,6 +35,9 @@ fork-ops-mcp = "fork_ops.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+fork_ops = ["fork-ops.schema.json"]
 
 [tool.ruff]
 line-length = 100

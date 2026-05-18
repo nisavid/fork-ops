@@ -9,6 +9,7 @@ import tomllib
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
 
@@ -368,8 +369,8 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
     upstream_id = _slug_id(upstream_slug[1])
     facts = _flatten_facts(candidates)
     urls = _candidate_urls(repo, candidates)
-    product_site = _first_matching_url(urls, "lemonade-server.ai", exclude="/docs")
-    docs_url = _first_matching_url(urls, "lemonade-server.ai/docs")
+    docs_url = _infer_docs_url(urls)
+    product_site = _infer_product_site_url(urls, docs_url)
     context_paths = _required_context_paths(repo)
 
     config: dict[str, Any] = {
@@ -745,11 +746,46 @@ def _github_repo_root_slug_from_url(url: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def _first_matching_url(urls: list[str], needle: str, exclude: str = "") -> str:
+def _infer_docs_url(urls: list[str]) -> str:
     for url in urls:
-        if needle in url and (not exclude or exclude not in url):
+        if _is_public_web_url(url) and _looks_like_docs_url(url):
             return url
     return ""
+
+
+def _infer_product_site_url(urls: list[str], docs_url: str = "") -> str:
+    for url in urls:
+        if not _is_public_web_url(url):
+            continue
+        if url == docs_url or _looks_like_docs_url(url):
+            continue
+        return _site_root(url)
+    if docs_url:
+        return _site_root(docs_url)
+    return ""
+
+
+def _is_public_web_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc != ""
+        and parsed.netloc != "github.com"
+    )
+
+
+def _looks_like_docs_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host_parts = parsed.netloc.lower().split(".")
+    path_parts = [part for part in parsed.path.lower().split("/") if part]
+    return "docs" in host_parts or (bool(path_parts) and path_parts[0] == "docs")
+
+
+def _site_root(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -1041,13 +1077,19 @@ def _git_output(repo: Path, *args: str) -> str | None:
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=False,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
+    command = ["git", "-C", str(repo), *args]
+    try:
+        return subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(command, 124, "", str(exc))
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(command, 127, "", str(exc))
 
 
 def _iter_candidate_paths(repo: Path) -> Iterable[Path]:

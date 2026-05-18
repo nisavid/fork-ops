@@ -6,8 +6,8 @@ Status: Draft
 
 Source materials:
 
-- `/home/nisavid/src/nisavid/lemonade/.agents/skills/working-with-upstream-refs/SKILL.md`
-- `/home/nisavid/src/nisavid/lemonade/docs/agents/fork-stewardship.md`
+- `.agents/skills/working-with-upstream-refs/SKILL.md`
+- `docs/agents/fork-stewardship.md`
 
 This pressure case exercises the first migration target because it contains fork-specific upstream ref policy, stable-release selection, default sync baseline policy, forbidden sync flows, and closeout evidence.
 
