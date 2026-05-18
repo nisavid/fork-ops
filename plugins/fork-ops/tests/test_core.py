@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from fork_ops.cli import main as cli_main
 from fork_ops.core import (
@@ -756,6 +757,23 @@ uncertainty_destination = "ask-human-operator"
             self.assertEqual(config_path.read_text(), original_config)
 
         self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
+    def test_migration_execution_does_not_overwrite_target_created_during_write(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            with patch.object(Path, "open", side_effect=FileExistsError):
+                result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["applied_edits"], [])
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
     def test_execute_migration_uses_embedded_repo_path_for_supplied_plan(self) -> None:
