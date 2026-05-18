@@ -92,7 +92,7 @@ def load_config(
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(config)
     repository = normalized.setdefault("repository", {})
-    if repository.get("owner") and repository.get("name"):
+    if isinstance(repository, dict) and repository.get("owner") and repository.get("name"):
         repository.setdefault("slug", f"{repository['owner']}/{repository['name']}")
     for key in (
         "fork_remotes",
@@ -212,19 +212,20 @@ def capability_report(
 
 def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    upstream_ids = _ids(config.get("upstreams", []))
-    release_channel_ids = _ids(config.get("release_channels", []))
-    track_ids = _ids(config.get("upstream_tracks", []))
+    upstreams = _section_items(config, "upstreams")
+    release_channels = _section_items(config, "release_channels")
+    upstream_tracks = _section_items(config, "upstream_tracks")
+    upstream_ids = _ids(upstreams)
+    release_channel_ids = _ids(release_channels)
+    track_ids = _ids(upstream_tracks)
 
-    diagnostics.extend(_duplicate_id_diagnostics("upstreams", config.get("upstreams", [])))
-    diagnostics.extend(
-        _duplicate_id_diagnostics("release_channels", config.get("release_channels", []))
-    )
-    diagnostics.extend(
-        _duplicate_id_diagnostics("upstream_tracks", config.get("upstream_tracks", []))
-    )
+    diagnostics.extend(_duplicate_id_diagnostics("upstreams", upstreams))
+    diagnostics.extend(_duplicate_id_diagnostics("release_channels", release_channels))
+    diagnostics.extend(_duplicate_id_diagnostics("upstream_tracks", upstream_tracks))
 
-    for index, channel in enumerate(config.get("release_channels", [])):
+    for index, channel in enumerate(release_channels):
+        if not isinstance(channel, dict):
+            continue
         upstream = channel.get("upstream")
         if upstream and upstream not in upstream_ids:
             diagnostics.append(
@@ -239,7 +240,9 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
                 )
             )
 
-    for index, track in enumerate(config.get("upstream_tracks", [])):
+    for index, track in enumerate(upstream_tracks):
+        if not isinstance(track, dict):
+            continue
         upstream = track.get("upstream")
         if upstream and upstream not in upstream_ids:
             diagnostics.append(
@@ -269,7 +272,8 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
                 )
             )
 
-    default_baseline = config.get("sync_policy", {}).get("default_sync_baseline")
+    sync_policy = _mapping_section(config, "sync_policy")
+    default_baseline = sync_policy.get("default_sync_baseline")
     if default_baseline and default_baseline not in track_ids:
         diagnostics.append(
             Diagnostic(
@@ -298,11 +302,17 @@ def git_diagnostics(repo: Path, config: dict[str, Any]) -> list[Diagnostic]:
         )
         return diagnostics
 
-    for index, remote in enumerate(config.get("fork_remotes", [])):
+    for index, remote in enumerate(_section_items(config, "fork_remotes")):
+        if not isinstance(remote, dict):
+            continue
         _check_remote_url(repo, remote, f"fork_remotes.{index}", diagnostics)
-    for index, upstream in enumerate(config.get("upstreams", [])):
+    for index, upstream in enumerate(_section_items(config, "upstreams")):
+        if not isinstance(upstream, dict):
+            continue
         _check_remote_url(repo, upstream, f"upstreams.{index}", diagnostics)
-    for index, track in enumerate(config.get("upstream_tracks", [])):
+    for index, track in enumerate(_section_items(config, "upstream_tracks")):
+        if not isinstance(track, dict):
+            continue
         ref = track.get("ref")
         if (
             isinstance(ref, str)
@@ -1100,13 +1110,23 @@ def _path_has_value(config: dict[str, Any], dotted_path: str) -> bool:
     return True
 
 
-def _ids(items: list[dict[str, Any]]) -> set[str]:
+def _section_items(config: dict[str, Any], key: str) -> list[Any]:
+    items = config.get(key, [])
+    return items if isinstance(items, list) else []
+
+
+def _mapping_section(config: dict[str, Any], key: str) -> dict[str, Any]:
+    section = config.get(key, {})
+    return section if isinstance(section, dict) else {}
+
+
+def _ids(items: Iterable[Any]) -> set[str]:
     return {
         item["id"] for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
 
 
-def _duplicate_id_diagnostics(section: str, items: list[dict[str, Any]]) -> list[Diagnostic]:
+def _duplicate_id_diagnostics(section: str, items: Iterable[Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     seen: set[str] = set()
     for index, item in enumerate(items):
