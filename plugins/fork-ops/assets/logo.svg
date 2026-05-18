@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 96" role="img" aria-label="Fork Ops">
+  <rect width="96" height="96" rx="16" fill="#2563eb"/>
+  <path d="M31 23v19a15 15 0 0 0 15 15h6" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+  <path d="M65 23v13a21 21 0 0 1-21 21" fill="none" stroke="#bfdbfe" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="31" cy="23" r="8" fill="#ffffff"/>
+  <circle cx="65" cy="23" r="8" fill="#bfdbfe"/>
+  <circle cx="58" cy="57" r="8" fill="#ffffff"/>
+  <path d="M58 65v12" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+  <text x="120" y="60" font-family="Inter, Arial, sans-serif" font-size="38" font-weight="700" fill="#111827">Fork Ops</text>
+</svg>
