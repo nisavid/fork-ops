@@ -829,6 +829,21 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.unsupported_target_path",
         )
 
+    def test_migration_execution_accepts_platform_separator_target_path(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["proposed_config_patch"]["target_path"] = ".agents\\fork-ops.toml"
+
+            result = execute_migration_plan(plan)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "applied")
+
     def test_migration_execution_does_not_overwrite_target_created_during_write(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -949,6 +964,31 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.validation_requirements_missing",
         )
 
+    def test_migration_execution_rejects_unknown_validation_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["validation_requirements"].append(
+                {
+                    "code": "validation.external_command",
+                    "command": "false",
+                    "when": "after applying the proposed fork ops config",
+                }
+            )
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.validation_requirement_unsupported",
+        )
+
     def test_migration_execution_rejects_changed_retained_source_material(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -1042,6 +1082,25 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.write_failed")
 
+    def test_migration_execution_removes_parent_created_for_blocked_write(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "AGENTS.md"
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            def target_appeared(*args: Any, **kwargs: Any) -> None:
+                raise FileExistsError("target appeared")
+
+            with patch("fork_ops.core.os.link", target_appeared):
+                result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((repo_path / ".agents").exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
     def test_mcp_migration_execution_rejects_plan_repo_path_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
             repo_path = Path(repo)
@@ -1118,12 +1177,41 @@ uncertainty_destination = "ask-human-operator"
             output = io.StringIO()
 
             with redirect_stdout(output):
-                exit_code = cli_main(["migration", "execute", "--plan", str(plan_path)])
+                exit_code = cli_main(
+                    ["migration", "execute", "--repo", str(repo_path), "--plan", str(plan_path)]
+                )
 
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["operation"], "migration-execution")
         self.assertEqual(payload["status"], "applied")
+
+    def test_cli_migration_execute_plan_rejects_repo_path_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            plan_path = repo_path / "migration-plan.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan_path.write_text(json.dumps(generate_migration_plan(repo_path)))
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    [
+                        "migration",
+                        "execute",
+                        "--repo",
+                        str(Path(other)),
+                        "--plan",
+                        str(plan_path),
+                    ]
+                )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_mcp_exposes_migration_execute(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

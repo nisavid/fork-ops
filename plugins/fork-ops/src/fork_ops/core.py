@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tomllib
+import uuid
 from collections.abc import Iterable
 from datetime import date, datetime, time
 from pathlib import Path
@@ -488,6 +490,8 @@ def dry_run_migration_plan(
                 "message": "Migration execution requires at least one validation requirement.",
             }
         )
+    else:
+        blocked_steps.extend(_validation_requirement_blockers(expected_verification_commands))
     return {
         "repo_path": normalized_repo_path,
         "mode": "non-mutating",
@@ -615,6 +619,7 @@ def _dry_run_file_edits(proposed_config_patch: dict[str, Any]) -> list[dict[str,
         raise ForkOpsError(
             "Migration dry run input has malformed proposed_config_patch.target_path."
         )
+    target_path = _normalize_migration_relative_path(target_path)
     operation = proposed_config_patch.get("operation", "review-and-merge")
     if not isinstance(operation, str):
         raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.operation.")
@@ -639,6 +644,7 @@ def _dry_run_config_changes(proposed_config_patch: dict[str, Any]) -> list[dict[
         raise ForkOpsError(
             "Migration dry run input has malformed proposed_config_patch.target_path."
         )
+    target_path = _normalize_migration_relative_path(target_path)
     operation = proposed_config_patch.get("operation", "review-and-merge")
     if not isinstance(operation, str):
         raise ForkOpsError("Migration dry run input has malformed proposed_config_patch.operation.")
@@ -849,6 +855,10 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
     return blockers
 
 
+def _normalize_migration_relative_path(raw_path: str) -> str:
+    return raw_path.replace("\\", "/")
+
+
 def _migration_edit_target(
     repo: Path,
     raw_path: Any,
@@ -858,7 +868,8 @@ def _migration_edit_target(
             "code": "migration_execution.malformed_target_path",
             "message": "Migration execution requires a non-empty relative target path.",
         }
-    target = Path(raw_path)
+    normalized_path = _normalize_migration_relative_path(raw_path)
+    target = Path(normalized_path)
     if target.is_absolute() or ".." in target.parts:
         return repo, {
             "code": "migration_execution.unsafe_target_path",
@@ -953,12 +964,14 @@ def _apply_migration_file_edits(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     applied = []
     blockers = []
+    repo_root = repo.resolve()
     for edit in file_edits:
         path, blocker = _migration_edit_target(repo, edit.get("path"))
         if blocker:
             blockers.append(blocker)
             continue
         content = edit["content"]
+        parent_existed = path.parent.exists()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -970,10 +983,15 @@ def _apply_migration_file_edits(
                 }
             )
             continue
+        parent_blocker = _migration_target_parent_blocker(repo_root, path.parent, edit.get("path"))
+        if parent_blocker:
+            _remove_created_parent(path.parent, parent_existed)
+            blockers.append(parent_blocker)
+            continue
         try:
-            with path.open("x") as handle:
-                handle.write(content)
+            _write_new_file_atomically(path, content)
         except FileExistsError:
+            _remove_created_parent(path.parent, parent_existed)
             blockers.append(
                 {
                     "code": "migration_execution.target_exists",
@@ -984,6 +1002,7 @@ def _apply_migration_file_edits(
             continue
         except OSError as exc:
             path.unlink(missing_ok=True)
+            _remove_created_parent(path.parent, parent_existed)
             blockers.append(
                 {
                     "code": "migration_execution.write_failed",
@@ -1003,6 +1022,48 @@ def _apply_migration_file_edits(
             }
         )
     return applied, blockers
+
+
+def _migration_target_parent_blocker(
+    repo_root: Path,
+    parent: Path,
+    raw_path: Any,
+) -> dict[str, Any] | None:
+    resolved_parent = parent.resolve(strict=False)
+    if not resolved_parent.is_relative_to(repo_root):
+        return {
+            "code": "migration_execution.unsafe_target_path",
+            "path": raw_path,
+            "message": "Migration execution refuses target paths outside the repository.",
+        }
+    if not resolved_parent.is_dir():
+        return {
+            "code": "migration_execution.target_parent_not_directory",
+            "path": raw_path,
+            "message": "Migration execution target parent is not a directory.",
+        }
+    return None
+
+
+def _write_new_file_atomically(path: Path, content: str) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temp_path.open("x") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _remove_created_parent(parent: Path, parent_existed: bool) -> None:
+    if parent_existed:
+        return
+    try:
+        parent.rmdir()
+    except OSError:
+        return
 
 
 def _verify_migration_execution(
@@ -1221,6 +1282,34 @@ def _migration_plan_validation_requirements() -> list[dict[str, Any]]:
             "when": "after applying the proposed fork ops config",
         },
     ]
+
+
+def _validation_requirement_blockers(
+    requirements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    blockers = []
+    expected_by_code = {
+        requirement["code"]: requirement
+        for requirement in _migration_plan_validation_requirements()
+    }
+    for requirement in requirements:
+        code = requirement.get("code")
+        command = requirement.get("command")
+        expected = expected_by_code.get(code)
+        if expected is None or command != expected["command"]:
+            blockers.append(
+                {
+                    "code": "migration_execution.validation_requirement_unsupported",
+                    "step": "verify_migration_execution",
+                    "source": "migration_plan",
+                    "validation_code": code,
+                    "message": (
+                        "Migration execution only reports supported Fork Ops "
+                        "validation requirements."
+                    ),
+                }
+            )
+    return blockers
 
 
 def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict[str, Any]:
