@@ -116,7 +116,7 @@ def fork_ops_migration_dry_run(
 
 @_tool
 def fork_ops_migration_execute(
-    repo_path: str = ".",
+    repo_path: str = "",
     migration_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply a validated migration plan through guarded operations."""

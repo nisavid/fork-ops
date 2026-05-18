@@ -904,6 +904,27 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.required_capability_unavailable",
         )
 
+    def test_migration_execution_rejects_plan_without_validation_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["validation_requirements"] = []
+
+            dry_run = dry_run_migration_plan(plan)
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertFalse(dry_run["can_execute"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.validation_requirements_missing",
+        )
+
     def test_migration_execution_rejects_changed_retained_source_material(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -921,6 +942,25 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.retained_source_changed",
+        )
+
+    def test_migration_execution_rejects_missing_retained_source_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            del plan["retained_source_materials"][0]["content_sha256"]
+
+            result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.retained_source_hash_missing",
         )
 
     def test_migration_execution_rejects_unsafe_retained_source_path(self) -> None:
@@ -941,6 +981,58 @@ uncertainty_destination = "ask-human-operator"
             result["blockers"][0]["code"],
             "migration_execution.unsafe_retained_source_path",
         )
+
+    def test_migration_execution_reports_write_failure_and_removes_partial_config(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            original_open = Path.open
+
+            class FailingWriter:
+                def __enter__(self) -> FailingWriter:
+                    return self
+
+                def __exit__(self, *args: Any) -> None:
+                    return None
+
+                def write(self, content: str) -> None:
+                    with original_open(target_path, "w") as handle:
+                        handle.write("partial")
+                    raise OSError("disk full")
+
+            def fail_during_write(path: Path, *args: Any, **kwargs: Any) -> Any:
+                mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+                if mode == "x":
+                    return FailingWriter()
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", fail_during_write):
+                result = execute_migration_plan(plan)
+
+            self.assertFalse(target_path.exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.write_failed")
+
+    def test_mcp_migration_execution_rejects_plan_repo_path_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            result = fork_ops_migration_execute(str(Path(other)), migration_plan=plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((Path(other) / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_execute_migration_uses_embedded_repo_path_for_supplied_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

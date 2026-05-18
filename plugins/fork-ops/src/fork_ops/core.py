@@ -479,6 +479,15 @@ def dry_run_migration_plan(
         _retained_source_material_blockers(Path(normalized_repo_path), retained_materials)
     )
     expected_verification_commands = _require_plan_list(plan, "validation_requirements")
+    if not expected_verification_commands:
+        blocked_steps.append(
+            {
+                "code": "migration_execution.validation_requirements_missing",
+                "step": "verify_migration_execution",
+                "source": "migration_plan",
+                "message": "Migration execution requires at least one validation requirement.",
+            }
+        )
     return {
         "repo_path": normalized_repo_path,
         "mode": "non-mutating",
@@ -519,7 +528,32 @@ def execute_migration(
     plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
-    return execute_migration_plan(migration_plan, repo_path=None if plan is not None else repo_path)
+    if plan is None:
+        return execute_migration_plan(migration_plan, repo_path=repo_path)
+    if str(repo_path) not in ("", "."):
+        plan_repo_path = _dry_run_repo_path(migration_plan, None)
+        requested_repo_path = str(Path(repo_path).expanduser().resolve())
+        if requested_repo_path != plan_repo_path:
+            return _migration_execution_result(
+                repo=Path(requested_repo_path),
+                preview={"plan_operation": migration_plan.get("operation")},
+                status="blocked",
+                applied_edits=[],
+                skipped_edits=[],
+                blockers=[
+                    {
+                        "code": "migration_execution.repo_path_mismatch",
+                        "message": (
+                            "Supplied migration plan repo_path does not match the requested "
+                            "execution repo_path."
+                        ),
+                        "plan_repo_path": plan_repo_path,
+                        "requested_repo_path": requested_repo_path,
+                    }
+                ],
+                verification_results=[],
+            )
+    return execute_migration_plan(migration_plan)
 
 
 def execute_migration_plan(
@@ -863,7 +897,6 @@ def _retained_source_material_blockers(
                 }
             )
             continue
-        path = repo / raw_path
         retained_path = Path(raw_path)
         if retained_path.is_absolute() or ".." in retained_path.parts:
             blockers.append(
@@ -874,6 +907,7 @@ def _retained_source_material_blockers(
                 }
             )
             continue
+        path = repo / raw_path
         if not path.resolve(strict=False).is_relative_to(repo.resolve()):
             blockers.append(
                 {
@@ -893,7 +927,16 @@ def _retained_source_material_blockers(
             )
             continue
         expected_sha256 = material.get("content_sha256")
-        if expected_sha256 and _file_sha256(path) != expected_sha256:
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            blockers.append(
+                {
+                    "code": "migration_execution.retained_source_hash_missing",
+                    "path": raw_path,
+                    "message": "Retained source material requires a planned content hash.",
+                }
+            )
+            continue
+        if _file_sha256(path) != expected_sha256:
             blockers.append(
                 {
                     "code": "migration_execution.retained_source_changed",
@@ -940,6 +983,7 @@ def _apply_migration_file_edits(
             )
             continue
         except OSError as exc:
+            path.unlink(missing_ok=True)
             blockers.append(
                 {
                     "code": "migration_execution.write_failed",
