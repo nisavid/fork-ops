@@ -1031,6 +1031,34 @@ uncertainty_destination = "ask-human-operator"
             "migration_execution.retained_source_changed",
         )
 
+    def test_migration_execution_rejects_unreadable_retained_source_material(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["retained_source_materials"][0]["content_sha256"] = hashlib.sha256(
+                b""
+            ).hexdigest()
+            original_read_bytes = Path.read_bytes
+
+            def unreadable(path: Path) -> bytes:
+                if path == source_path:
+                    raise OSError("unreadable")
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", unreadable):
+                result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.retained_source_changed",
+        )
+
     def test_migration_execution_rejects_missing_retained_source_hash(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
