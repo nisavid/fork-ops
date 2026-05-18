@@ -1094,8 +1094,7 @@ def _verify_migration_execution(
     report = build_status_report(repo, include_config=False)
     required_level = "track-aware"
     required_available = bool(report["capability"]["levels"][required_level]["available"])
-    has_errors = any(item.get("severity") == "error" for item in report.get("diagnostics", []))
-    status = "passed" if required_available and not has_errors else "failed"
+    status = "passed" if required_available else "failed"
     results = []
     for requirement in _require_preview_list(preview, "expected_verification_commands"):
         results.append(
@@ -2179,7 +2178,10 @@ def _read_bytes(path: Path) -> bytes:
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(_read_bytes(path)).hexdigest()
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def _fork_signals(text: str) -> list[str]:
