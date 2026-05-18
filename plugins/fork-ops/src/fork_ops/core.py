@@ -463,10 +463,11 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
         config["upstreams"][0]["docs_url"] = docs_url
 
     fact_values = {(fact["kind"], fact["value"]) for fact in facts}
-    if ("release_channel", "stable") in fact_values or (
+    has_stable_release_channel = ("release_channel", "stable") in fact_values or (
         "release_channel_source",
         "github-releases",
-    ) in fact_values:
+    ) in fact_values
+    if has_stable_release_channel:
         config["release_channels"].append(
             {
                 "id": "stable",
@@ -509,14 +510,33 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
         )
 
     if _has_any_fact(fact_values, "ref_role", {"origin/upstream-stable", "upstream-stable"}):
+        stable_track_source = (
+            {
+                "source_type": "release_channel",
+                "source": "stable",
+                "notes": (
+                    "Published stable upstream baseline for sync and fork release "
+                    "versioning. Do not advance just because a new tag exists."
+                ),
+            }
+            if has_stable_release_channel
+            else {
+                "source_type": "upstream_ref",
+                "source": "refs/remotes/origin/upstream-stable",
+                "source_ref": "refs/remotes/origin/upstream-stable",
+                "notes": (
+                    "Published stable upstream baseline was detected, but no release-channel "
+                    "selection source was found. Review source material before treating this "
+                    "track as release-channel backed."
+                ),
+            }
+        )
         config["upstream_tracks"].append(
             {
                 "id": "upstream-stable",
                 "upstream": upstream_id,
                 "ref": "refs/remotes/origin/upstream-stable",
                 "role": "stable upstream release baseline",
-                "source_type": "release_channel",
-                "source": "stable",
                 "owner_remote": "origin",
                 "local_branch": "upstream-stable",
                 "tracking_ref": "refs/remotes/origin/upstream-stable",
@@ -535,10 +555,7 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
                     "git rev-parse <release-tag> upstream-stable origin/upstream-stable",
                 ],
                 "sync_eligible": True,
-                "notes": (
-                    "Published stable upstream baseline for sync and fork release "
-                    "versioning. Do not advance just because a new tag exists."
-                ),
+                **stable_track_source,
             }
         )
 
