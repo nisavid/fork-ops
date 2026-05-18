@@ -37,11 +37,11 @@ The merged foundation supports:
 - Capability reporting for all defined levels, with implemented operations
   centered on `track-aware`.
 - Local Git diagnostics for configured remotes and upstream track refs.
-- Read-only migration assessment and non-mutating config proposal generation.
+- Read-only migration assessment, non-mutating config proposal generation, and
+  non-mutating migration plan generation.
 
-Do not describe broad upstream sync, publication closeout, migration plan,
-migration dry run, or migration execution as implemented. They are planned
-follow-up work.
+Do not describe broad upstream sync, publication closeout, migration dry run, or
+migration execution as implemented. They are planned follow-up work.
 
 ## Source Map
 

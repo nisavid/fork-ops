@@ -10,9 +10,12 @@ Fork Ops must provide reusable operations for Maintained Forks while keeping for
 
 Use a Codex plugin for the initial portable bundle, with a design bundle before scaffolding implementation files.
 
-The first fully operational target is the `track-aware` Fork Ops Capability Level. The config schema should include the shape needed for `sync-ready`, but broad sync mutations can follow after config access, validation, and upstream-track reporting are solid.
+The first fully operational target is the `track-aware` capability level. The config schema should include the shape needed for `sync-ready`, but broad sync mutations can follow after config access, validation, and upstream-track reporting are solid.
 
-The first migration surface is read-only Migration Assessment. Full migration must later support explicit planning, dry-run preview, mutation, and verification.
+The first migration surface includes read-only migration assessment,
+non-mutating config proposal generation, and non-mutating migration plan
+generation. Full migration must later support dry-run preview, mutation, and
+verification.
 
 Use Python for the initial core library, CLI, and MCP server implementation.
 
@@ -29,13 +32,13 @@ Use Python for the initial core library, CLI, and MCP server implementation.
 
 ## Implementation Projection
 
-- Core package: `plugins/fork-ops/src/fork_ops/` for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, and Migration Assessment.
+- Core package: `plugins/fork-ops/src/fork_ops/` for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, and migration plans.
 - CLI adapter: a `fork-ops` console entry point over the core package.
 - MCP adapter: a stdio MCP server over the core package.
 
 ## Config API Shape
 
-Read surfaces should expose raw TOML, parsed config, normalized config, capability-level reports, and diagnostics. Write surfaces should default to semantic operations such as adding an upstream, adding a release channel, adding an Upstream Track, setting the Default Sync Baseline, adding a local surface, or setting a Portability Hint.
+Read surfaces should expose raw TOML, parsed config, normalized config, capability-level reports, and diagnostics. Write surfaces should default to semantic operations such as adding an upstream, adding a release channel, adding an upstream track, setting the default sync baseline, adding a local surface, or setting a portability hint.
 
 Raw TOML writes are an advanced escape hatch. They should validate parse and schema results and show a diff before writing.
 

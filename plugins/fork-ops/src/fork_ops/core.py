@@ -357,10 +357,10 @@ def assess_migration(
         },
         "candidates": candidates,
         "next_actions": [
-            "Review candidates before creating a Migration Plan.",
+            "Review candidates before creating a migration plan.",
             "Generate a proposed config patch only when the migration plan needs one.",
             "Prefer semantic config writes over raw TOML edits.",
-            "Run a Migration Dry Run before Migration Execution once those surfaces exist.",
+            "Run a migration dry run before migration execution once those surfaces exist.",
         ],
     }
     if include_proposed_config_patch:
@@ -380,7 +380,7 @@ def propose_migration_config_patch(
     diagnostics = schema_diagnostics(parsed) + reference_diagnostics(normalize_config(parsed))
     return {
         "mode": "non-mutating",
-        "purpose": "Migration Plan input",
+        "purpose": "migration plan input",
         "target_path": str(CONFIG_RELATIVE_PATH),
         "operation": "create" if not find_config_path(repo).exists() else "review-and-merge",
         "requires_review": True,
@@ -389,12 +389,54 @@ def propose_migration_config_patch(
         "diagnostics": [item.to_dict() for item in diagnostics],
         "evidence": _proposal_evidence(migration_candidates),
         "limitations": [
-            "This deterministic proposal is not a Migration Execution.",
+            "This deterministic proposal is not a migration execution.",
             "Review against source materials before applying.",
             (
                 "Escalate to an LLM-based migration planner if important source "
                 "semantics are not represented."
             ),
+        ],
+    }
+
+
+def generate_migration_plan(
+    repo_path: str | Path = ".",
+    candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    migration_candidates = candidates if candidates is not None else _migration_candidates(repo)
+    proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
+    evidence = _migration_plan_evidence(migration_candidates)
+    retained_source_materials = _retained_source_materials(migration_candidates)
+    blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
+    return {
+        "repo_path": str(repo),
+        "mode": "non-mutating",
+        "operation": "migration-plan",
+        "requires_review": True,
+        "summary": {
+            "candidate_count": len(migration_candidates),
+            "evidence_source_count": len(evidence),
+            "retained_source_material_count": len(retained_source_materials),
+            "blocker_count": len(blockers),
+            "semantic_coverage": _semantic_coverage_status(blockers),
+        },
+        "evidence": evidence,
+        "proposed_config_patch": proposed_config_patch,
+        "retained_source_materials": retained_source_materials,
+        "deferred_removals": _deferred_removals(retained_source_materials),
+        "blockers": blockers,
+        "required_review": _migration_plan_required_review(blockers),
+        "validation_requirements": _migration_plan_validation_requirements(),
+        "limitations": [
+            "This migration plan is non-mutating and does not apply config or edit source files.",
+            "Retain source materials until migration dry run and migration execution exist.",
+            "Review semantic coverage before replacing or deleting fork-local authority.",
+        ],
+        "next_actions": [
+            "Review proposed_config_patch against evidence.",
+            "Resolve blockers before migration dry run.",
+            "Run validation requirements after any manual application of the proposed config.",
         ],
     }
 
@@ -422,6 +464,159 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
             }
         )
     return sorted(candidates, key=lambda item: item["path"])
+
+
+def _migration_plan_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence = []
+    for candidate in candidates:
+        facts = candidate["extracted_facts"]
+        if not facts:
+            continue
+        evidence.append(
+            {
+                "source_path": candidate["path"],
+                "kind": candidate["kind"],
+                "domains": candidate["domains"],
+                "facts": facts,
+                "urls": candidate["urls"],
+                "proposed_destination": candidate["proposed_destination"],
+                "portability_hint": candidate["portability_hint"],
+            }
+        )
+    return evidence
+
+
+def _retained_source_materials(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    retained = []
+    for candidate in candidates:
+        retained.append(
+            {
+                "path": candidate["path"],
+                "kind": candidate["kind"],
+                "domains": candidate["domains"],
+                "proposed_destination": candidate["proposed_destination"],
+                "portability_hint": candidate["portability_hint"],
+                "replacement_status": "deferred",
+                "retention_policy": (
+                    "Keep this source material until a reviewed migration dry run proves "
+                    "the fork ops replacement preserves the relevant authority."
+                ),
+            }
+        )
+    return retained
+
+
+def _deferred_removals(retained_source_materials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": material["path"],
+            "status": "deferred",
+            "reason": (
+                "Removal is deferred because migration execution is not available and "
+                "source material remains fork-local authority."
+            ),
+        }
+        for material in retained_source_materials
+    ]
+
+
+def _migration_plan_blockers(
+    candidates: list[dict[str, Any]],
+    proposed_config_patch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    diagnostics = proposed_config_patch.get("diagnostics", [])
+    error_diagnostics = [
+        item for item in diagnostics if isinstance(item, dict) and item.get("severity") == "error"
+    ]
+    if error_diagnostics:
+        blockers.append(
+            {
+                "code": "proposed_config_patch.diagnostics_failed",
+                "message": "Resolve proposed config patch errors before migration dry run.",
+                "diagnostics": error_diagnostics,
+            }
+        )
+    uncovered_paths = [
+        candidate["path"] for candidate in candidates if not candidate["extracted_facts"]
+    ]
+    if uncovered_paths:
+        blockers.append(
+            {
+                "code": "semantic_coverage.incomplete",
+                "message": (
+                    "Some candidate source materials were detected but did not produce "
+                    "structured facts. Review them before replacing or removing source material."
+                ),
+                "paths": uncovered_paths,
+            }
+        )
+    # No source material and source material without extracted facts are distinct
+    # blockers; keep their signals separate for plan consumers.
+    if not candidates:
+        blockers.append(
+            {
+                "code": "source_material.none_found",
+                "message": (
+                    "No fork-related source materials were detected. Review scan scope before "
+                    "treating the plan as complete."
+                ),
+            }
+        )
+    return blockers
+
+
+def _semantic_coverage_status(blockers: list[dict[str, Any]]) -> str:
+    if any(blocker.get("code") == "semantic_coverage.incomplete" for blocker in blockers):
+        return "incomplete"
+    return "complete"
+
+
+def _migration_plan_required_review(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    required_review = [
+        {
+            "code": "review.proposed_config_patch",
+            "status": "required",
+            "subject": "proposed_config_patch",
+            "reason": (
+                "Config proposals are deterministic drafts and require human or agent review."
+            ),
+        },
+        {
+            "code": "review.retained_source_materials",
+            "status": "required",
+            "subject": "retained_source_materials",
+            "reason": "Fork-local authority must remain until replacement coverage is verified.",
+        },
+    ]
+    if blockers:
+        required_review.append(
+            {
+                "code": "review.blockers",
+                "status": "required",
+                "subject": "blockers",
+                "reason": "Blockers must be resolved or explicitly waived before dry run.",
+            }
+        )
+    return required_review
+
+
+def _migration_plan_validation_requirements() -> list[dict[str, Any]]:
+    return [
+        {
+            "code": "validation.config_validate",
+            "command": (
+                "uv run --package fork-ops fork-ops config validate "
+                "--repo <repo> --required-level track-aware"
+            ),
+            "when": "after applying the proposed fork ops config",
+        },
+        {
+            "code": "validation.capability_report",
+            "command": "uv run --package fork-ops fork-ops capability report --repo <repo>",
+            "when": "after applying the proposed fork ops config",
+        },
+    ]
 
 
 def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -683,7 +878,7 @@ def _proposed_local_surfaces(candidates: list[dict[str, Any]]) -> list[dict[str,
             "domains": domains,
             "portability_hint": candidate["portability_hint"],
             "portability_hints": _portability_hints(candidate),
-            "notes": "Migration Assessment candidate; review before replacing source material.",
+            "notes": "Migration assessment candidate; review before replacing source material.",
         }
         scope = _repo_ops_candidate_scope(candidate)
         if scope:
@@ -1475,9 +1670,9 @@ def _proposed_destination(rel_path: str, signals: list[str]) -> str:
             "upstream-stable",
         )
     ):
-        return "Fork Ops Config release_channels/upstream_tracks plus operation guide"
+        return "fork ops config release_channels/upstream_tracks plus operation guide"
     if "merge-base" in signals or "sync" in signals:
-        return "Fork Ops Config sync_policy/divergence_policy plus sync runbook"
+        return "fork ops config sync_policy/divergence_policy plus sync runbook"
     if any(
         signal in signals
         for signal in (
@@ -1494,7 +1689,7 @@ def _proposed_destination(rel_path: str, signals: list[str]) -> str:
         return "review_policy/publication_policy or future Repo Ops equipment"
     if "/skills/" in rel_path:
         return "Fork Ops skill or migration note"
-    return "Fork-local authority or Migration Assessment evidence"
+    return "Fork-local authority or migration assessment evidence"
 
 
 def _portability_hint(rel_path: str, signals: list[str]) -> str:

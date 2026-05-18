@@ -6,6 +6,7 @@ from .core import (
     build_status_report,
     create_initial_config_text,
     find_config_path,
+    generate_migration_plan,
     load_config,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "build_status_report",
     "create_initial_config_text",
     "find_config_path",
+    "generate_migration_plan",
     "load_config",
 ]

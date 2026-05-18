@@ -11,7 +11,11 @@ Provide reusable agentic operations for Maintained Forks while keeping each fork
 
 The first implementation should fully support the `track-aware` Fork Ops Capability Level. It should design for `sync-ready` without implementing every sync mutation in the first release.
 
-The first implementation should include read-only Migration Assessment for existing fork-related materials. Full Migration Plan, Migration Dry Run, and Migration Execution support should follow after the target config, docs, and component surfaces exist.
+The first implementation should include read-only migration assessment,
+non-mutating config proposal generation, and non-mutating migration plan
+generation for existing fork-related materials. Migration dry run and migration
+execution support should follow after the target config, docs, and component
+surfaces exist.
 
 ## Users
 
@@ -62,18 +66,18 @@ The first implementation should include read-only Migration Assessment for exist
 
 ## Initial Implementation Shape
 
-- Python core library for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, and Migration Assessment.
+- Python core library for schema, parsing, normalization, diagnostics, Git/GitHub inspectors, release-channel resolution, migration assessment, config proposals, and migration plans.
 - `fork-ops` CLI as a thin adapter over the core library.
 - Stdio MCP server as a thin adapter over the core library.
 - Codex plugin packaging for skills, MCP config, scripts, docs, and assets.
 
 ## Hard Rules
 
-- Fork-local authority is the source of project truth for a Maintained Fork.
-- The Fork Ops Plugin supplies reusable operations but does not replace fork-local authority.
+- Fork-local authority is the source of project truth for a maintained fork.
+- The Fork Ops plugin supplies reusable operations but does not replace fork-local authority.
 - Default upstream contribution intent is fork-local unless fork-local authority or the user says otherwise.
-- Upstream Release Channels are live selectors, not durable baseline refs.
-- Durable upstream baseline state belongs in Upstream Tracks.
+- Upstream release channels are live selectors, not durable baseline refs.
+- Durable upstream baseline state belongs in upstream tracks.
 - Upstream commit identity must be preserved when a sync claims to include upstream commits.
 - Portability hints are non-normative and do not decide future Repo Ops migration.
 
@@ -98,9 +102,15 @@ Codex hooks should enforce the harness boundary for lifecycle events and manual 
 
 Fork Ops equipment should produce structured status, evidence, and next-action reports that distinguish verified facts, fork policy, inferred conclusions, blockers, and required human decisions.
 
-Migration Assessment output should map existing fork-related material to proposed Fork Ops Config sections, docs, skills, scripts, tools, hooks, and portability hints without mutating the repository.
+Migration assessment output should map existing fork-related material to
+proposed fork ops config sections, docs, skills, scripts, tools, hooks, and
+portability hints without mutating the repository.
 
-For upstream-ref materials, Migration Assessment should expose candidate facts such as ref roles, release-channel sources, default sync baselines, disabled upstream push policy, ancestry checks, and forbidden history rewrites. These facts are pressure-case inputs for a later Migration Plan; they are not applied automatically.
+For upstream-ref materials, migration assessment should expose candidate facts
+such as ref roles, release-channel sources, default sync baselines, disabled
+upstream push policy, ancestry checks, and forbidden history rewrites. These
+facts are pressure-case inputs for the migration plan; they are not applied
+automatically.
 
 The proposed config patch surface should convert assessment output into a non-mutating `.agents/fork-ops.toml` draft with review-required metadata, source evidence, schema diagnostics, and limitations. It should not infer repository protection policy that was not present in the source material or verified from live state.
 
@@ -124,5 +134,6 @@ Config-management output should distinguish raw TOML, parsed config, normalized 
 - `fork_ops_config_validate`: validate config and optionally check a required capability level.
 - `fork_ops_capability_report`: report Fork Ops Capability Levels.
 - `fork_ops_migration_assessment`: run read-only Migration Assessment.
+- `fork_ops_migration_plan`: generate a non-mutating migration plan for review.
 - `fork_ops_migration_config_patch`: generate a non-mutating proposed config patch for review.
 - `fork_ops_schema`: return the config schema.
