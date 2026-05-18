@@ -56,6 +56,7 @@ uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 ```bash
 export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
 uv run --package fork-ops fork-ops schema print
+uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork

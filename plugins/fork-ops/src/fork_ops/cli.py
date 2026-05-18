@@ -21,6 +21,7 @@ from .core import (
     generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
+    schema_artifact_report,
     schema_json,
 )
 from .schema import CAPABILITY_LEVELS
@@ -136,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
     schema_subcommands = schema.add_subparsers(dest="schema_command", required=True)
     schema_print = schema_subcommands.add_parser("print", help="Print Fork Ops JSON Schema.")
     schema_print.set_defaults(func=cmd_schema_print)
+    schema_check = schema_subcommands.add_parser(
+        "check",
+        help="Check checked-in schema artifacts against the runtime schema.",
+    )
+    schema_check.add_argument(
+        "--plugin-root",
+        default=str(Path(__file__).resolve().parents[2]),
+        help="Fork Ops plugin root containing schema/ and src/fork_ops/.",
+    )
+    schema_check.add_argument("--json", action="store_true", help="Print full JSON report.")
+    schema_check.set_defaults(func=cmd_schema_check)
 
     return parser
 
@@ -285,6 +297,22 @@ def cmd_migration_propose_config(args: argparse.Namespace) -> int:
 def cmd_schema_print(args: argparse.Namespace) -> int:
     print(schema_json(), end="")
     return 0
+
+
+def cmd_schema_check(args: argparse.Namespace) -> int:
+    report = schema_artifact_report(args.plugin_root)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for artifact in report["artifacts"]:
+            if artifact.get("error"):
+                status = "error"
+            elif artifact["matches_runtime_schema"]:
+                status = "ok"
+            else:
+                status = "drift"
+            print(f"{status}\t{artifact['path']}")
+    return 0 if report["ok"] else 1
 
 
 def _print_diagnostics(report: dict[str, Any]) -> None:

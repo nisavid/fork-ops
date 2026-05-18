@@ -4,6 +4,14 @@ Fork Ops Config lives at `.agents/fork-ops.toml` in a Maintained Fork. The machi
 
 The schema defines the parsed TOML shape. Unknown keys are allowed so a fork can carry local extensions while Fork Ops grows. Tools should still validate all known fields and report unknown extension behavior as inferred when it affects an operation.
 
+The packaged runtime schema and the documented schema are expected to match the
+canonical runtime serialization. Check both artifacts with:
+
+```bash
+# From the repository root:
+uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
+```
+
 ## Required Foundation Sections
 
 `schema_version` identifies the config schema family. The foundation version is `0.1`.
@@ -28,7 +36,7 @@ The schema defines the parsed TOML shape. Unknown keys are allowed so a fork can
 
 ## Sync-ready Sections
 
-`[sync_policy]` defines the Default Sync Baseline, default sync ref, fork sync start ref, commit identity requirements, merge methods, track update methods, ancestry checks, and history rewrite boundaries.
+`[sync_policy]` defines the Default Sync Baseline, default sync ref, fork sync start ref, commit identity requirements, merge methods, track update methods, ancestry checks, and history rewrite boundaries. Migration proposals map detected `origin/upstream-*` default baseline refs to matching `upstream_tracks` entries instead of relying on a single hard-coded baseline name.
 
 `[divergence_policy]` records local contracts, preservation checks, and the uncertainty destination for ambiguous sync work.
 

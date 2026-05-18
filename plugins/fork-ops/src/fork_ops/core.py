@@ -19,6 +19,10 @@ from urllib.parse import urlparse
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
 
 CONFIG_RELATIVE_PATH = Path(".agents/fork-ops.toml")
+SCHEMA_ARTIFACT_RELATIVE_PATHS = (
+    Path("schema/fork-ops.schema.json"),
+    Path("src/fork_ops/fork-ops.schema.json"),
+)
 _CANDIDATE_FILE_SUFFIXES = {".json", ".md", ".toml", ".yaml", ".yml"}
 _CANDIDATE_SCAN_SKIP_DIRS = {
     ".git",
@@ -380,7 +384,11 @@ def propose_migration_config_patch(
     proposed_config = _build_proposed_config(repo, migration_candidates)
     toml = _toml_dumps(proposed_config)
     parsed = parse_config_text(toml)
-    diagnostics = schema_diagnostics(parsed) + reference_diagnostics(normalize_config(parsed))
+    diagnostics = (
+        _migration_proposal_diagnostics(_flatten_facts(migration_candidates))
+        + schema_diagnostics(parsed)
+        + reference_diagnostics(normalize_config(parsed))
+    )
     return {
         "mode": "non-mutating",
         "purpose": "migration plan input",
@@ -389,11 +397,16 @@ def propose_migration_config_patch(
         "requires_review": True,
         "config": proposed_config,
         "toml": toml,
+        "contract_tags": ["toml_renderer.flat_config_contract"],
         "diagnostics": [item.to_dict() for item in diagnostics],
         "evidence": _proposal_evidence(migration_candidates),
         "limitations": [
             "This deterministic proposal is not a migration execution.",
             "Review against source materials before applying.",
+            (
+                "Config proposal TOML is limited to top-level scalar fields, "
+                "top-level tables, and arrays of flat tables."
+            ),
             (
                 "Escalate to an LLM-based migration planner if important source "
                 "semantics are not represented."
@@ -1577,10 +1590,36 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
             }
         )
 
-    if ("default_sync_baseline", "origin/upstream-stable") in fact_values:
+    default_sync_ref = _default_sync_baseline_ref(fact_values)
+    for ref in _generic_origin_upstream_refs(fact_values, default_sync_ref):
+        track_id = _origin_upstream_track_id(ref)
+        if any(track.get("id") == track_id for track in config["upstream_tracks"]):
+            continue
+        source_ref = _origin_remote_tracking_ref(ref)
+        config["upstream_tracks"].append(
+            {
+                "id": track_id,
+                "upstream": upstream_id,
+                "ref": source_ref,
+                "role": "detected upstream baseline",
+                "source_type": "upstream_ref",
+                "source": source_ref,
+                "source_ref": source_ref,
+                "owner_remote": "origin",
+                "tracking_ref": source_ref,
+                "sync_eligible": ref == default_sync_ref,
+                "notes": (
+                    "Detected upstream baseline; review source material before treating "
+                    "this track as release-channel backed."
+                ),
+            }
+        )
+
+    if default_sync_ref:
+        default_sync_track = _origin_upstream_track_id(default_sync_ref)
         config["sync_policy"] = {
-            "default_sync_baseline": "upstream-stable",
-            "default_sync_ref": "origin/upstream-stable",
+            "default_sync_baseline": default_sync_track,
+            "default_sync_ref": default_sync_ref,
             "fork_sync_start_ref": f"origin/{default_branch}",
             "preserve_commit_identity": True,
             "forbid_history_rewrites": True,
@@ -1588,7 +1627,7 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
             "fork_sync_methods": ["merge"],
             "track_update_methods": ["ff-only"],
             "ancestry_checks": [
-                "git merge-base --is-ancestor origin/upstream-stable HEAD",
+                f"git merge-base --is-ancestor {default_sync_ref} HEAD",
             ],
             "conditional_ancestry_checks": [
                 (
@@ -1698,6 +1737,38 @@ def _has_any_fact(
     values: set[str],
 ) -> bool:
     return any((kind, value) in fact_values for value in values)
+
+
+def _default_sync_baseline_ref(fact_values: set[tuple[str, str]]) -> str:
+    refs = _default_sync_baseline_fact_refs(fact_values)
+    return refs[0] if len(refs) == 1 else ""
+
+
+def _generic_origin_upstream_refs(
+    fact_values: set[tuple[str, str]],
+    default_sync_ref: str,
+) -> list[str]:
+    refs = {
+        value
+        for kind, value in fact_values
+        if kind == "ref_role" and value.startswith("origin/upstream-")
+    }
+    refs.update(_default_sync_baseline_fact_refs(fact_values))
+    if default_sync_ref:
+        refs.add(default_sync_ref)
+    return sorted(refs)
+
+
+def _default_sync_baseline_fact_refs(fact_values: set[tuple[str, str]]) -> list[str]:
+    return sorted(value for kind, value in fact_values if kind == "default_sync_baseline")
+
+
+def _origin_upstream_track_id(ref: str) -> str:
+    return _slug_id(ref.removeprefix("origin/"))
+
+
+def _origin_remote_tracking_ref(ref: str) -> str:
+    return f"refs/remotes/{ref}"
 
 
 def _required_context_paths(repo: Path) -> list[str]:
@@ -2004,6 +2075,61 @@ def create_initial_config_text(
 
 def schema_json() -> str:
     return json.dumps(CONFIG_SCHEMA, indent=2, sort_keys=True) + "\n"
+
+
+def _migration_proposal_diagnostics(facts: list[dict[str, str]]) -> list[Diagnostic]:
+    fact_values = {(fact["kind"], fact["value"]) for fact in facts}
+    default_sync_refs = _default_sync_baseline_fact_refs(fact_values)
+    if len(default_sync_refs) <= 1:
+        return []
+    return [
+        Diagnostic(
+            severity="error",
+            code="migration.default_sync_baseline_ambiguous",
+            message=(
+                "Multiple default sync baseline refs were detected; review source "
+                "materials before selecting one."
+            ),
+            path="sync_policy.default_sync_baseline",
+            detail={"refs": default_sync_refs},
+        )
+    ]
+
+
+def schema_artifact_report(plugin_root: str | Path = ".") -> dict[str, Any]:
+    root = Path(plugin_root).expanduser().resolve()
+    runtime_schema = schema_json().encode("utf-8")
+    artifacts = []
+    for relative_path in SCHEMA_ARTIFACT_RELATIVE_PATHS:
+        path = root / relative_path
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            artifacts.append(
+                {
+                    "path": relative_path.as_posix(),
+                    "absolute_path": str(path),
+                    "exists": path.exists(),
+                    "matches_runtime_schema": False,
+                    "error": str(exc),
+                }
+            )
+            continue
+        artifacts.append(
+            {
+                "path": relative_path.as_posix(),
+                "absolute_path": str(path),
+                "exists": True,
+                "matches_runtime_schema": content == runtime_schema,
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return {
+        "plugin_root": str(root),
+        "runtime_schema_sha256": hashlib.sha256(runtime_schema).hexdigest(),
+        "ok": all(artifact["matches_runtime_schema"] for artifact in artifacts),
+        "artifacts": artifacts,
+    }
 
 
 def _missing_requirements(config: dict[str, Any], level: str) -> Iterable[str]:
@@ -2319,15 +2445,11 @@ def _extracted_facts(text: str) -> list[dict[str, str]]:
             }
         )
 
-    if (
-        "origin/upstream-stable" in lowered_text
-        and "default" in lowered_text
-        and "baseline" in lowered_text
-    ):
+    for ref in _default_sync_baseline_refs(text):
         facts.append(
             {
                 "kind": "default_sync_baseline",
-                "value": "origin/upstream-stable",
+                "value": ref,
                 "suggested_config": "sync_policy.default_sync_baseline",
             }
         )
@@ -2375,6 +2497,22 @@ def _looks_like_ref_role(ref: str) -> bool:
         or normalized.startswith("origin/upstream-")
         or normalized in {"upstream-main", "upstream-stable"}
     )
+
+
+def _default_sync_baseline_refs(text: str) -> list[str]:
+    ref_pattern = re.compile(
+        r"(?<![a-zA-Z0-9_/-])"
+        r"(origin/upstream-[A-Za-z0-9._/-]*[A-Za-z0-9_-])"
+        r"(?![a-zA-Z0-9_/-])"
+    )
+    refs: set[str] = set()
+    lowered_text = text.lower()
+    for match in ref_pattern.finditer(text):
+        window = lowered_text[max(0, match.start() - 160) : match.end() + 160]
+        if "default" not in window or "baseline" not in window:
+            continue
+        refs.add(match.group(1))
+    return sorted(refs)
 
 
 def _contains_signal(text: str, needle: str) -> bool:
@@ -2517,4 +2655,4 @@ def _has_fork_specific_signal(signals: set[str]) -> bool:
 
 
 def _slug_id(value: str) -> str:
-    return value.lower().replace("_", "-").replace(" ", "-")
+    return value.lower().replace("_", "-").replace(" ", "-").replace("/", "-")
