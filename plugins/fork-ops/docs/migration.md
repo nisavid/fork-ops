@@ -102,3 +102,18 @@ capability verification for blocker-free plans.
 Do not delete the last copy of fork policy until the Fork Ops replacement exists and validates.
 
 Do not migrate generic repository behavior into Fork Ops without a Portability Hint. Portability Hints are non-normative and are subject to future Repo Ops migration design.
+
+## Workflow Migration Inventory
+
+Workflow migration inventory is separate from fork authority migration. It
+scouts reusable fork-workflow materials from operator-provided source roots and
+maps them to workflow catalog targets or backlog candidates without mutating the
+sources.
+
+```bash
+uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
+```
+
+Inventory evidence uses references, source kinds, material scope, coverage
+status, and line numbers. It does not duplicate source text or make backlog
+candidates available as implemented workflows.

@@ -9,8 +9,9 @@ local development checks.
 > [!NOTE]
 > The foundation version targets `track-aware`. It supports config discovery,
 > schema validation, upstream release-channel and upstream track modeling, live
-> Git ref checks, CLI access, MCP access, read-only migration assessment, and
-> migration plan, dry-run, guarded execution, and config proposal generation.
+> Git ref checks, CLI access, MCP access, workflow migration inventory,
+> read-only migration assessment, and migration plan, dry-run, guarded
+> execution, and config proposal generation.
 > Broad sync mutations, publication closeout, arbitrary migration edits, and
 > source-material removal are designed but not enabled yet.
 
@@ -18,7 +19,7 @@ local development checks.
 
 - Skill: `skills/fork-ops/SKILL.md`
 - CLI: `uv run --package fork-ops fork-ops ...`
-- MCP: `fork_ops_workflow_catalog`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
+- MCP: `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
 - Schema: `schema/fork-ops.schema.json` and packaged runtime copy `src/fork_ops/fork-ops.schema.json`
 - Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
 
@@ -29,6 +30,12 @@ Inspect a configured fork's current Fork Ops capability:
 ```bash
 uv run --package fork-ops fork-ops workflow catalog
 uv run --package fork-ops fork-ops capability report --repo /path/to/configured-fork
+```
+
+Inventory reusable workflow materials without editing source roots:
+
+```bash
+uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
 ```
 
 Validate the config before relying on track-aware operations:
@@ -58,6 +65,7 @@ uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
 uv run --package fork-ops fork-ops schema print
 uv run --package fork-ops fork-ops workflow catalog
+uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
 uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config

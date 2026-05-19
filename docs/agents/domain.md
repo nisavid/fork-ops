@@ -42,10 +42,10 @@ Use the narrowest source that answers the question:
 ## Current Implementation Boundary
 
 The foundation implementation is `track-aware`. It supports config discovery,
-schema validation, capability reporting, local Git diagnostics, migration
-assessment, proposed config patch generation, migration plan generation,
-migration dry run, and guarded migration execution for blocker-free config
-creation plans.
+schema validation, capability reporting, local Git diagnostics, workflow
+migration inventory reporting, migration assessment, proposed config patch
+generation, migration plan generation, migration dry run, and guarded migration
+execution for blocker-free config creation plans.
 
 Treat these as planned, not implemented:
 

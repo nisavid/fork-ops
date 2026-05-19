@@ -18,6 +18,7 @@ from fork_ops.core import (
     ForkOpsError,
     assess_migration,
     build_status_report,
+    build_workflow_migration_inventory,
     dry_run_migration,
     dry_run_migration_plan,
     execute_migration,
@@ -37,6 +38,7 @@ from fork_ops.mcp_server import (
     fork_ops_migration_execute,
     fork_ops_schema,
     fork_ops_workflow_catalog,
+    fork_ops_workflow_migration_inventory,
 )
 from fork_ops.schema import schema_diagnostics
 from fork_ops.workflow_catalog import ImplementationStatus, WorkflowContract, workflow_catalog
@@ -125,6 +127,7 @@ class ForkOpsCoreTests(unittest.TestCase):
         expected_contracts = {
             "operator-onboarding": ("plugin-health", "next-slice", False),
             "fork-authority-migration": ("identified", "current", True),
+            "workflow-migration-inventory": ("plugin-health", "diagnostic-only", True),
             "authority-source-routing": ("identified", "diagnostic-only", True),
             "upstream-status-assessment": ("track-aware", "diagnostic-only", True),
             "upstream-sync-planning": ("sync-ready", "next-slice", False),
@@ -172,6 +175,18 @@ class ForkOpsCoreTests(unittest.TestCase):
         )
         self.assertIn("source material disposition", " ".join(migration["evidence_expectations"]))
 
+        workflow_inventory = workflows["workflow-migration-inventory"]
+        self.assertIn("workflow migration inventory", workflow_inventory["trigger_phrases"])
+        self.assertIn("fork-ops workflow inventory", _entrypoint_ids(workflow_inventory))
+        self.assertIn(
+            "fork_ops_workflow_migration_inventory",
+            _entrypoint_ids(workflow_inventory),
+        )
+        self.assertIn(
+            "backlog candidates",
+            " ".join(workflow_inventory["evidence_expectations"]),
+        )
+
         guarded_sync = workflows["guarded-sync-execution"]
         self.assertIn("refuse", guarded_sync["refusal_behavior"].lower())
         self.assertIn("not implemented", guarded_sync["refusal_behavior"].lower())
@@ -200,6 +215,131 @@ class ForkOpsCoreTests(unittest.TestCase):
         catalog = workflow_catalog()
 
         self.assertEqual(set(catalog["status_values"]), set(get_args(ImplementationStatus)))
+
+    def test_workflow_migration_inventory_classifies_representative_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            source_roots = _write_workflow_inventory_fixture(workspace_path)
+
+            inventory = build_workflow_migration_inventory(source_roots)
+
+        self.assertEqual(inventory["operation"], "workflow-migration-inventory")
+        self.assertEqual(inventory["mode"], "read-only")
+        self.assertEqual(inventory["summary"]["entry_count"], 7)
+        self.assertEqual(inventory["summary"]["source_root_count"], 3)
+        self.assertGreaterEqual(inventory["summary"]["backlog_candidate_count"], 1)
+        self.assertEqual(inventory["mutation_policy"], "no source roots are modified")
+
+        entries = {entry["source_kind"]: entry for entry in inventory["entries"]}
+        self.assertEqual(
+            set(entries),
+            {
+                "global-skill",
+                "repo-local-skill",
+                "agent-instruction",
+                "policy",
+                "gate",
+                "procedure",
+                "handoff",
+            },
+        )
+        self.assertEqual(
+            entries["global-skill"]["material_scope"],
+            "reusable-workflow-material",
+        )
+        self.assertEqual(
+            entries["global-skill"]["likely_workflow_catalog_target"],
+            "upstream-sync-planning",
+        )
+        self.assertEqual(
+            entries["repo-local-skill"]["material_scope"],
+            "fork-local-authority-material",
+        )
+        self.assertEqual(
+            entries["agent-instruction"]["material_scope"],
+            "fork-local-authority-material",
+        )
+        self.assertEqual(entries["gate"]["likely_workflow_catalog_target"], "review-preparation")
+        self.assertEqual(entries["handoff"]["coverage_status"], "backlog-candidate")
+
+        for entry in inventory["entries"]:
+            self.assertTrue(entry["candidate_operator_intent"])
+            self.assertTrue(entry["likely_workflow_catalog_target"])
+            self.assertTrue(entry["evidence"])
+            self.assertNotIn("source_text", entry)
+            for evidence in entry["evidence"]:
+                self.assertTrue(evidence["id"])
+                self.assertTrue(evidence["signal"])
+                self.assertGreaterEqual(evidence["line"], 1)
+                self.assertNotIn("source_text", evidence)
+
+    def test_workflow_migration_inventory_groups_catalog_evidence_by_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            source_roots = _write_workflow_inventory_fixture(Path(workspace))
+
+            inventory = build_workflow_migration_inventory(source_roots)
+
+        catalog_evidence = {
+            group["workflow_id"]: group for group in inventory["catalog_evidence"]
+        }
+        sync_planning = catalog_evidence["upstream-sync-planning"]
+        self.assertEqual(sync_planning["coverage_status"], "cataloged-not-implemented")
+        self.assertFalse(sync_planning["available"])
+        self.assertTrue(sync_planning["entry_refs"])
+        self.assertNotIn("source_text", sync_planning)
+        self.assertNotIn("source_text", sync_planning["entry_refs"][0])
+
+        backlog_targets = {
+            candidate["candidate_target"] for candidate in inventory["backlog_candidates"]
+        }
+        self.assertIn("human-handoff-contracts", backlog_targets)
+        for candidate in inventory["backlog_candidates"]:
+            self.assertEqual(candidate["coverage_status"], "backlog-candidate")
+            self.assertTrue(candidate["entry_id"])
+
+    def test_workflow_migration_inventory_classifies_repo_local_skill_root(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo = Path(workspace) / "maintained-fork"
+            skill_root = repo / ".agents" / "skills"
+            skill = skill_root / "review-closeout" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "# Review Closeout\n\n"
+                "This fork-local authority uses review bot evidence before publication.\n"
+            )
+
+            inventory = build_workflow_migration_inventory([skill_root])
+
+        [entry] = inventory["entries"]
+        self.assertEqual(entry["source_kind"], "repo-local-skill")
+        self.assertEqual(entry["material_scope"], "fork-local-authority-material")
+
+    def test_cli_and_mcp_expose_workflow_migration_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            source_roots = _write_workflow_inventory_fixture(Path(workspace))
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    [
+                        "workflow",
+                        "inventory",
+                        "--source-root",
+                        str(source_roots[0]),
+                        "--source-root",
+                        str(source_roots[1]),
+                        "--source-root",
+                        str(source_roots[2]),
+                    ]
+                )
+            cli_payload = json.loads(output.getvalue())
+            mcp_payload = fork_ops_workflow_migration_inventory(
+                [str(source_root) for source_root in source_roots]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cli_payload, mcp_payload)
+        self.assertEqual(cli_payload["operation"], "workflow-migration-inventory")
 
     def test_track_aware_config_satisfies_track_aware_level(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1741,6 +1881,64 @@ Run `git rev-parse <release-tag> upstream-stable origin/upstream-stable` for
 baseline update closeout.
 Run `git merge-base --is-ancestor origin/upstream-stable HEAD` for closeout.
 """
+
+
+def _write_workflow_inventory_fixture(workspace: Path) -> list[Path]:
+    global_skills = workspace / "global-skills"
+    maintained_fork = workspace / "maintained-fork"
+    handoffs = workspace / "handoffs"
+
+    global_skill = global_skills / "sync-fork" / "SKILL.md"
+    global_skill.parent.mkdir(parents=True)
+    global_skill.write_text(
+        "# Sync Fork\n\n"
+        "Use when an operator asks to plan an upstream sync for a maintained fork. "
+        "Read fork-local authority, check origin/upstream-stable before mutation, and "
+        "record workflow catalog evidence.\n"
+    )
+
+    repo_skill = maintained_fork / ".agents" / "skills" / "review-closeout" / "SKILL.md"
+    repo_skill.parent.mkdir(parents=True)
+    repo_skill.write_text(
+        "# Review Closeout\n\n"
+        "This fork-local authority says pull request publication uses the review bot, "
+        "CodeQL code scanning, and rebase merge after review threads are resolved.\n"
+    )
+
+    agents = maintained_fork / "AGENTS.md"
+    agents.write_text(
+        "# Agent Instructions\n\n"
+        "Mutation gate: do not force-push routine baseline updates. Stop and ask a "
+        "human operator when sync policy is ambiguous.\n"
+    )
+
+    docs_agents = maintained_fork / "docs" / "agents"
+    docs_agents.mkdir(parents=True)
+    (docs_agents / "pull-request-policy.md").write_text(
+        "# Pull Request Policy\n\n"
+        "Policy: required checks, code scanning, and unresolved review thread handling "
+        "must be reported before publication closeout.\n"
+    )
+    (docs_agents / "local-gates.md").write_text(
+        "# Local Gates\n\n"
+        "Gate: run pytest and ruff before review preparation. If checks fail, no "
+        "publication mutation is allowed.\n"
+    )
+    (docs_agents / "upstream-sync-procedure.md").write_text(
+        "# Upstream Sync Procedure\n\n"
+        "Procedure: upstream sync planning compares origin/upstream-stable with HEAD "
+        "using merge-base --is-ancestor and records blockers.\n"
+    )
+
+    handoff = handoffs / "sync-handoff.md"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text(
+        "# Sync Handoff\n\n"
+        "Handoff contract: include the active blocker, current upstream refs, review "
+        "thread state, next action, and return contract when an upstream sync pauses.\n"
+    )
+
+    return [global_skills, maintained_fork, handoffs]
 
 
 def _run_git(repo_path: Path, *args: str) -> None:

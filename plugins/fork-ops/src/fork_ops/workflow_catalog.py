@@ -240,6 +240,56 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         ),
     ),
     WorkflowContract(
+        id="workflow-migration-inventory",
+        title="Workflow migration inventory",
+        operator_intent=(
+            "Scout reusable fork-workflow materials and map them to workflow catalog "
+            "coverage evidence without changing source roots."
+        ),
+        trigger_phrases=(
+            "workflow migration inventory",
+            "inventory fork workflow materials",
+            "map skills to the workflow catalog",
+        ),
+        capability_gate="plugin-health",
+        implementation_status="diagnostic-only",
+        available=True,
+        authority_reads=("operator-provided source roots", "workflow catalog contracts"),
+        preflight_checks=("Confirm source roots are readable.", "Classify source material."),
+        mutation_gates=("No source root mutation is allowed during inventory reporting.",),
+        entrypoints=(
+            WorkflowEntrypoint(
+                kind="cli",
+                id="fork-ops workflow inventory",
+                label="Build a read-only workflow migration inventory.",
+                surface="fork-ops workflow inventory",
+            ),
+            WorkflowEntrypoint(
+                kind="mcp",
+                id="fork_ops_workflow_migration_inventory",
+                label="Return workflow migration inventory evidence to MCP clients.",
+                surface="MCP tool",
+            ),
+        ),
+        evidence_expectations=(
+            "source kind, material scope, candidate operator intent, and coverage status",
+            "line-level evidence references that do not duplicate source text",
+            "backlog candidates separated from implemented workflow availability",
+        ),
+        refusal_behavior=(
+            "Refuse to treat backlog candidates as available workflows or to replace "
+            "fork-local authority based on inventory reporting alone."
+        ),
+        handoff_expectations=(
+            "Ask for additional source roots when the inventory scope is incomplete.",
+            "Ask for product-owner review before converting backlog candidates into catalog work.",
+        ),
+        closeout_criteria=(
+            "Inventory entries are grouped by catalog target or backlog candidate.",
+            "No source root was modified.",
+        ),
+    ),
+    WorkflowContract(
         id="authority-source-routing",
         title="Authority and source routing explanation",
         operator_intent="Explain where fork-local authority comes from before selecting tools.",
