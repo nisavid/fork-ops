@@ -1851,7 +1851,10 @@ uncertainty_destination = "ask-human-operator"
             mcp_assessment = fork_ops_migration_assessment(str(repo_path))
             mcp_plan = fork_ops_migration_plan(str(repo_path))
             mcp_resolution = fork_ops_migration_blocker_resolution(
-                generate_migration_plan(repo_path),
+                {
+                    "operation": "migration-plan",
+                    "blockers": [{"code": "source_material.none_found"}],
+                },
                 "source_material.none_found",
             )
 
@@ -2181,6 +2184,25 @@ uncertainty_destination = "ask-human-operator"
             resolution["unavailable_work"],
         )
 
+    def test_blocker_resolution_rejects_non_migration_payload(self) -> None:
+        with self.assertRaisesRegex(
+            ForkOpsError,
+            "requires migration workflow output",
+        ):
+            explain_migration_blocker({"operation": "plugin-health"})
+
+    def test_blocker_resolution_rejects_missing_requested_code(self) -> None:
+        plan = {
+            "operation": "migration-plan",
+            "blockers": [{"code": "semantic_coverage.incomplete"}],
+        }
+
+        with self.assertRaisesRegex(
+            ForkOpsError,
+            "Requested blocker code was not present",
+        ):
+            explain_migration_blocker(plan, "missing.blocker")
+
     def test_migration_execution_applies_config_and_preserves_source_material(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -2202,6 +2224,7 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["status"], "applied")
         self.assertEqual(result["summary"]["applied_edit_count"], 1)
         self.assertEqual(result["summary"]["blocker_count"], 0)
+        self.assertEqual(result["summary"]["retained_material_count"], 1)
         self.assertEqual(result["applied_edits"][0]["path"], ".agents/fork-ops.toml")
         self.assertEqual(result["applied_edits"][0]["action"], "create")
         self.assertEqual(result["applied_edits"][0]["bytes"], len(config_bytes))
@@ -2213,6 +2236,16 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(
             result["skipped_edits"][0]["path"],
             ".agents/skills/working-with-upstream-refs/SKILL.md",
+        )
+        self.assertEqual(
+            result["retained_materials"][0]["path"],
+            ".agents/skills/working-with-upstream-refs/SKILL.md",
+        )
+        narrative = result["narrative"]["text"]
+        self.assertIn("retained authority:", narrative)
+        self.assertIn(
+            "retained source material .agents/skills/working-with-upstream-refs/SKILL.md",
+            narrative,
         )
         self.assertEqual(result["verification_results"][0]["status"], "passed")
         self.assertEqual(
