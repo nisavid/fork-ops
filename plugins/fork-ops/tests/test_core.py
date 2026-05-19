@@ -329,6 +329,58 @@ class ForkOpsCoreTests(unittest.TestCase):
         }
         self.assertIsNone(policy_evidence["policy"]["line"])
 
+    def test_workflow_migration_inventory_scopes_direct_fork_authority_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_workflow_inventory_fixture(workspace_path)
+            docs_agents = workspace_path / "maintained-fork" / "docs" / "agents"
+
+            inventory = build_workflow_migration_inventory([docs_agents])
+
+        entries_by_path = {entry["source_path"]: entry for entry in inventory["entries"]}
+        self.assertEqual(
+            entries_by_path["pull-request-policy.md"]["material_scope"],
+            "fork-local-authority-material",
+        )
+        self.assertEqual(
+            entries_by_path["local-gates.md"]["material_scope"],
+            "fork-local-authority-material",
+        )
+
+    def test_workflow_migration_inventory_scopes_user_global_policy_material(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            policy_root = workspace_path / ".agents" / "policies"
+            policy_root.mkdir(parents=True)
+            (policy_root / "review-policy.md").write_text(
+                "# Review Policy\n\n"
+                "Use when an operator prepares publication evidence for catalog review.\n"
+            )
+
+            with patch.object(Path, "home", return_value=workspace_path):
+                inventory = build_workflow_migration_inventory([policy_root])
+
+        [entry] = inventory["entries"]
+        self.assertEqual(entry["source_kind"], "policy")
+        self.assertEqual(entry["material_scope"], "reusable-workflow-material")
+
+    def test_workflow_migration_inventory_scopes_user_global_lowercase_agents_doc(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            docs_root = workspace_path / ".agents" / "docs"
+            docs_root.mkdir(parents=True)
+            (docs_root / "agents.md").write_text(
+                "# Agents\n\n"
+                "Use when an operator prepares publication evidence for catalog review.\n"
+            )
+
+            with patch.object(Path, "home", return_value=workspace_path):
+                inventory = build_workflow_migration_inventory([docs_root])
+
+        [entry] = inventory["entries"]
+        self.assertEqual(entry["source_kind"], "doc")
+        self.assertEqual(entry["material_scope"], "reusable-workflow-material")
+
     def test_workflow_migration_inventory_reports_unresolvable_source_roots(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             missing = Path(workspace) / "missing-source-root"

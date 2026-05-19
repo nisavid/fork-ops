@@ -2268,7 +2268,7 @@ def _workflow_inventory_entry(
         "source_root": str(root),
         "source_path": source_path,
         "source_kind": source_kind,
-        "material_scope": _workflow_material_scope(source_kind, source_path, raw_text),
+        "material_scope": _workflow_material_scope(source_kind, source_path, path, raw_text),
         "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "candidate_operator_intent": _workflow_operator_intent(target, signals, source_kind),
         "likely_workflow_catalog_target": target,
@@ -2353,30 +2353,48 @@ def _workflow_inventory_signals(
     return _dedupe_strings(signals)
 
 
-def _workflow_material_scope(source_kind: str, source_path: str, raw_text: str) -> str:
+def _workflow_material_scope(
+    source_kind: str,
+    source_path: str,
+    path: Path,
+    raw_text: str,
+) -> str:
     lowered_text = raw_text.lower()
     if source_kind == "global-skill":
         return "reusable-workflow-material"
     if source_kind in {"repo-local-skill", "agent-instruction", "config"}:
         return "fork-local-authority-material"
     if source_kind in {"policy", "gate"}:
-        if _workflow_path_or_content_is_fork_local_authority(source_path, lowered_text):
+        if _workflow_path_or_content_is_fork_local_authority(source_path, path, lowered_text):
             return "fork-local-authority-material"
         return "reusable-workflow-material"
-    if _workflow_path_or_content_is_fork_local_authority(source_path, lowered_text):
+    if _workflow_path_or_content_is_fork_local_authority(source_path, path, lowered_text):
         return "fork-local-authority-material"
     return "reusable-workflow-material"
 
 
 def _workflow_path_or_content_is_fork_local_authority(
     source_path: str,
+    path: Path,
     lowered_text: str,
 ) -> bool:
     lowered_path = source_path.lower()
+    path_parts = tuple(part.lower() for part in path.parts)
+    user_global_agents_path = _is_user_global_agents_path(path)
     return (
-        lowered_path in {"agents.md", "claude.md"}
-        or lowered_path.startswith(".agents/")
-        or lowered_path.startswith("docs/agents/")
+        (lowered_path in {"agents.md", "claude.md"} and not user_global_agents_path)
+        or (
+            not user_global_agents_path
+            and (
+                lowered_path.startswith(".agents/")
+                or lowered_path.startswith("docs/agents/")
+                or ".agents" in path_parts
+                or any(
+                    left == "docs" and right == "agents"
+                    for left, right in zip(path_parts, path_parts[1:], strict=False)
+                )
+            )
+        )
         or "fork-local authority" in lowered_text
         or "maintained fork" in lowered_text
     )
