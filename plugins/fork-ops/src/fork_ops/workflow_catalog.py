@@ -176,7 +176,8 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         ),
         preflight_checks=("Assess candidate source materials.", "Validate generated config."),
         mutation_gates=(
-            "Migration execution only creates .agents/fork-ops.toml for blocker-free plans.",
+            "Migration execution only creates .agents/fork-ops.toml when the dry-run "
+            "preview has no blockers.",
             "Retained source material must remain present and unchanged.",
         ),
         entrypoints=(
@@ -201,7 +202,7 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             WorkflowEntrypoint(
                 kind="cli",
                 id="fork-ops migration execute",
-                label="Apply guarded config creation for blocker-free plans.",
+                label="Apply guarded config creation when the dry-run preview has no blockers.",
                 surface="fork-ops migration execute",
             ),
             WorkflowEntrypoint(
@@ -251,11 +252,12 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "and retain source material until replacement coverage exists."
         ),
         handoff_expectations=(
-            "Request a concrete retain, exclude, defer, or extraction decision when source "
-            "material disposition is ambiguous.",
+            "Request a concrete retain, exclude, defer, needs-human-decision, or "
+            "unsupported-extractor decision when source material disposition is ambiguous.",
         ),
         closeout_criteria=(
-            "Config creation is applied only for a blocker-free plan.",
+            "Config creation is applied only when the dry-run preview has no blockers.",
+            "Reviewed retain decisions can resolve semantic coverage for config creation.",
             "Retained authority remains preserved and validation evidence is reported.",
         ),
     ),

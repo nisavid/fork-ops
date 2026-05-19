@@ -57,7 +57,8 @@ uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork
 uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
 ```
 
-Apply a reviewed, blocker-free migration plan through guarded config creation:
+Apply a reviewed migration plan through guarded config creation when the dry-run
+preview has no blockers:
 
 ```bash
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork

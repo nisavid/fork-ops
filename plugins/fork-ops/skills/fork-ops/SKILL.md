@@ -54,13 +54,17 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
    uv run --project ${PLUGIN_ROOT} fork-ops migration plan --repo /path/to/fork
    ```
 
-5. For a migration preview, run a non-mutating dry run:
+5. For a migration preview, run a non-mutating dry run. If the plan includes
+   `semantic_coverage.incomplete`, guarded config creation is available only
+   when every affected source path has a reviewed `retain` decision in the
+   migration review artifact:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration dry-run --repo /path/to/fork
    ```
 
-6. For a reviewed, blocker-free config migration, run guarded migration execution:
+6. For a reviewed config migration whose dry run has no blockers, run guarded
+   migration execution:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration execute --repo /path/to/fork
@@ -86,4 +90,4 @@ Escalate when fork-local authority is missing, contradictory, or insufficient fo
 
 ## Current Capability
 
-This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and proposed review artifacts, generate dry runs and config proposals, render operator-readable migration narratives, explain migration blockers, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.
+This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and review artifact decision choices, generate dry runs and config proposals, render operator-readable migration narratives, explain migration blockers, and execute guarded config creation when dry-run blockers are resolved for config creation. Reviewed `retain` decisions can unblock config creation for incomplete semantic coverage while retained authority remains preserved and source-material replacement/removal stays unavailable. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.

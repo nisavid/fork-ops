@@ -105,13 +105,17 @@ Use `provenance-ready` only when source, artifact, package, runtime, or install-
 ## Mutation Policy
 
 The foundation implementation supports guarded migration execution for
-blocker-free plans that create `.agents/fork-ops.toml`, preserve retained source
-materials, report migration map dispositions and proposed review artifact
-content, render operator-readable narratives, explain migration blockers, and
-verify the resulting capability level. It does not run broad sync mutations, PR
-publication closeout, arbitrary migration edits, or source-material removal.
-Agents should report missing capabilities and provide the smallest safe next
-step.
+plans whose dry-run blockers are resolved for config creation. It creates
+`.agents/fork-ops.toml`, preserves retained source materials, reports migration
+map dispositions and review artifact decisions, renders operator-readable
+narratives, explains migration blockers, and verifies the resulting capability
+level. A `semantic_coverage.incomplete` path only stops blocking guarded config
+creation when the migration review artifact records a reviewed `retain`
+decision for that path. Retained authority remains checked-in source material
+and still blocks source-material replacement or removal. The implementation does
+not run broad sync mutations, PR publication closeout, arbitrary migration
+edits, or source-material removal. Agents should report missing capabilities and
+provide the smallest safe next step.
 
 When mutation surfaces exist, they should share core mutation gate logic:
 
