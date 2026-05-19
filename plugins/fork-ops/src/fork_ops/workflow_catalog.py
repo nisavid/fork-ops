@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 ImplementationStatus = Literal["current", "diagnostic-only", "next-slice", "planned"]
+_AVAILABLE_STATUSES: frozenset[ImplementationStatus] = frozenset(
+    {"current", "diagnostic-only"}
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,13 @@ class WorkflowContract:
     refusal_behavior: str
     handoff_expectations: tuple[str, ...]
     closeout_criteria: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.available and self.implementation_status not in _AVAILABLE_STATUSES:
+            raise ValueError(
+                f"Workflow {self.id!r}: available=True requires implementation_status in "
+                f"{_AVAILABLE_STATUSES!r}, got {self.implementation_status!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -434,6 +444,7 @@ def workflow_catalog() -> dict[str, Any]:
     return {
         "operation": "workflow-catalog",
         "model": "intent-led-workflow-contracts",
+        # Keep these keys in sync with the ImplementationStatus Literal type.
         "status_values": {
             "current": "Implemented in the plugin's current controlled surfaces.",
             "diagnostic-only": "Implemented only for read-only diagnostics or explanation.",

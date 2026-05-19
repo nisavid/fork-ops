@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 from fork_ops.cli import main as cli_main
@@ -39,7 +39,7 @@ from fork_ops.mcp_server import (
     fork_ops_workflow_catalog,
 )
 from fork_ops.schema import schema_diagnostics
-from fork_ops.workflow_catalog import workflow_catalog
+from fork_ops.workflow_catalog import ImplementationStatus, WorkflowContract, workflow_catalog
 
 TRACK_AWARE_CONFIG = """schema_version = "0.1"
 
@@ -175,6 +175,31 @@ class ForkOpsCoreTests(unittest.TestCase):
         guarded_sync = workflows["guarded-sync-execution"]
         self.assertIn("refuse", guarded_sync["refusal_behavior"].lower())
         self.assertIn("not implemented", guarded_sync["refusal_behavior"].lower())
+
+    def test_workflow_contract_rejects_available_unimplemented_workflow(self) -> None:
+        with self.assertRaisesRegex(ValueError, "available=True requires"):
+            WorkflowContract(
+                id="bad-workflow",
+                title="Bad workflow",
+                operator_intent="Expose an invalid workflow contract.",
+                trigger_phrases=("bad workflow",),
+                capability_gate="sync-ready",
+                implementation_status="planned",
+                available=True,
+                authority_reads=("sync_policy",),
+                preflight_checks=("Validate sync policy.",),
+                mutation_gates=("No mutation.",),
+                entrypoints=(),
+                evidence_expectations=("Evidence.",),
+                refusal_behavior="Refuse invalid contracts.",
+                handoff_expectations=("Ask for correction.",),
+                closeout_criteria=("Contract is valid.",),
+            )
+
+    def test_workflow_catalog_status_values_cover_status_type(self) -> None:
+        catalog = workflow_catalog()
+
+        self.assertEqual(set(catalog["status_values"]), set(get_args(ImplementationStatus)))
 
     def test_track_aware_config_satisfies_track_aware_level(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
