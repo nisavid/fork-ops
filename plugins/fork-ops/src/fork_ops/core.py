@@ -85,6 +85,22 @@ _WORKFLOW_INVENTORY_SIGNAL_NEEDLES = (
     ("handoff", ("handoff", "return contract")),
     ("blocker", ("blocker", "blocked")),
 )
+_WORKFLOW_SIGNAL_NEEDLE_MAP = dict(_WORKFLOW_INVENTORY_SIGNAL_NEEDLES)
+_WORKFLOW_POLICY_PATH_QUALIFIERS = {
+    "baseline",
+    "branch",
+    "closeout",
+    "divergence",
+    "fork",
+    "merge",
+    "publication",
+    "pull",
+    "release",
+    "request",
+    "review",
+    "sync",
+    "upstream",
+}
 
 
 class ForkOpsError(RuntimeError):
@@ -487,6 +503,7 @@ def build_workflow_migration_inventory(
 ) -> dict[str, Any]:
     roots = _workflow_inventory_roots(source_roots)
     contracts = {item.id: item for item in workflow_contracts()}
+    unresolvable_roots = [str(root) for root in roots if not root.exists()]
     entries: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
     for root in roots:
@@ -510,10 +527,12 @@ def build_workflow_migration_inventory(
             "entry_count": len(entries),
             "catalog_evidence_group_count": len(catalog_evidence),
             "backlog_candidate_count": len(backlog_candidates),
+            "unresolvable_source_root_count": len(unresolvable_roots),
         },
         "entries": entries,
         "catalog_evidence": catalog_evidence,
         "backlog_candidates": backlog_candidates,
+        "unresolvable_source_roots": unresolvable_roots,
         "mutation_policy": "no source roots are modified",
         "limitations": [
             "This inventory classifies source material for workflow migration only.",
@@ -2265,23 +2284,46 @@ def _workflow_inventory_entry_id(root: Path, path: Path) -> str:
 
 def _workflow_source_kind(root: Path, path: Path, raw_text: str) -> str:
     rel_parts = path.relative_to(root).parts if path != root else path.parts[-1:]
-    rel = "/".join(rel_parts).lower()
     lowered_text = raw_text.lower()
     if path.name in {"AGENTS.md", "CLAUDE.md"}:
         return "agent-instruction"
     if path.name == "SKILL.md":
         return "global-skill" if _is_user_global_agents_path(path) else "repo-local-skill"
-    if "handoff" in rel or "handoff contract" in lowered_text:
+    if _workflow_path_has_token(rel_parts, {"handoff", "handoffs"}) or (
+        "handoff contract" in lowered_text
+    ):
         return "handoff"
-    if "gate" in rel or "mutation gate" in lowered_text or "local gate" in lowered_text:
+    if _workflow_path_has_token(rel_parts, {"gate", "gates"}) or (
+        "mutation gate" in lowered_text or "local gate" in lowered_text
+    ):
         return "gate"
-    if "procedure" in rel or "procedure:" in lowered_text or "runbook" in lowered_text:
+    if _workflow_path_has_token(rel_parts, {"procedure", "procedures", "runbook", "runbooks"}) or (
+        "procedure:" in lowered_text or "runbook" in lowered_text
+    ):
         return "procedure"
-    if "policy" in rel or "policy:" in lowered_text:
+    if _workflow_path_has_policy_marker(rel_parts) or "policy:" in lowered_text:
         return "policy"
     if path.suffix.lower() in {".toml", ".yaml", ".yml", ".json"}:
         return "config"
     return "doc"
+
+
+def _workflow_path_has_token(rel_parts: tuple[str, ...], tokens: set[str]) -> bool:
+    return any(token in tokens for part in rel_parts for token in _workflow_path_tokens(part))
+
+
+def _workflow_path_has_policy_marker(rel_parts: tuple[str, ...]) -> bool:
+    for part in rel_parts:
+        tokens = _workflow_path_tokens(part)
+        if tokens in {("policy",), ("policies",)}:
+            return True
+        if tokens and tokens[-1] in {"policy", "policies"}:
+            return bool(set(tokens[:-1]) & _WORKFLOW_POLICY_PATH_QUALIFIERS)
+    return False
+
+
+def _workflow_path_tokens(part: str) -> tuple[str, ...]:
+    return tuple(token for token in re.split(r"[^a-z0-9]+", Path(part).stem.lower()) if token)
 
 
 def _is_user_global_agents_path(path: Path) -> bool:
@@ -2405,14 +2447,16 @@ def _workflow_inventory_evidence(
     return evidence
 
 
-def _workflow_signal_line(raw_text: str, signal: str) -> int:
-    needles = dict(_WORKFLOW_INVENTORY_SIGNAL_NEEDLES).get(signal, (signal.replace("-", " "),))
+def _workflow_signal_line(raw_text: str, signal: str) -> int | None:
+    needles = _WORKFLOW_SIGNAL_NEEDLE_MAP.get(signal)
+    if needles is None:
+        return None
     lowered_needles = tuple(needle.lower() for needle in needles)
     for index, line in enumerate(raw_text.splitlines(), start=1):
         lowered_line = line.lower()
         if any(needle in lowered_line for needle in lowered_needles):
             return index
-    return 1
+    return None
 
 
 def _workflow_signal_basis(signal: str) -> str:
