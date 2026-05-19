@@ -2191,6 +2191,17 @@ uncertainty_destination = "ask-human-operator"
         ):
             explain_migration_blocker({"operation": "plugin-health"})
 
+        with self.assertRaisesRegex(
+            ForkOpsError,
+            "requires migration workflow output",
+        ):
+            explain_migration_blocker(
+                {
+                    "operation": "blocker-resolution",
+                    "blocker": {"code": "semantic_coverage.incomplete"},
+                }
+            )
+
     def test_blocker_resolution_rejects_missing_requested_code(self) -> None:
         plan = {
             "operation": "migration-plan",
