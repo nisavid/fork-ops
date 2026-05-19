@@ -19,6 +19,7 @@ from .core import (
     build_workflow_migration_inventory,
     dry_run_migration,
     execute_migration,
+    explain_migration_blocker,
     find_config_path,
     generate_migration_plan,
     load_raw_config,
@@ -31,7 +32,7 @@ _MCP_IMPORT_ERROR: ModuleNotFoundError | None = None
 _FAST_MCP_CLASS: Any = None
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without optional dependency.
     _MCP_IMPORT_ERROR = exc
 else:
@@ -142,6 +143,15 @@ def fork_ops_migration_execute(
 ) -> dict[str, Any]:
     """Apply a validated migration plan through guarded operations."""
     return execute_migration(repo_path, plan=migration_plan)
+
+
+@_tool
+def fork_ops_migration_blocker_resolution(
+    workflow_output: dict[str, Any],
+    blocker_code: str | None = None,
+) -> dict[str, Any]:
+    """Explain a migration blocker from structured workflow output."""
+    return explain_migration_blocker(workflow_output, blocker_code)
 
 
 @_tool
