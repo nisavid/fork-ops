@@ -1520,9 +1520,7 @@ def explain_migration_blocker(
     if not isinstance(workflow_output, dict):
         raise ForkOpsError("Blocker resolution requires a workflow output object.")
     operation = workflow_output.get("operation")
-    if not isinstance(operation, str) or not (
-        operation.startswith("migration-") or operation == "blocker-resolution"
-    ):
+    if not isinstance(operation, str) or not operation.startswith("migration-"):
         raise ForkOpsError("Blocker resolution requires migration workflow output.")
     blocker = _select_blocker(workflow_output, blocker_code)
     evidence = _blocker_evidence(workflow_output, blocker)
