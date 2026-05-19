@@ -3,6 +3,7 @@
 Start configured-fork operations by locating fork-local authority.
 
 ```bash
+uv run --package fork-ops fork-ops workflow catalog
 uv run --package fork-ops fork-ops capability report --repo /path/to/configured-fork
 ```
 
@@ -37,6 +38,7 @@ MCP tools expose the same surface for agents:
 - `fork_ops_config_read`
 - `fork_ops_config_validate`
 - `fork_ops_capability_report`
+- `fork_ops_workflow_catalog`
 - `fork_ops_migration_assessment`
 - `fork_ops_migration_plan`
 - `fork_ops_migration_dry_run`
