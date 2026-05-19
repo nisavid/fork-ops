@@ -80,4 +80,4 @@ Escalate when fork-local authority is missing, contradictory, or insufficient fo
 
 ## Current Capability
 
-This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans, dry runs, and config proposals, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.
+This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and proposed review artifacts, generate dry runs and config proposals, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.

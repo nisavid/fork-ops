@@ -105,8 +105,9 @@ Use `provenance-ready` only when source, artifact, package, runtime, or install-
 
 The foundation implementation supports guarded migration execution for
 blocker-free plans that create `.agents/fork-ops.toml`, preserve retained source
-materials, and verify the resulting capability level. It does not run broad
-sync mutations, PR publication closeout, arbitrary migration edits, or
+materials, report migration map dispositions and proposed review artifact
+content, and verify the resulting capability level. It does not run broad sync
+mutations, PR publication closeout, arbitrary migration edits, or
 source-material removal. Agents should report missing capabilities and provide
 the smallest safe next step.
 

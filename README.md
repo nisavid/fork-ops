@@ -52,8 +52,8 @@ docs, policies, and refs that are authoritative for that fork.
 | Check plugin readiness | The plugin health report independently checks readiness paths for registration, skill discovery, CLI, MCP, and UI visibility. |
 | Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
-| Plan a reviewed migration | Migration plan generation combines evidence, config patch, retained source material, blockers, and validation requirements without editing files. |
-| Preview a migration plan | Migration dry run reports file edits, config changes, retained materials, blocked steps, and expected verification commands without editing files. |
+| Plan a reviewed migration | Migration plan generation combines evidence, a migration map with source material dispositions, a proposed review artifact, config patch, retained source material, blockers, and validation requirements without editing files. |
+| Preview a migration plan | Migration dry run reports file edits, config changes, migration map entries, the proposed review artifact, retained materials, blocked steps, and expected verification commands without editing files. |
 | Apply a migration plan | Guarded migration execution creates `.agents/fork-ops.toml` from a blocker-free plan, preserves retained source materials, and verifies capability. |
 | Draft a starting config | Config proposal generation emits review-required TOML without editing the fork. |
 | Validate fork authority | The schema and CLI validate `.agents/fork-ops.toml` for defined capability levels. |

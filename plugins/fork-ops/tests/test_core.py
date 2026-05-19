@@ -126,6 +126,11 @@ def _entrypoint_ids(workflow: dict[str, Any]) -> set[str]:
     return {entrypoint["id"] for entrypoint in workflow["entrypoints"]}
 
 
+def _migration_map_by_path(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index migration_map entries by source_path for test assertions."""
+    return {entry["source_path"]: entry for entry in plan["migration_map"]}
+
+
 class ForkOpsCoreTests(unittest.TestCase):
     def test_workflow_catalog_defines_intent_level_contracts(self) -> None:
         catalog = workflow_catalog()
@@ -1436,17 +1441,217 @@ uncertainty_destination = "ask-human-operator"
         validation_codes = {item["code"] for item in plan["validation_requirements"]}
         self.assertIn("validation.config_validate", validation_codes)
 
+    def test_migration_plan_adds_map_and_review_artifact_for_source_materials(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            upstream_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            review_path = repo_path / "docs/agents/review-policy.md"
+            upstream_path.parent.mkdir(parents=True)
+            review_path.parent.mkdir(parents=True)
+            upstream_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            review_path.write_text(
+                "Review bot policy lives here. Pull request publication closeout uses "
+                "CodeQL code scanning and review threads.\n"
+            )
+
+            plan = generate_migration_plan(repo_path)
+
+        expected_dispositions = {
+            "extracted_into_config",
+            "retained_as_fork_local_authority",
+            "mapped_to_workflow_backlog",
+            "irrelevant_to_fork_ops",
+            "unsupported_extractor_shape",
+            "needs_human_decision",
+            "deferred_with_rationale",
+        }
+        self.assertEqual(set(plan["source_material_disposition_types"]), expected_dispositions)
+        self.assertEqual(plan["summary"]["migration_map_entry_count"], 2)
+        self.assertEqual(plan["summary"]["review_artifact_entry_count"], 2)
+
+        migration_map = _migration_map_by_path(plan)
+        self.assertEqual(
+            list(migration_map),
+            [
+                ".agents/skills/working-with-upstream-refs/SKILL.md",
+                "docs/agents/review-policy.md",
+            ],
+        )
+
+        upstream_entry = migration_map[".agents/skills/working-with-upstream-refs/SKILL.md"]
+        self.assertEqual(upstream_entry["disposition"]["type"], "extracted_into_config")
+        self.assertEqual(upstream_entry["target_surface"]["type"], "fork_ops_config")
+        self.assertEqual(upstream_entry["target_surface"]["path"], ".agents/fork-ops.toml")
+        self.assertIn(
+            "sync_policy.default_sync_baseline",
+            upstream_entry["target_surface"]["sections"],
+        )
+        self.assertTrue(upstream_entry["retained_source_material"])
+
+        review_entry = migration_map["docs/agents/review-policy.md"]
+        self.assertEqual(review_entry["disposition"]["type"], "mapped_to_workflow_backlog")
+        self.assertEqual(review_entry["target_surface"]["type"], "workflow_catalog_backlog")
+        self.assertEqual(review_entry["target_surface"]["workflow_id"], "publication-closeout")
+
+        artifact = plan["migration_review_artifact"]
+        self.assertEqual(artifact["status"], "proposed")
+        self.assertEqual(artifact["target_path"], "docs/agents/fork-ops-migration-review.md")
+        artifact_entries = {entry["source_path"]: entry for entry in artifact["entries"]}
+        self.assertEqual(
+            artifact_entries["docs/agents/review-policy.md"]["disposition"]["type"],
+            "mapped_to_workflow_backlog",
+        )
+        self.assertIn("rationale", artifact_entries["docs/agents/review-policy.md"])
+        self.assertIn("- Target path: .agents/fork-ops.toml", artifact["markdown"])
+        self.assertIn("sync_policy.default_sync_baseline", artifact["markdown"])
+        self.assertIn("- Target workflow id: publication-closeout", artifact["markdown"])
+        self.assertNotIn(
+            "migration review",
+            json.dumps(plan["proposed_config_patch"]["config"]).lower(),
+        )
+        review_codes = {item["code"] for item in plan["required_review"]}
+        self.assertIn("review.migration_review_artifact", review_codes)
+
+    def test_migration_map_classifies_retained_irrelevant_unsupported_and_human_decisions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            agents_path = repo_path / "AGENTS.md"
+            irrelevant_path = repo_path / ".codex/process-notes.md"
+            unsupported_path = repo_path / "docs/maintainers/upstream-notes.md"
+            lts_path = repo_path / "docs/agents/default-lts.md"
+            stable_path = repo_path / "docs/agents/default-stable.md"
+            irrelevant_path.parent.mkdir(parents=True)
+            unsupported_path.parent.mkdir(parents=True)
+            lts_path.parent.mkdir(parents=True)
+            agents_path.write_text(
+                "Fork-local authority for this maintained fork lives here. Ask before "
+                "changing local pull request review bot policy.\n"
+            )
+            irrelevant_path.write_text(
+                "The test harness can fork a child process while running examples.\n"
+            )
+            unsupported_path.write_text(
+                "The upstream track policy is described narratively without refs.\n"
+            )
+            lts_path.write_text(
+                "Use origin/upstream-lts as the default upstream baseline for sync work.\n"
+            )
+            stable_path.write_text(
+                "Use origin/upstream-stable as the default upstream baseline for sync work.\n"
+            )
+
+            plan = generate_migration_plan(repo_path)
+
+        migration_map = _migration_map_by_path(plan)
+        self.assertEqual(
+            migration_map["AGENTS.md"]["disposition"]["type"],
+            "retained_as_fork_local_authority",
+        )
+        self.assertEqual(
+            migration_map[".codex/process-notes.md"]["disposition"]["type"],
+            "irrelevant_to_fork_ops",
+        )
+        self.assertEqual(
+            migration_map["docs/maintainers/upstream-notes.md"]["disposition"]["type"],
+            "unsupported_extractor_shape",
+        )
+        self.assertEqual(
+            migration_map["docs/agents/default-lts.md"]["disposition"]["type"],
+            "needs_human_decision",
+        )
+        self.assertEqual(
+            migration_map["docs/agents/default-stable.md"]["disposition"]["type"],
+            "needs_human_decision",
+        )
+        self.assertEqual(
+            migration_map["docs/agents/default-lts.md"]["target_surface"]["type"],
+            "migration_review_artifact",
+        )
+        config_surface_paths = {
+            surface["path"] for surface in plan["proposed_config_patch"]["config"]["local_surfaces"]
+        }
+        self.assertNotIn(".codex/process-notes.md", config_surface_paths)
+
+    def test_migration_map_defers_existing_config_merge_without_source_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            config_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+
+            plan = generate_migration_plan(repo_path)
+            dry_run = dry_run_migration_plan(plan)
+            result = execute_migration_plan(plan)
+
+            self.assertEqual(source_path.read_text(), UPSTREAM_REF_PRESSURE_TEXT)
+            self.assertEqual(config_path.read_text(), TRACK_AWARE_CONFIG)
+
+        entry = _migration_map_by_path(plan)[".agents/skills/working-with-upstream-refs/SKILL.md"]
+        self.assertEqual(entry["disposition"]["type"], "deferred_with_rationale")
+        self.assertEqual(entry["target_surface"]["type"], "migration_review_artifact")
+        dry_run_map = {
+            item["source_path"]: item for item in dry_run["migration_map"]
+        }
+        dry_run_entry = dry_run_map[".agents/skills/working-with-upstream-refs/SKILL.md"]
+        self.assertEqual(dry_run_entry["source_path"], entry["source_path"])
+        self.assertEqual(
+            dry_run["migration_review_artifact"]["target_path"],
+            "docs/agents/fork-ops-migration-review.md",
+        )
+        self.assertIn(
+            "- Target section: deferred mappings",
+            dry_run["migration_review_artifact"]["markdown"],
+        )
+        self.assertEqual(result["status"], "blocked")
+        skipped_by_path = {item["path"]: item for item in result["skipped_edits"]}
+        self.assertEqual(
+            skipped_by_path[".agents/skills/working-with-upstream-refs/SKILL.md"]["action"],
+            "preserve",
+        )
+
+    def test_migration_plan_does_not_block_on_reviewed_non_config_dispositions(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            irrelevant_path = repo_path / ".codex/process-notes.md"
+            backlog_path = repo_path / "docs/agents/review-policy.md"
+            source_path.parent.mkdir(parents=True)
+            irrelevant_path.parent.mkdir(parents=True)
+            backlog_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            irrelevant_path.write_text(
+                "The test harness can fork a child process while running examples.\n"
+            )
+            backlog_path.write_text(
+                "Review bot policy lives here. Pull request publication closeout uses "
+                "CodeQL code scanning and review threads.\n"
+            )
+
+            plan = generate_migration_plan(repo_path)
+            dry_run = dry_run_migration_plan(plan)
+
+        self.assertEqual(plan["summary"]["semantic_coverage"], "complete")
+        blocker_codes = {item["code"] for item in plan["blockers"]}
+        self.assertNotIn("semantic_coverage.incomplete", blocker_codes)
+        self.assertTrue(dry_run["can_execute"])
+
     def test_migration_plan_records_semantic_coverage_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
-            path = repo_path / "AGENTS.md"
-            path.write_text("Review bot policy lives here, but no structured fork facts yet.\n")
+            path = repo_path / "docs/maintainers/upstream-notes.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("The upstream track policy is described narratively without refs.\n")
 
             plan = generate_migration_plan(repo)
 
         self.assertEqual(plan["summary"]["semantic_coverage"], "incomplete")
         self.assertEqual(plan["blockers"][0]["code"], "semantic_coverage.incomplete")
-        self.assertEqual(plan["blockers"][0]["paths"], ["AGENTS.md"])
+        self.assertEqual(plan["blockers"][0]["paths"], ["docs/maintainers/upstream-notes.md"])
 
     def test_migration_plan_accepts_default_baseline_without_separate_ref_role(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1532,6 +1737,21 @@ uncertainty_destination = "ask-human-operator"
             with self.assertRaisesRegex(ForkOpsError, "malformed blockers"):
                 dry_run_migration_plan(plan)
 
+    def test_migration_dry_run_rejects_malformed_review_artifact_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["migration_review_artifact"]["entries"] = ["not-a-table"]
+
+            with self.assertRaisesRegex(
+                ForkOpsError,
+                "malformed migration_review_artifact.entries",
+            ):
+                dry_run_migration_plan(plan)
+
     def test_migration_dry_run_uses_embedded_repo_path_for_supplied_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -1547,8 +1767,9 @@ uncertainty_destination = "ask-human-operator"
     def test_migration_dry_run_reports_plan_blockers_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
-            source_path = repo_path / "AGENTS.md"
-            source_text = "Review bot policy lives here, but no structured fork facts yet.\n"
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            source_path.parent.mkdir(parents=True)
+            source_text = "The upstream track policy is described narratively without refs.\n"
             source_path.write_text(source_text)
 
             dry_run = dry_run_migration(repo_path)
@@ -1784,8 +2005,9 @@ uncertainty_destination = "ask-human-operator"
     def test_migration_execution_refuses_plan_blockers_without_mutating_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
-            source_path = repo_path / "AGENTS.md"
-            source_text = "Review bot policy lives here, but no structured fork facts yet.\n"
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            source_path.parent.mkdir(parents=True)
+            source_text = "The upstream track policy is described narratively without refs.\n"
             source_path.write_text(source_text)
             plan = generate_migration_plan(repo_path)
 

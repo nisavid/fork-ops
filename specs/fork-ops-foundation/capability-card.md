@@ -116,8 +116,13 @@ The proposed config patch surface should convert assessment output into a non-mu
 
 Config-management output should distinguish raw TOML, parsed config, normalized config, diagnostics, capability levels, proposed diffs, and applied semantic operations.
 
+Migration plan and dry-run output should distinguish migration map dispositions,
+target surfaces, proposed review artifact entries, config changes, retained
+source materials, blockers, and verification requirements.
+
 Migration execution output should distinguish applied edits, skipped preserved
-source materials, blockers, and verification results.
+source materials, migration map dispositions, proposed review artifact entries,
+blockers, and verification results.
 
 ## Failure Modes
 
