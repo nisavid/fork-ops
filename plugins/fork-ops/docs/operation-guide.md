@@ -53,16 +53,16 @@ MCP tools expose the same surface for agents:
 
 Use plugin health when first bringing Fork Ops online or when one control
 surface works while another is missing. The report checks plugin registration,
-skill discovery, CLI execution, MCP config resolution, MCP process startup, MCP
-tool listing, and UI visibility when a UI inspection result is supplied.
+skill discovery, CLI execution, MCP config, MCP startup, MCP tool listing, and
+UI visibility when inspectable.
 
 ```bash
 uv run --package fork-ops fork-ops plugin health
 ```
 
 Each readiness path reports one status: `ready`, `failed`, `unavailable`, or
-`uninspectable`. MCP failures include next paths, and the report keeps CLI
-fallback guidance available when CLI execution is ready.
+`uninspectable`. MCP failures include next paths, and the report provides CLI
+fallback guidance when CLI execution is ready.
 
 ## Workflow Migration Inventory
 

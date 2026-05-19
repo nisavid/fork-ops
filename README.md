@@ -49,7 +49,7 @@ docs, policies, and refs that are authoritative for that fork.
 
 | User need | Current support |
 | --- | --- |
-| Check plugin readiness | Plugin health diagnostics report registration, skill discovery, CLI, MCP, and UI visibility readiness paths independently. |
+| Check plugin readiness | The plugin health report independently checks readiness paths for registration, skill discovery, CLI, MCP, and UI visibility. |
 | Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
 | Plan a reviewed migration | Migration plan generation combines evidence, config patch, retained source material, blockers, and validation requirements without editing files. |

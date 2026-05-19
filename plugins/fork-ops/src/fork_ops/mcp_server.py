@@ -173,22 +173,25 @@ def fork_ops_workflow_migration_inventory(
 def mcp_healthcheck() -> dict[str, Any]:
     """Return lightweight startup evidence without opening the stdio MCP server."""
     return {
+        "mcp_dependency_available": mcp is not None,
+        "missing_dependency": str(_MCP_IMPORT_ERROR) if _MCP_IMPORT_ERROR else None,
         "server": "Fork Ops",
         "tools": list(_REGISTERED_TOOL_IDS),
     }
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ["--health-check"]:
+        print(json.dumps(mcp_healthcheck(), indent=2, sort_keys=True))
+        return 0
     if mcp is None:
         raise SystemExit(
             "The Fork Ops MCP server requires the optional dependency: pip install 'fork-ops[mcp]'"
         ) from _MCP_IMPORT_ERROR
-    if argv == ["--health-check"]:
-        print(json.dumps(mcp_healthcheck(), indent=2, sort_keys=True))
-        return
     mcp.run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

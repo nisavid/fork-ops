@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -41,12 +42,14 @@ MCP_TOOL_IDS = (
 )
 PLUGIN_HEALTH_STATUS_VALUES = {
     "ready": "The readiness path was inspected and is usable.",
+    "partial": "Some readiness paths are usable while others are unavailable or uninspectable.",
     "failed": "The readiness path was inspected and returned a blocking failure.",
     "unavailable": "The readiness path has no usable local control surface in this context.",
     "uninspectable": (
         "The readiness path needs an external or UI control surface that was not provided."
     ),
 }
+PLUGIN_HEALTH_CHECK_STATUSES = {"ready", "failed", "unavailable", "uninspectable"}
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
 _CANDIDATE_FILE_SUFFIXES = {".json", ".md", ".toml", ".yaml", ".yml"}
 _CANDIDATE_SCAN_SKIP_DIRS = {
@@ -244,7 +247,7 @@ def build_plugin_health_report(
         "status_values": dict(PLUGIN_HEALTH_STATUS_VALUES),
         "summary": summary,
         "checks": checks,
-        "cli_fallback": _cli_fallback(cli_ready, root),
+        "cli_fallback": _cli_fallback(cli_ready, root, repo),
         "mutation_policy": "read-only diagnostics; no repository mutation is performed",
     }
 
@@ -272,7 +275,7 @@ def _health_check(
     evidence: dict[str, Any] | None = None,
     next_steps: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    if status not in PLUGIN_HEALTH_STATUS_VALUES:
+    if status not in PLUGIN_HEALTH_CHECK_STATUSES:
         raise ValueError(f"Unknown plugin health status: {status}")
     return {
         "id": check_id,
@@ -300,6 +303,15 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
         )
     try:
         marketplace = json.loads(marketplace_path.read_text())
+    except UnicodeDecodeError as exc:
+        return _health_check(
+            "plugin_registration",
+            "Plugin registration",
+            "failed",
+            "Plugin marketplace metadata is not valid UTF-8 text.",
+            evidence={"path": str(marketplace_path), "error": str(exc)},
+            next_steps=("Repair .agents/plugins/marketplace.json text encoding.",),
+        )
     except OSError as exc:
         return _health_check(
             "plugin_registration",
@@ -317,6 +329,15 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
             "Plugin marketplace metadata is not valid JSON.",
             evidence={"path": str(marketplace_path), "error": str(exc)},
             next_steps=("Repair .agents/plugins/marketplace.json before trusting plugin state.",),
+        )
+    if not isinstance(marketplace, dict):
+        return _health_check(
+            "plugin_registration",
+            "Plugin registration",
+            "failed",
+            "Plugin marketplace metadata must be a JSON object.",
+            evidence={"path": str(marketplace_path), "json_type": type(marketplace).__name__},
+            next_steps=("Repair .agents/plugins/marketplace.json plugin registration metadata.",),
         )
 
     plugins = marketplace.get("plugins")
@@ -343,20 +364,31 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
             next_steps=("Register the local Fork Ops plugin before relying on Codex discovery.",),
         )
 
-    plugin = matching_plugins[0]
-    source = plugin.get("source")
-    source_path = source.get("path") if isinstance(source, dict) else None
-    if not isinstance(source_path, str):
+    matching_registrations: list[tuple[dict[str, Any], Path]] = []
+    for plugin in matching_plugins:
+        source = plugin.get("source")
+        source_path = source.get("path") if isinstance(source, dict) else None
+        if isinstance(source_path, str):
+            matching_registrations.append((plugin, _resolve_health_path(repo_root, source_path)))
+
+    if not matching_registrations:
         return _health_check(
             "plugin_registration",
             "Plugin registration",
             "failed",
             "Fork Ops plugin registration does not include a local source path.",
-            evidence={"path": str(marketplace_path), "plugin": plugin},
+            evidence={"path": str(marketplace_path), "plugins": matching_plugins},
             next_steps=("Record a local source path for the Fork Ops plugin registration.",),
         )
-    registered_path = _resolve_health_path(repo_root, source_path)
-    if registered_path != plugin_root:
+    matched_registration = next(
+        (
+            (plugin, registered_path)
+            for plugin, registered_path in matching_registrations
+            if registered_path == plugin_root
+        ),
+        None,
+    )
+    if matched_registration is None:
         return _health_check(
             "plugin_registration",
             "Plugin registration",
@@ -364,11 +396,14 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
             "Fork Ops plugin registration points at a different plugin root.",
             evidence={
                 "path": str(marketplace_path),
-                "registered_path": str(registered_path),
+                "registered_paths": [
+                    str(registered_path) for _, registered_path in matching_registrations
+                ],
                 "plugin_root": str(plugin_root),
             },
             next_steps=("Update plugin marketplace metadata or pass the matching --plugin-root.",),
         )
+    plugin, registered_path = matched_registration
     return _health_check(
         "plugin_registration",
         "Plugin registration",
@@ -395,6 +430,15 @@ def _skill_discovery_check(plugin_root: Path) -> dict[str, Any]:
         )
     try:
         skill_text = skill_path.read_text()
+    except UnicodeDecodeError as exc:
+        return _health_check(
+            "skill_discovery",
+            "Skill discovery",
+            "failed",
+            "Fork Ops skill file is not valid UTF-8 text.",
+            evidence={"path": str(skill_path), "error": str(exc)},
+            next_steps=("Repair plugins/fork-ops/skills/fork-ops/SKILL.md text encoding.",),
+        )
     except OSError as exc:
         return _health_check(
             "skill_discovery",
@@ -461,6 +505,16 @@ def _cli_execution_check(
             evidence=evidence,
             next_steps=("Run fork-ops workflow catalog directly and inspect stdout.",),
         )
+    if not isinstance(payload, dict):
+        evidence["json_type"] = type(payload).__name__
+        return _health_check(
+            "cli_execution",
+            "CLI execution",
+            "failed",
+            "Fork Ops CLI workflow catalog probe did not return a JSON object.",
+            evidence=evidence,
+            next_steps=("Run fork-ops workflow catalog directly and inspect stdout.",),
+        )
     if payload.get("operation") != "workflow-catalog":
         evidence["operation"] = payload.get("operation")
         return _health_check(
@@ -471,7 +525,18 @@ def _cli_execution_check(
             evidence=evidence,
             next_steps=("Verify the fork-ops command resolves to this plugin checkout.",),
         )
-    evidence["workflow_count"] = len(payload.get("workflows", []))
+    workflows = payload.get("workflows", [])
+    if not isinstance(workflows, list):
+        evidence["workflows_type"] = type(workflows).__name__
+        return _health_check(
+            "cli_execution",
+            "CLI execution",
+            "failed",
+            "Fork Ops CLI workflow catalog probe returned malformed workflows metadata.",
+            evidence=evidence,
+            next_steps=("Run fork-ops workflow catalog directly and inspect stdout.",),
+        )
+    evidence["workflow_count"] = len(workflows)
     evidence.pop("stdout", None)
     evidence.pop("stderr", None)
     return _health_check(
@@ -501,6 +566,18 @@ def _mcp_config_resolution_check(
         )
     try:
         mcp_config = json.loads(mcp_config_path.read_text())
+    except UnicodeDecodeError as exc:
+        return (
+            _health_check(
+                "mcp_config_resolution",
+                "MCP config resolution",
+                "failed",
+                "Fork Ops MCP config is not valid UTF-8 text.",
+                evidence={"path": str(mcp_config_path), "error": str(exc)},
+                next_steps=("Repair plugins/fork-ops/.mcp.json text encoding.",),
+            ),
+            None,
+        )
     except OSError as exc:
         return (
             _health_check(
@@ -521,6 +598,18 @@ def _mcp_config_resolution_check(
                 "failed",
                 "Fork Ops MCP config is not valid JSON.",
                 evidence={"path": str(mcp_config_path), "error": str(exc)},
+                next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
+            ),
+            None,
+        )
+    if not isinstance(mcp_config, dict):
+        return (
+            _health_check(
+                "mcp_config_resolution",
+                "MCP config resolution",
+                "failed",
+                "Fork Ops MCP config must be a JSON object.",
+                evidence={"path": str(mcp_config_path), "json_type": type(mcp_config).__name__},
                 next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
             ),
             None,
@@ -580,7 +669,7 @@ def _mcp_process_startup_check(
 
     command_value = server.get("command")
     args_value = server.get("args", [])
-    if not isinstance(command_value, str) or not all(
+    if not isinstance(command_value, str) or not isinstance(args_value, (list, tuple)) or not all(
         isinstance(item, str) for item in args_value
     ):
         return (
@@ -629,6 +718,19 @@ def _mcp_process_startup_check(
             ),
             None,
         )
+    if not isinstance(payload, dict):
+        evidence["json_type"] = type(payload).__name__
+        return (
+            _health_check(
+                "mcp_process_startup",
+                "MCP process startup",
+                "failed",
+                "Fork Ops MCP health-check process did not return a JSON object.",
+                evidence=evidence,
+                next_steps=_mcp_failure_next_steps(cli_ready),
+            ),
+            None,
+        )
     if payload.get("server") != "Fork Ops":
         evidence["server"] = payload.get("server")
         return (
@@ -637,6 +739,34 @@ def _mcp_process_startup_check(
                 "MCP process startup",
                 "failed",
                 "Fork Ops MCP health-check process returned an unexpected server name.",
+                evidence=evidence,
+                next_steps=_mcp_failure_next_steps(cli_ready),
+            ),
+            None,
+        )
+    mcp_dependency_available = payload.get("mcp_dependency_available")
+    evidence["mcp_dependency_available"] = mcp_dependency_available
+    if not isinstance(mcp_dependency_available, bool):
+        evidence["missing_dependency"] = payload.get("missing_dependency")
+        return (
+            _health_check(
+                "mcp_process_startup",
+                "MCP process startup",
+                "failed",
+                "Fork Ops MCP health-check process returned malformed dependency metadata.",
+                evidence=evidence,
+                next_steps=_mcp_failure_next_steps(cli_ready),
+            ),
+            None,
+        )
+    if not mcp_dependency_available:
+        evidence["missing_dependency"] = payload.get("missing_dependency")
+        return (
+            _health_check(
+                "mcp_process_startup",
+                "MCP process startup",
+                "failed",
+                "Fork Ops MCP optional dependency is not installed.",
                 evidence=evidence,
                 next_steps=_mcp_failure_next_steps(cli_ready),
             ),
@@ -732,17 +862,14 @@ def _plugin_health_summary(checks: list[dict[str, Any]]) -> dict[str, Any]:
     counts = {status: 0 for status in PLUGIN_HEALTH_STATUS_VALUES}
     for check in checks:
         counts[check["status"]] += 1
-    cli_ready = any(
-        check["id"] == "cli_execution" and check["status"] == "ready" for check in checks
-    )
-    if counts["ready"] == len(checks):
+    if counts["failed"]:
+        status = "failed"
+    elif counts["ready"] == len(checks):
         status = "ready"
     elif counts["ready"] == 0 and counts["uninspectable"] and not (
         counts["failed"] or counts["unavailable"]
     ):
         status = "uninspectable"
-    elif not cli_ready:
-        status = "failed"
     else:
         status = "partial"
     return {
@@ -755,13 +882,14 @@ def _plugin_health_summary(checks: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _cli_fallback(cli_ready: bool, plugin_root: Path) -> dict[str, Any]:
+def _cli_fallback(cli_ready: bool, plugin_root: Path, repo_root: Path) -> dict[str, Any]:
     return {
         "usable": cli_ready,
         "command": "uv run --package fork-ops fork-ops workflow catalog",
         "plugin_health_command": (
             "uv run --package fork-ops fork-ops plugin health "
-            f"--plugin-root {plugin_root}"
+            f"--plugin-root {shlex.quote(str(plugin_root))} "
+            f"--repo-root {shlex.quote(str(repo_root))}"
         ),
         "note": (
             "Use CLI commands while MCP or UI surfaces are unavailable."
@@ -820,6 +948,8 @@ def _default_command_runner(
             command,
             cwd=cwd,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             check=False,
