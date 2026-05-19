@@ -36,8 +36,10 @@ from fork_ops.mcp_server import (
     fork_ops_migration_dry_run,
     fork_ops_migration_execute,
     fork_ops_schema,
+    fork_ops_workflow_catalog,
 )
 from fork_ops.schema import schema_diagnostics
+from fork_ops.workflow_catalog import workflow_catalog
 
 TRACK_AWARE_CONFIG = """schema_version = "0.1"
 
@@ -110,7 +112,70 @@ push = false
 """
 
 
+def _entrypoint_ids(workflow: dict[str, Any]) -> set[str]:
+    return {entrypoint["id"] for entrypoint in workflow["entrypoints"]}
+
+
 class ForkOpsCoreTests(unittest.TestCase):
+    def test_workflow_catalog_defines_intent_level_contracts(self) -> None:
+        catalog = workflow_catalog()
+
+        self.assertEqual(catalog["operation"], "workflow-catalog")
+        workflows = {workflow["id"]: workflow for workflow in catalog["workflows"]}
+        expected_contracts = {
+            "operator-onboarding": ("plugin-health", "next-slice", False),
+            "fork-authority-migration": ("identified", "current", True),
+            "authority-source-routing": ("identified", "diagnostic-only", True),
+            "upstream-status-assessment": ("track-aware", "diagnostic-only", True),
+            "upstream-sync-planning": ("sync-ready", "next-slice", False),
+            "guarded-sync-execution": ("sync-ready", "planned", False),
+            "carried-divergence-review": ("sync-ready", "planned", False),
+            "review-preparation": ("review-ready", "planned", False),
+            "publication-closeout": ("review-ready", "planned", False),
+            "blocker-resolution": ("identified", "next-slice", False),
+        }
+        self.assertEqual(set(workflows), set(expected_contracts))
+        self.assertEqual(len(catalog["workflows"]), len(workflows))
+
+        for workflow_id, (capability_gate, status, available) in expected_contracts.items():
+            workflow = workflows[workflow_id]
+            self.assertEqual(workflow["capability_gate"], capability_gate)
+            self.assertEqual(workflow["implementation_status"], status)
+            self.assertEqual(workflow["available"], available)
+            self.assertTrue(workflow["operator_intent"])
+            self.assertTrue(workflow["trigger_phrases"])
+            self.assertTrue(workflow["evidence_expectations"])
+            self.assertTrue(workflow["refusal_behavior"])
+            self.assertTrue(workflow["handoff_expectations"])
+            self.assertTrue(workflow["closeout_criteria"])
+            if not available:
+                self.assertIn("fork-ops workflow catalog", _entrypoint_ids(workflow))
+                self.assertIn("fork_ops_workflow_catalog", _entrypoint_ids(workflow))
+
+        migration = workflows["fork-authority-migration"]
+        self.assertIn("map an existing maintained fork", migration["operator_intent"].lower())
+        self.assertIn("fork authority migration", migration["trigger_phrases"])
+        self.assertLessEqual(
+            {
+                "fork-ops migration assess",
+                "fork-ops migration plan",
+                "fork-ops migration dry-run",
+                "fork-ops migration execute",
+                "fork-ops migration propose-config",
+                "fork_ops_migration_assessment",
+                "fork_ops_migration_plan",
+                "fork_ops_migration_dry_run",
+                "fork_ops_migration_execute",
+                "fork_ops_migration_config_patch",
+            },
+            _entrypoint_ids(migration),
+        )
+        self.assertIn("source material disposition", " ".join(migration["evidence_expectations"]))
+
+        guarded_sync = workflows["guarded-sync-execution"]
+        self.assertIn("refuse", guarded_sync["refusal_behavior"].lower())
+        self.assertIn("not implemented", guarded_sync["refusal_behavior"].lower())
+
     def test_track_aware_config_satisfies_track_aware_level(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             path = Path(repo) / CONFIG_RELATIVE_PATH
@@ -934,6 +999,21 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(exit_code, 1)
         self.assertIn("error\tschema/fork-ops.schema.json", output.getvalue())
         self.assertIn("ok\tsrc/fork_ops/fork-ops.schema.json", output.getvalue())
+
+    def test_cli_and_mcp_expose_shared_workflow_catalog(self) -> None:
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = cli_main(["workflow", "catalog"])
+        cli_payload = json.loads(output.getvalue())
+        mcp_payload = fork_ops_workflow_catalog()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cli_payload, mcp_payload)
+        workflows = {workflow["id"]: workflow for workflow in cli_payload["workflows"]}
+        operator_onboarding = workflows["operator-onboarding"]
+        self.assertIn("fork-ops workflow catalog", _entrypoint_ids(operator_onboarding))
+        self.assertIn("fork_ops_workflow_catalog", _entrypoint_ids(operator_onboarding))
 
     def test_mcp_exposes_migration_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

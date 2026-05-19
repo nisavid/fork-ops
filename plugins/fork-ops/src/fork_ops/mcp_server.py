@@ -21,6 +21,7 @@ from .core import (
     propose_migration_config_patch,
     schema_json,
 )
+from .workflow_catalog import workflow_catalog
 
 _MCP_IMPORT_ERROR: ModuleNotFoundError | None = None
 _FAST_MCP_CLASS: Any = None
@@ -133,6 +134,12 @@ def fork_ops_migration_config_patch(repo_path: str = ".") -> dict[str, Any]:
 def fork_ops_schema() -> str:
     """Return the Fork Ops config JSON Schema."""
     return schema_json()
+
+
+@_tool
+def fork_ops_workflow_catalog() -> dict[str, Any]:
+    """Return the Fork Ops intent-level workflow catalog."""
+    return workflow_catalog()
 
 
 def main() -> None:

@@ -25,6 +25,7 @@ from .core import (
     schema_json,
 )
 from .schema import CAPABILITY_LEVELS
+from .workflow_catalog import workflow_catalog
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -132,6 +133,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_repo_arg(propose)
     propose.add_argument("--format", choices=["json", "toml"], default="json")
     propose.set_defaults(func=cmd_migration_propose_config)
+
+    workflow = subcommands.add_parser("workflow", help="Inspect Fork Ops workflow contracts.")
+    workflow_subcommands = workflow.add_subparsers(dest="workflow_command", required=True)
+    workflow_catalog_parser = workflow_subcommands.add_parser(
+        "catalog",
+        help="Print the Fork Ops workflow catalog.",
+    )
+    workflow_catalog_parser.set_defaults(func=cmd_workflow_catalog)
 
     schema = subcommands.add_parser("schema", help="Print schema information.")
     schema_subcommands = schema.add_subparsers(dest="schema_command", required=True)
@@ -292,6 +301,11 @@ def cmd_migration_propose_config(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(patch, indent=2, sort_keys=True))
     return 1 if _diagnostics_have_errors(patch["diagnostics"]) else 0
+
+
+def cmd_workflow_catalog(args: argparse.Namespace) -> int:
+    print(json.dumps(workflow_catalog(), indent=2, sort_keys=True))
+    return 0
 
 
 def cmd_schema_print(args: argparse.Namespace) -> int:
