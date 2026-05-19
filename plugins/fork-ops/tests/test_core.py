@@ -269,6 +269,8 @@ class ForkOpsCoreTests(unittest.TestCase):
             entries["agent-instruction"]["material_scope"],
             "fork-local-authority-material",
         )
+        self.assertEqual(entries["policy"]["material_scope"], "fork-local-authority-material")
+        self.assertEqual(entries["gate"]["material_scope"], "fork-local-authority-material")
         self.assertEqual(entries["gate"]["likely_workflow_catalog_target"], "review-preparation")
         self.assertEqual(entries["handoff"]["coverage_status"], "backlog-candidate")
 
@@ -307,6 +309,25 @@ class ForkOpsCoreTests(unittest.TestCase):
         )
         for entry in entries_by_path.values():
             self.assertEqual(entry["source_kind"], "doc")
+
+    def test_workflow_migration_inventory_scopes_reusable_policy_material(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace) / "global-workflows"
+            root.mkdir()
+            (root / "review-policy.md").write_text(
+                "# Review\n\n"
+                "Use when an operator prepares publication evidence for catalog review.\n"
+            )
+
+            inventory = build_workflow_migration_inventory([root])
+
+        [entry] = inventory["entries"]
+        self.assertEqual(entry["source_kind"], "policy")
+        self.assertEqual(entry["material_scope"], "reusable-workflow-material")
+        policy_evidence = {
+            evidence["signal"]: evidence for evidence in entry["evidence"]
+        }
+        self.assertIsNone(policy_evidence["policy"]["line"])
 
     def test_workflow_migration_inventory_reports_unresolvable_source_roots(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
