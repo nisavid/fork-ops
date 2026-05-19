@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
+from .workflow_catalog import workflow_contracts
 
 CONFIG_RELATIVE_PATH = Path(".agents/fork-ops.toml")
 SCHEMA_ARTIFACT_RELATIVE_PATHS = (
@@ -59,6 +60,20 @@ _FORK_SIGNAL_NEEDLES = (
     "divergence",
     "code scanning",
     "review thread",
+)
+_WORKFLOW_INVENTORY_SIGNAL_NEEDLES = (
+    ("workflow-catalog", ("workflow catalog", "fork ops workflow")),
+    ("operator-intent", ("operator intent", "use when", "trigger phrases")),
+    ("fork-local-authority", ("fork-local authority", "maintained fork")),
+    ("upstream-sync", ("upstream sync", "sync policy", "baseline", "origin/upstream")),
+    ("upstream-evidence", ("merge-base --is-ancestor", "upstream refs", "upstream track")),
+    ("review-publication", ("pull request", "publication", "review preparation")),
+    ("review-automation", ("review bot", "review thread", "code scanning")),
+    ("mutation-gate", ("mutation gate", "local gate", "required checks")),
+    ("procedure", ("procedure", "runbook")),
+    ("policy", ("policy",)),
+    ("handoff", ("handoff", "return contract")),
+    ("blocker", ("blocker", "blocked")),
 )
 
 
@@ -453,6 +468,46 @@ def generate_migration_plan(
             "Review proposed_config_patch against evidence.",
             "Resolve blockers before migration dry run.",
             "Run validation requirements after any manual application of the proposed config.",
+        ],
+    }
+
+
+def build_workflow_migration_inventory(
+    source_roots: Iterable[str | Path] | str | Path | None = None,
+) -> dict[str, Any]:
+    roots = _workflow_inventory_roots(source_roots)
+    entries: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+    for root in roots:
+        for path in _iter_workflow_inventory_paths(root):
+            resolved_path = path.resolve()
+            if resolved_path in seen_paths:
+                continue
+            seen_paths.add(resolved_path)
+            entry = _workflow_inventory_entry(root, path)
+            if entry:
+                entries.append(entry)
+    entries.sort(key=lambda item: (item["source_root"], item["source_path"]))
+    catalog_evidence = _workflow_catalog_evidence(entries)
+    backlog_candidates = _workflow_backlog_candidates(entries)
+    return {
+        "operation": "workflow-migration-inventory",
+        "mode": "read-only",
+        "source_roots": [str(root) for root in roots],
+        "summary": {
+            "source_root_count": len(roots),
+            "entry_count": len(entries),
+            "catalog_evidence_group_count": len(catalog_evidence),
+            "backlog_candidate_count": len(backlog_candidates),
+        },
+        "entries": entries,
+        "catalog_evidence": catalog_evidence,
+        "backlog_candidates": backlog_candidates,
+        "mutation_policy": "no source roots are modified",
+        "limitations": [
+            "This inventory classifies source material for workflow migration only.",
+            "Backlog candidates are not implemented workflow promises.",
+            "Fork-local authority remains owned by the maintained fork that contains it.",
         ],
     }
 
@@ -2130,6 +2185,284 @@ def schema_artifact_report(plugin_root: str | Path = ".") -> dict[str, Any]:
         "ok": all(artifact["matches_runtime_schema"] for artifact in artifacts),
         "artifacts": artifacts,
     }
+
+
+def _workflow_inventory_roots(
+    source_roots: Iterable[str | Path] | str | Path | None,
+) -> list[Path]:
+    if source_roots is None:
+        raw_roots: list[str | Path] = ["."]
+    elif isinstance(source_roots, str | Path):
+        raw_roots = [source_roots]
+    else:
+        raw_roots = list(source_roots)
+    if not raw_roots:
+        raw_roots = ["."]
+    return [Path(root).expanduser().resolve() for root in raw_roots]
+
+
+def _iter_workflow_inventory_paths(root: Path) -> Iterable[Path]:
+    if root.is_file():
+        if root.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
+            yield root
+        return
+    if not root.is_dir():
+        return
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(root).parts
+        if any(part in _CANDIDATE_SCAN_SKIP_DIRS for part in relative_parts[:-1]):
+            continue
+        if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
+            yield path
+
+
+def _workflow_inventory_entry(root: Path, path: Path) -> dict[str, Any] | None:
+    raw_bytes = _read_bytes(path)
+    raw_text = raw_bytes.decode(errors="ignore")
+    source_path = path.relative_to(root).as_posix() if path != root else path.name
+    source_kind = _workflow_source_kind(root, path, raw_text)
+    signals = _workflow_inventory_signals(source_path, raw_text, source_kind)
+    if not signals:
+        return None
+    entry_id = _workflow_inventory_entry_id(root, path)
+    target = _workflow_catalog_target(signals, source_kind, raw_text)
+    coverage_status = _workflow_coverage_status(target)
+    return {
+        "id": entry_id,
+        "source_root": str(root),
+        "source_path": source_path,
+        "source_kind": source_kind,
+        "material_scope": _workflow_material_scope(source_kind, source_path, raw_text),
+        "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "candidate_operator_intent": _workflow_operator_intent(target, signals, source_kind),
+        "likely_workflow_catalog_target": target,
+        "coverage_status": coverage_status,
+        "evidence": _workflow_inventory_evidence(entry_id, raw_text, signals),
+    }
+
+
+def _workflow_inventory_entry_id(root: Path, path: Path) -> str:
+    digest = hashlib.sha256(f"{root}\0{path}".encode()).hexdigest()
+    return f"workflow-inventory:{digest[:16]}"
+
+
+def _workflow_source_kind(root: Path, path: Path, raw_text: str) -> str:
+    rel_parts = path.relative_to(root).parts if path != root else path.parts[-1:]
+    rel = "/".join(rel_parts).lower()
+    lowered_text = raw_text.lower()
+    if path.name in {"AGENTS.md", "CLAUDE.md"}:
+        return "agent-instruction"
+    if path.name == "SKILL.md":
+        if ".agents" in path.parts and not _is_user_global_agents_path(path):
+            return "repo-local-skill"
+        return "global-skill"
+    if "handoff" in rel or "handoff contract" in lowered_text:
+        return "handoff"
+    if "gate" in rel or "mutation gate" in lowered_text or "local gate" in lowered_text:
+        return "gate"
+    if "procedure" in rel or "procedure:" in lowered_text or "runbook" in lowered_text:
+        return "procedure"
+    if "policy" in rel or "policy:" in lowered_text:
+        return "policy"
+    if path.suffix.lower() in {".toml", ".yaml", ".yml", ".json"}:
+        return "config"
+    return "doc"
+
+
+def _is_user_global_agents_path(path: Path) -> bool:
+    return path.resolve().is_relative_to((Path.home() / ".agents").resolve())
+
+
+def _workflow_inventory_signals(
+    source_path: str,
+    raw_text: str,
+    source_kind: str,
+) -> list[str]:
+    haystack = f"{source_path}\n{raw_text}".lower()
+    signals: list[str] = []
+    for signal, needles in _WORKFLOW_INVENTORY_SIGNAL_NEEDLES:
+        if any(_contains_signal(haystack, needle) for needle in needles):
+            signals.append(signal)
+    if source_kind in {
+        "global-skill",
+        "repo-local-skill",
+        "agent-instruction",
+        "policy",
+        "gate",
+        "procedure",
+        "handoff",
+    }:
+        signals.append(source_kind)
+    return _dedupe_strings(signals)
+
+
+def _workflow_material_scope(source_kind: str, source_path: str, raw_text: str) -> str:
+    lowered_text = raw_text.lower()
+    if source_kind == "global-skill":
+        return "reusable-workflow-material"
+    if source_kind in {"repo-local-skill", "agent-instruction", "policy", "gate", "config"}:
+        return "fork-local-authority-material"
+    if "fork-local authority" in lowered_text or ".agents/" in source_path:
+        return "fork-local-authority-material"
+    return "reusable-workflow-material"
+
+
+def _workflow_catalog_target(signals: list[str], source_kind: str, raw_text: str) -> str:
+    signal_set = set(signals)
+    lowered_text = raw_text.lower()
+    if source_kind == "handoff":
+        return "human-handoff-contracts"
+    if "operator-onboarding" in lowered_text or "plugin health" in lowered_text:
+        return "operator-onboarding"
+    if "fork authority migration" in lowered_text or "source material" in lowered_text:
+        return "fork-authority-migration"
+    if "blocker" in signal_set and "handoff" not in signal_set:
+        return "blocker-resolution"
+    if "review-publication" in signal_set or "review-automation" in signal_set:
+        if source_kind == "gate" or "review preparation" in lowered_text:
+            return "review-preparation"
+        return "publication-closeout"
+    if "upstream-sync" in signal_set or "upstream-evidence" in signal_set:
+        if "execute" in lowered_text or "execution" in lowered_text:
+            return "guarded-sync-execution"
+        if source_kind in {"agent-instruction", "gate"} and "mutation gate" in lowered_text:
+            return "guarded-sync-execution"
+        return "upstream-sync-planning"
+    if "workflow-catalog" in signal_set:
+        return "operator-onboarding"
+    return f"{source_kind}-workflow-candidate"
+
+
+def _workflow_operator_intent(target: str, signals: list[str], source_kind: str) -> str:
+    intents = {
+        "operator-onboarding": (
+            "Verify Fork Ops plugin health and workflow catalog visibility before work begins."
+        ),
+        "fork-authority-migration": (
+            "Map existing fork-local guidance into Fork Ops-readable authority."
+        ),
+        "upstream-sync-planning": "Plan a safe upstream sync without mutating repository refs.",
+        "guarded-sync-execution": "Execute upstream sync work after mutation gates pass.",
+        "review-preparation": "Prepare a fork-local change for configured review gates.",
+        "publication-closeout": "Close out fork-local review and publication after gates pass.",
+        "blocker-resolution": "Explain a Fork Ops blocker and route the next safe action.",
+        "human-handoff-contracts": (
+            "Preserve workflow state and return expectations across an operator or agent handoff."
+        ),
+    }
+    if target in intents:
+        return intents[target]
+    if "operator-intent" in signals:
+        return "Capture a reusable operator intent for future workflow catalog review."
+    return f"Classify {source_kind} material for workflow catalog backlog review."
+
+
+def _workflow_coverage_status(target: str) -> str:
+    contract = {item.id: item for item in workflow_contracts()}.get(target)
+    if contract is None:
+        return "backlog-candidate"
+    if contract.available and contract.implementation_status == "current":
+        return "covered-current"
+    if contract.available and contract.implementation_status == "diagnostic-only":
+        return "covered-diagnostic-only"
+    return "cataloged-not-implemented"
+
+
+def _workflow_inventory_evidence(
+    entry_id: str,
+    raw_text: str,
+    signals: list[str],
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for index, signal in enumerate(signals, start=1):
+        line = _workflow_signal_line(raw_text, signal)
+        evidence.append(
+            {
+                "id": f"{entry_id}:e{index}",
+                "signal": signal,
+                "line": line,
+                "basis": _workflow_signal_basis(signal),
+            }
+        )
+    return evidence
+
+
+def _workflow_signal_line(raw_text: str, signal: str) -> int:
+    needles = dict(_WORKFLOW_INVENTORY_SIGNAL_NEEDLES).get(signal, (signal.replace("-", " "),))
+    lowered_needles = tuple(needle.lower() for needle in needles)
+    for index, line in enumerate(raw_text.splitlines(), start=1):
+        lowered_line = line.lower()
+        if any(needle in lowered_line for needle in lowered_needles):
+            return index
+    return 1
+
+
+def _workflow_signal_basis(signal: str) -> str:
+    return {
+        "workflow-catalog": "workflow catalog language",
+        "operator-intent": "operator intent or trigger language",
+        "fork-local-authority": "fork-local authority language",
+        "upstream-sync": "upstream sync language",
+        "upstream-evidence": "upstream evidence command language",
+        "review-publication": "review or publication workflow language",
+        "review-automation": "review automation language",
+        "mutation-gate": "mutation or gate language",
+        "procedure": "procedure or runbook language",
+        "policy": "policy language",
+        "handoff": "handoff or return contract language",
+        "blocker": "blocker language",
+    }.get(signal, "source path or source kind")
+
+
+def _workflow_catalog_evidence(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contracts = {item.id: item for item in workflow_contracts()}
+    groups: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        workflow_id = entry["likely_workflow_catalog_target"]
+        contract = contracts.get(workflow_id)
+        if contract is None:
+            continue
+        group = groups.setdefault(
+            workflow_id,
+            {
+                "workflow_id": workflow_id,
+                "workflow_title": contract.title,
+                "implementation_status": contract.implementation_status,
+                "available": contract.available,
+                "coverage_status": entry["coverage_status"],
+                "entry_refs": [],
+            },
+        )
+        group["entry_refs"].append(
+            {
+                "entry_id": entry["id"],
+                "source_path": entry["source_path"],
+                "evidence_ids": [item["id"] for item in entry["evidence"]],
+            }
+        )
+    return [groups[key] for key in sorted(groups)]
+
+
+def _workflow_backlog_candidates(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = []
+    for entry in entries:
+        if entry["coverage_status"] != "backlog-candidate":
+            continue
+        candidates.append(
+            {
+                "entry_id": entry["id"],
+                "source_path": entry["source_path"],
+                "source_kind": entry["source_kind"],
+                "material_scope": entry["material_scope"],
+                "candidate_operator_intent": entry["candidate_operator_intent"],
+                "candidate_target": entry["likely_workflow_catalog_target"],
+                "coverage_status": entry["coverage_status"],
+                "evidence_ids": [item["id"] for item in entry["evidence"]],
+            }
+        )
+    return sorted(candidates, key=lambda item: (item["candidate_target"], item["source_path"]))
 
 
 def _missing_requirements(config: dict[str, Any], level: str) -> Iterable[str]:

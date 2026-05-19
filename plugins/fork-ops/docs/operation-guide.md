@@ -39,12 +39,27 @@ MCP tools expose the same surface for agents:
 - `fork_ops_config_validate`
 - `fork_ops_capability_report`
 - `fork_ops_workflow_catalog`
+- `fork_ops_workflow_migration_inventory`
 - `fork_ops_migration_assessment`
 - `fork_ops_migration_plan`
 - `fork_ops_migration_dry_run`
 - `fork_ops_migration_execute`
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
+
+## Workflow Migration Inventory
+
+Use workflow inventory for product-surface workflow migration, not for replacing
+a maintained fork's authority. It scans operator-provided roots and reports
+source kind, material scope, candidate operator intent, likely workflow catalog
+target, coverage status, and evidence references.
+
+```bash
+uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/global-skills --source-root /path/to/fork
+```
+
+Backlog candidates in this report are evidence for future catalog work. They do
+not mean the workflow is available.
 
 ## Schema Artifacts
 

@@ -13,6 +13,7 @@ from .core import (
     ForkOpsError,
     assess_migration,
     build_status_report,
+    build_workflow_migration_inventory,
     dry_run_migration,
     execute_migration,
     find_config_path,
@@ -140,6 +141,14 @@ def fork_ops_schema() -> str:
 def fork_ops_workflow_catalog() -> dict[str, Any]:
     """Return the Fork Ops intent-level workflow catalog."""
     return workflow_catalog()
+
+
+@_tool
+def fork_ops_workflow_migration_inventory(
+    source_roots: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a read-only workflow migration inventory from source roots."""
+    return build_workflow_migration_inventory(source_roots)
 
 
 def main() -> None:

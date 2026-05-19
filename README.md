@@ -17,8 +17,9 @@ migration, and execute the first guarded config-creation migration slice.
 >
 > **Done:** Codex plugin foundation, `.agents/fork-ops.toml` schema, Python
 > core library, CLI, MCP server, capability reporting, live Git diagnostics,
-> read-only migration assessment, non-mutating config proposal generation, and
-> migration plan generation, migration dry run, and guarded migration execution.
+> workflow migration inventory, read-only migration assessment, non-mutating
+> config proposal generation, and migration plan generation, migration dry run,
+> and guarded migration execution.
 >
 > **Planned:** Lemonade onboarding, broader migration edits, source-material
 > removal, and later mutation-capable sync, review, and publication workflows.
@@ -48,6 +49,7 @@ docs, policies, and refs that are authoritative for that fork.
 
 | User need | Current support |
 | --- | --- |
+| Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
 | Plan a reviewed migration | Migration plan generation combines evidence, config patch, retained source material, blockers, and validation requirements without editing files. |
 | Preview a migration plan | Migration dry run reports file edits, config changes, retained materials, blocked steps, and expected verification commands without editing files. |
@@ -72,6 +74,15 @@ cd fork-ops
 
 export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
 uv run --package fork-ops fork-ops schema print
+```
+
+### Inventory workflow material
+
+Use this when improving the reusable Fork Ops workflow catalog from existing
+skills, policies, gates, procedures, or handoff examples.
+
+```bash
+uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
 ```
 
 ### Assess an unconfigured fork

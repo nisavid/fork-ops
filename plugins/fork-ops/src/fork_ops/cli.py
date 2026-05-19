@@ -14,6 +14,7 @@ from .core import (
     ForkOpsError,
     assess_migration,
     build_status_report,
+    build_workflow_migration_inventory,
     create_initial_config_text,
     dry_run_migration,
     dry_run_migration_plan,
@@ -141,6 +142,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the Fork Ops workflow catalog.",
     )
     workflow_catalog_parser.set_defaults(func=cmd_workflow_catalog)
+    workflow_inventory_parser = workflow_subcommands.add_parser(
+        "inventory",
+        help="Build a read-only workflow migration inventory.",
+    )
+    workflow_inventory_parser.add_argument(
+        "--source-root",
+        action="append",
+        dest="source_roots",
+        help="Source file or directory to scan. May be provided more than once.",
+    )
+    workflow_inventory_parser.set_defaults(func=cmd_workflow_inventory)
 
     schema = subcommands.add_parser("schema", help="Print schema information.")
     schema_subcommands = schema.add_subparsers(dest="schema_command", required=True)
@@ -305,6 +317,17 @@ def cmd_migration_propose_config(args: argparse.Namespace) -> int:
 
 def cmd_workflow_catalog(args: argparse.Namespace) -> int:
     print(json.dumps(workflow_catalog(), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_workflow_inventory(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            build_workflow_migration_inventory(args.source_roots),
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

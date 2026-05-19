@@ -37,6 +37,8 @@ The merged foundation supports:
 - Capability reporting for all defined levels, with implemented operations
   centered on `track-aware`.
 - Local Git diagnostics for configured remotes and upstream track refs.
+- Read-only workflow migration inventory reporting for operator-provided source
+  roots, with catalog evidence references and backlog candidates.
 - Read-only migration assessment, non-mutating config proposal generation, and
   non-mutating migration plan generation.
 - Non-mutating migration dry run for migration plan previews.
