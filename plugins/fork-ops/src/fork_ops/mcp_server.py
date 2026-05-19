@@ -5,6 +5,8 @@ This module requires the optional ``mcp`` dependency.
 
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -12,6 +14,7 @@ from .core import (
     CONFIG_RELATIVE_PATH,
     ForkOpsError,
     assess_migration,
+    build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
     dry_run_migration,
@@ -28,7 +31,7 @@ _MCP_IMPORT_ERROR: ModuleNotFoundError | None = None
 _FAST_MCP_CLASS: Any = None
 
 try:
-    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+    from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without optional dependency.
     _MCP_IMPORT_ERROR = exc
 else:
@@ -37,12 +40,28 @@ else:
 
 ToolFunc = Callable[..., Any]
 mcp = _FAST_MCP_CLASS("Fork Ops") if _FAST_MCP_CLASS is not None else None
+_REGISTERED_TOOL_IDS: list[str] = []
 
 
 def _tool(func: ToolFunc) -> ToolFunc:
+    _REGISTERED_TOOL_IDS.append(func.__name__)
     if mcp is None:
         return func
     return cast(ToolFunc, mcp.tool()(func))
+
+
+@_tool
+def fork_ops_plugin_health(
+    plugin_root: str = "",
+    repo_root: str = "",
+    ui_visible: bool | None = None,
+) -> dict[str, Any]:
+    """Report Fork Ops plugin health diagnostics."""
+    return build_plugin_health_report(
+        plugin_root or None,
+        repo_root=repo_root or None,
+        ui_visible=ui_visible,
+    )
 
 
 @_tool
@@ -151,11 +170,23 @@ def fork_ops_workflow_migration_inventory(
     return build_workflow_migration_inventory(source_roots)
 
 
-def main() -> None:
+def mcp_healthcheck() -> dict[str, Any]:
+    """Return lightweight startup evidence without opening the stdio MCP server."""
+    return {
+        "server": "Fork Ops",
+        "tools": list(_REGISTERED_TOOL_IDS),
+    }
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
     if mcp is None:
         raise SystemExit(
             "The Fork Ops MCP server requires the optional dependency: pip install 'fork-ops[mcp]'"
         ) from _MCP_IMPORT_ERROR
+    if argv == ["--health-check"]:
+        print(json.dumps(mcp_healthcheck(), indent=2, sort_keys=True))
+        return
     mcp.run()
 
 

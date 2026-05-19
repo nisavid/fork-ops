@@ -17,9 +17,9 @@ migration, and execute the first guarded config-creation migration slice.
 >
 > **Done:** Codex plugin foundation, `.agents/fork-ops.toml` schema, Python
 > core library, CLI, MCP server, capability reporting, live Git diagnostics,
-> workflow migration inventory, read-only migration assessment, non-mutating
-> config proposal generation, and migration plan generation, migration dry run,
-> and guarded migration execution.
+> plugin health diagnostics, workflow migration inventory, read-only migration
+> assessment, non-mutating config proposal generation, and migration plan
+> generation, migration dry run, and guarded migration execution.
 >
 > **Planned:** Lemonade onboarding, broader migration edits, source-material
 > removal, and later mutation-capable sync, review, and publication workflows.
@@ -49,6 +49,7 @@ docs, policies, and refs that are authoritative for that fork.
 
 | User need | Current support |
 | --- | --- |
+| Check plugin readiness | Plugin health diagnostics report registration, skill discovery, CLI, MCP, and UI visibility readiness paths independently. |
 | Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
 | Plan a reviewed migration | Migration plan generation combines evidence, config patch, retained source material, blockers, and validation requirements without editing files. |
@@ -73,6 +74,7 @@ git clone https://github.com/nisavid/fork-ops.git
 cd fork-ops
 
 export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
+uv run --package fork-ops fork-ops plugin health
 uv run --package fork-ops fork-ops schema print
 ```
 

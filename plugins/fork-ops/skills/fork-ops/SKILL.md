@@ -20,8 +20,9 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
 ## Tool Surfaces
 
 - CLI: `uv run --project ${PLUGIN_ROOT} fork-ops ...`
+- Plugin health: `uv run --project ${PLUGIN_ROOT} fork-ops plugin health`
 - Workflow catalog: `uv run --project ${PLUGIN_ROOT} fork-ops workflow catalog`
-- MCP: `fork_ops_workflow_catalog`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, `fork_ops_schema`
+- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, `fork_ops_schema`
 - Schema: `${PLUGIN_ROOT}/schema/fork-ops.schema.json`
 - Operation docs: `${PLUGIN_ROOT}/docs/operation-guide.md`
 
@@ -30,6 +31,7 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
 1. Run a capability report before choosing an operation:
 
    ```bash
+   uv run --project ${PLUGIN_ROOT} fork-ops plugin health
    uv run --project ${PLUGIN_ROOT} fork-ops workflow catalog
    uv run --project ${PLUGIN_ROOT} fork-ops capability report --repo /path/to/fork
    ```

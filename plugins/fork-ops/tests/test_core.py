@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -15,8 +16,10 @@ from unittest.mock import patch
 from fork_ops.cli import main as cli_main
 from fork_ops.core import (
     CONFIG_RELATIVE_PATH,
+    MCP_TOOL_IDS,
     ForkOpsError,
     assess_migration,
+    build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
     dry_run_migration,
@@ -36,9 +39,11 @@ from fork_ops.mcp_server import (
     fork_ops_config_validate,
     fork_ops_migration_dry_run,
     fork_ops_migration_execute,
+    fork_ops_plugin_health,
     fork_ops_schema,
     fork_ops_workflow_catalog,
     fork_ops_workflow_migration_inventory,
+    mcp_healthcheck,
 )
 from fork_ops.schema import schema_diagnostics
 from fork_ops.workflow_catalog import ImplementationStatus, WorkflowContract, workflow_catalog
@@ -125,7 +130,7 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(catalog["operation"], "workflow-catalog")
         workflows = {workflow["id"]: workflow for workflow in catalog["workflows"]}
         expected_contracts = {
-            "operator-onboarding": ("plugin-health", "next-slice", False),
+            "operator-onboarding": ("plugin-health", "current", True),
             "fork-authority-migration": ("identified", "current", True),
             "workflow-migration-inventory": ("plugin-health", "diagnostic-only", True),
             "authority-source-routing": ("identified", "diagnostic-only", True),
@@ -190,6 +195,124 @@ class ForkOpsCoreTests(unittest.TestCase):
         guarded_sync = workflows["guarded-sync-execution"]
         self.assertIn("refuse", guarded_sync["refusal_behavior"].lower())
         self.assertIn("not implemented", guarded_sync["refusal_behavior"].lower())
+
+        operator_onboarding = workflows["operator-onboarding"]
+        self.assertLessEqual(
+            {"fork-ops plugin health", "fork_ops_plugin_health", "fork-ops"},
+            _entrypoint_ids(operator_onboarding),
+        )
+        self.assertIn(
+            "independent readiness paths",
+            " ".join(operator_onboarding["evidence_expectations"]).lower(),
+        )
+
+    def test_plugin_health_report_succeeds_when_all_paths_are_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+
+            report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=_plugin_health_runner(),
+                ui_visible=True,
+            )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(report["operation"], "plugin-health")
+        self.assertEqual(report["summary"]["status"], "ready")
+        self.assertEqual(
+            set(report["status_values"]),
+            {"ready", "failed", "unavailable", "uninspectable"},
+        )
+        self.assertTrue(report["cli_fallback"]["usable"])
+        self.assertEqual(
+            {check_id: check["status"] for check_id, check in checks.items()},
+            {
+                "plugin_registration": "ready",
+                "skill_discovery": "ready",
+                "cli_execution": "ready",
+                "mcp_config_resolution": "ready",
+                "mcp_process_startup": "ready",
+                "mcp_tool_listing": "ready",
+                "ui_visibility": "ready",
+            },
+        )
+        self.assertIn("fork_ops_plugin_health", checks["mcp_tool_listing"]["evidence"]["tools"])
+
+    def test_plugin_health_report_keeps_mcp_failure_independent_from_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+
+            report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=_plugin_health_runner(mcp_exit_code=1),
+            )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(report["summary"]["status"], "partial")
+        self.assertEqual(checks["cli_execution"]["status"], "ready")
+        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
+        self.assertEqual(checks["mcp_tool_listing"]["status"], "unavailable")
+        self.assertEqual(checks["ui_visibility"]["status"], "uninspectable")
+        self.assertTrue(report["cli_fallback"]["usable"])
+        self.assertTrue(
+            any(
+                "fork-ops workflow catalog" in step
+                for step in checks["mcp_process_startup"]["next_steps"]
+            )
+        )
+
+    def test_plugin_health_report_marks_cli_hard_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+
+            report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=_plugin_health_runner(cli_exit_code=2),
+                ui_visible=None,
+            )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(report["summary"]["status"], "failed")
+        self.assertEqual(checks["cli_execution"]["status"], "failed")
+        self.assertFalse(report["cli_fallback"]["usable"])
+        self.assertIn("stderr from cli", checks["cli_execution"]["evidence"]["stderr"])
+
+    def test_cli_and_mcp_expose_shared_plugin_health(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(
+                Path(workspace),
+                real_scripts=True,
+            )
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    [
+                        "plugin",
+                        "health",
+                        "--plugin-root",
+                        str(plugin_root),
+                        "--repo-root",
+                        str(repo_root),
+                        "--ui-visible",
+                    ]
+                )
+            cli_payload = json.loads(output.getvalue())
+            mcp_payload = fork_ops_plugin_health(
+                str(plugin_root),
+                repo_root=str(repo_root),
+                ui_visible=True,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cli_payload, mcp_payload)
+        self.assertEqual(cli_payload["summary"]["status"], "ready")
+
+    def test_mcp_healthcheck_reports_registered_tool_ids(self) -> None:
+        self.assertEqual(mcp_healthcheck()["tools"], list(MCP_TOOL_IDS))
 
     def test_workflow_contract_rejects_available_unimplemented_workflow(self) -> None:
         with self.assertRaisesRegex(ValueError, "available=True requires"):
@@ -2004,6 +2127,106 @@ Run `git rev-parse <release-tag> upstream-stable origin/upstream-stable` for
 baseline update closeout.
 Run `git merge-base --is-ancestor origin/upstream-stable HEAD` for closeout.
 """
+
+
+def _write_plugin_health_fixture(
+    workspace: Path,
+    *,
+    real_scripts: bool = False,
+) -> tuple[Path, Path]:
+    repo_root = workspace / "repo"
+    plugin_root = repo_root / "plugins" / "fork-ops"
+    skill_path = plugin_root / "skills" / "fork-ops" / "SKILL.md"
+    scripts = plugin_root / "scripts"
+    plugin_root.mkdir(parents=True)
+    skill_path.parent.mkdir(parents=True)
+    scripts.mkdir()
+    skill_path.write_text("---\nname: fork-ops\n---\n\n# Fork Ops\n")
+
+    marketplace = repo_root / ".agents" / "plugins" / "marketplace.json"
+    marketplace.parent.mkdir(parents=True)
+    marketplace.write_text(
+        json.dumps(
+            {
+                "name": "fork-ops",
+                "plugins": [
+                    {
+                        "name": "fork-ops",
+                        "source": {"source": "local", "path": "./plugins/fork-ops"},
+                    }
+                ],
+            }
+        )
+    )
+
+    mcp_script = scripts / "fork_ops_mcp.py"
+    (plugin_root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "fork-ops": {
+                        "command": sys.executable,
+                        "args": [str(mcp_script)],
+                        "cwd": ".",
+                    }
+                }
+            }
+        )
+    )
+
+    if real_scripts:
+        (scripts / "fork_ops_cli.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'operation': 'workflow-catalog', 'workflows': []}))\n"
+        )
+        mcp_script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            f"print(json.dumps({{'server': 'Fork Ops', 'tools': {list(MCP_TOOL_IDS)!r}}}))\n"
+        )
+    else:
+        (scripts / "fork_ops_cli.py").write_text("# test fixture\n")
+        mcp_script.write_text("# test fixture\n")
+
+    return repo_root, plugin_root
+
+
+def _plugin_health_runner(
+    *,
+    cli_exit_code: int = 0,
+    mcp_exit_code: int = 0,
+) -> Any:
+    def run(
+        command: list[str],
+        cwd: Path,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        if "--health-check" in command:
+            if mcp_exit_code:
+                return subprocess.CompletedProcess(
+                    command,
+                    mcp_exit_code,
+                    "",
+                    "stderr from mcp",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"server": "Fork Ops", "tools": list(MCP_TOOL_IDS)}),
+                "",
+            )
+        if cli_exit_code:
+            return subprocess.CompletedProcess(command, cli_exit_code, "", "stderr from cli")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps({"operation": "workflow-catalog", "workflows": []}),
+            "",
+        )
+
+    return run
 
 
 def _write_workflow_inventory_fixture(workspace: Path) -> list[Path]:
