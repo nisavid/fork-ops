@@ -1519,6 +1519,11 @@ def explain_migration_blocker(
 ) -> dict[str, Any]:
     if not isinstance(workflow_output, dict):
         raise ForkOpsError("Blocker resolution requires a workflow output object.")
+    operation = workflow_output.get("operation")
+    if not isinstance(operation, str) or not (
+        operation.startswith("migration-") or operation == "blocker-resolution"
+    ):
+        raise ForkOpsError("Blocker resolution requires migration workflow output.")
     blocker = _select_blocker(workflow_output, blocker_code)
     evidence = _blocker_evidence(workflow_output, blocker)
     result = {
@@ -1726,6 +1731,10 @@ def _execution_narrative_sections(
     ]
     return [
         {"heading": "safe config creation", "items": [_safe_config_creation_line(workflow_output)]},
+        {
+            "heading": "retained authority",
+            "items": _retained_material_narrative_items(workflow_output),
+        },
         {"heading": "applied edits", "items": applied or ["No edits were applied."]},
         {"heading": "skipped edits", "items": skipped or ["No edits were skipped."]},
         {"heading": "blockers", "items": _blocker_narrative_items(blocker_explanations)},
@@ -1865,10 +1874,9 @@ def _select_blocker(
         for blocker in blockers:
             if blocker.get("code") == blocker_code:
                 return copy.deepcopy(blocker)
-        return {
-            "code": blocker_code,
-            "message": "No matching blocker evidence was present in the workflow output.",
-        }
+        raise ForkOpsError(
+            f"Requested blocker code was not present in the workflow output: {blocker_code}"
+        )
     if blockers:
         return copy.deepcopy(blockers[0])
     return {
@@ -2285,6 +2293,7 @@ def _migration_execution_result(
             "applied_edit_count": len(applied_edits),
             "skipped_edit_count": len(skipped_edits),
             "migration_map_entry_count": len(_optional_preview_list(preview, "migration_map")),
+            "retained_material_count": len(_optional_preview_list(preview, "retained_materials")),
             "review_artifact_entry_count": len(
                 _review_artifact_entries(
                     _optional_preview_dict(preview, "migration_review_artifact")
@@ -2296,6 +2305,7 @@ def _migration_execution_result(
         "applied_edits": applied_edits,
         "skipped_edits": skipped_edits,
         "migration_map": _optional_preview_list(preview, "migration_map"),
+        "retained_materials": _optional_preview_list(preview, "retained_materials"),
         "migration_review_artifact": _optional_preview_dict(
             preview,
             "migration_review_artifact",
