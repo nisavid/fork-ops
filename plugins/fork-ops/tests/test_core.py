@@ -221,7 +221,8 @@ class ForkOpsCoreTests(unittest.TestCase):
             workspace_path = Path(workspace)
             source_roots = _write_workflow_inventory_fixture(workspace_path)
 
-            inventory = build_workflow_migration_inventory(source_roots)
+            with patch.object(Path, "home", return_value=workspace_path):
+                inventory = build_workflow_migration_inventory(source_roots)
 
         self.assertEqual(inventory["operation"], "workflow-migration-inventory")
         self.assertEqual(inventory["mode"], "read-only")
@@ -230,19 +231,22 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertGreaterEqual(inventory["summary"]["backlog_candidate_count"], 1)
         self.assertEqual(inventory["mutation_policy"], "no source roots are modified")
 
-        entries = {entry["source_kind"]: entry for entry in inventory["entries"]}
+        entries_by_kind: dict[str, list[dict[str, Any]]] = {}
+        for entry in inventory["entries"]:
+            entries_by_kind.setdefault(entry["source_kind"], []).append(entry)
         self.assertEqual(
-            set(entries),
+            {kind: len(entries) for kind, entries in entries_by_kind.items()},
             {
-                "global-skill",
-                "repo-local-skill",
-                "agent-instruction",
-                "policy",
-                "gate",
-                "procedure",
-                "handoff",
+                "global-skill": 1,
+                "repo-local-skill": 1,
+                "agent-instruction": 1,
+                "policy": 1,
+                "gate": 1,
+                "procedure": 1,
+                "handoff": 1,
             },
         )
+        entries = {kind: matches[0] for kind, matches in entries_by_kind.items()}
         self.assertEqual(
             entries["global-skill"]["material_scope"],
             "reusable-workflow-material",
@@ -275,9 +279,11 @@ class ForkOpsCoreTests(unittest.TestCase):
 
     def test_workflow_migration_inventory_groups_catalog_evidence_by_reference(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            source_roots = _write_workflow_inventory_fixture(Path(workspace))
+            workspace_path = Path(workspace)
+            source_roots = _write_workflow_inventory_fixture(workspace_path)
 
-            inventory = build_workflow_migration_inventory(source_roots)
+            with patch.object(Path, "home", return_value=workspace_path):
+                inventory = build_workflow_migration_inventory(source_roots)
 
         catalog_evidence = {
             group["workflow_id"]: group for group in inventory["catalog_evidence"]
@@ -316,10 +322,11 @@ class ForkOpsCoreTests(unittest.TestCase):
 
     def test_cli_and_mcp_expose_workflow_migration_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            source_roots = _write_workflow_inventory_fixture(Path(workspace))
+            workspace_path = Path(workspace)
+            source_roots = _write_workflow_inventory_fixture(workspace_path)
             output = io.StringIO()
 
-            with redirect_stdout(output):
+            with patch.object(Path, "home", return_value=workspace_path), redirect_stdout(output):
                 exit_code = cli_main(
                     [
                         "workflow",
@@ -333,9 +340,10 @@ class ForkOpsCoreTests(unittest.TestCase):
                     ]
                 )
             cli_payload = json.loads(output.getvalue())
-            mcp_payload = fork_ops_workflow_migration_inventory(
-                [str(source_root) for source_root in source_roots]
-            )
+            with patch.object(Path, "home", return_value=workspace_path):
+                mcp_payload = fork_ops_workflow_migration_inventory(
+                    [str(source_root) for source_root in source_roots]
+                )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(cli_payload, mcp_payload)
@@ -1884,7 +1892,7 @@ Run `git merge-base --is-ancestor origin/upstream-stable HEAD` for closeout.
 
 
 def _write_workflow_inventory_fixture(workspace: Path) -> list[Path]:
-    global_skills = workspace / "global-skills"
+    global_skills = workspace / ".agents" / "skills"
     maintained_fork = workspace / "maintained-fork"
     handoffs = workspace / "handoffs"
 

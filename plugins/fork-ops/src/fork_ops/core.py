@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
-from .workflow_catalog import workflow_contracts
+from .workflow_catalog import WorkflowContract, workflow_contracts
 
 CONFIG_RELATIVE_PATH = Path(".agents/fork-ops.toml")
 SCHEMA_ARTIFACT_RELATIVE_PATHS = (
@@ -65,13 +65,23 @@ _WORKFLOW_INVENTORY_SIGNAL_NEEDLES = (
     ("workflow-catalog", ("workflow catalog", "fork ops workflow")),
     ("operator-intent", ("operator intent", "use when", "trigger phrases")),
     ("fork-local-authority", ("fork-local authority", "maintained fork")),
-    ("upstream-sync", ("upstream sync", "sync policy", "baseline", "origin/upstream")),
+    (
+        "upstream-sync",
+        (
+            "upstream sync",
+            "sync policy",
+            "sync baseline",
+            "default baseline",
+            "stable baseline",
+            "origin/upstream",
+        ),
+    ),
     ("upstream-evidence", ("merge-base --is-ancestor", "upstream refs", "upstream track")),
     ("review-publication", ("pull request", "publication", "review preparation")),
     ("review-automation", ("review bot", "review thread", "code scanning")),
     ("mutation-gate", ("mutation gate", "local gate", "required checks")),
     ("procedure", ("procedure", "runbook")),
-    ("policy", ("policy",)),
+    ("policy", ("fork policy", "review policy", "publication policy", "sync policy")),
     ("handoff", ("handoff", "return contract")),
     ("blocker", ("blocker", "blocked")),
 )
@@ -476,6 +486,7 @@ def build_workflow_migration_inventory(
     source_roots: Iterable[str | Path] | str | Path | None = None,
 ) -> dict[str, Any]:
     roots = _workflow_inventory_roots(source_roots)
+    contracts = {item.id: item for item in workflow_contracts()}
     entries: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
     for root in roots:
@@ -484,11 +495,11 @@ def build_workflow_migration_inventory(
             if resolved_path in seen_paths:
                 continue
             seen_paths.add(resolved_path)
-            entry = _workflow_inventory_entry(root, path)
+            entry = _workflow_inventory_entry(root, path, contracts)
             if entry:
                 entries.append(entry)
     entries.sort(key=lambda item: (item["source_root"], item["source_path"]))
-    catalog_evidence = _workflow_catalog_evidence(entries)
+    catalog_evidence = _workflow_catalog_evidence(entries, contracts)
     backlog_candidates = _workflow_backlog_candidates(entries)
     return {
         "operation": "workflow-migration-inventory",
@@ -2218,7 +2229,11 @@ def _iter_workflow_inventory_paths(root: Path) -> Iterable[Path]:
             yield path
 
 
-def _workflow_inventory_entry(root: Path, path: Path) -> dict[str, Any] | None:
+def _workflow_inventory_entry(
+    root: Path,
+    path: Path,
+    contracts: dict[str, WorkflowContract],
+) -> dict[str, Any] | None:
     raw_bytes = _read_bytes(path)
     raw_text = raw_bytes.decode(errors="ignore")
     source_path = path.relative_to(root).as_posix() if path != root else path.name
@@ -2228,7 +2243,7 @@ def _workflow_inventory_entry(root: Path, path: Path) -> dict[str, Any] | None:
         return None
     entry_id = _workflow_inventory_entry_id(root, path)
     target = _workflow_catalog_target(signals, source_kind, raw_text)
-    coverage_status = _workflow_coverage_status(target)
+    coverage_status = _workflow_coverage_status(target, contracts)
     return {
         "id": entry_id,
         "source_root": str(root),
@@ -2255,9 +2270,7 @@ def _workflow_source_kind(root: Path, path: Path, raw_text: str) -> str:
     if path.name in {"AGENTS.md", "CLAUDE.md"}:
         return "agent-instruction"
     if path.name == "SKILL.md":
-        if ".agents" in path.parts and not _is_user_global_agents_path(path):
-            return "repo-local-skill"
-        return "global-skill"
+        return "global-skill" if _is_user_global_agents_path(path) else "repo-local-skill"
     if "handoff" in rel or "handoff contract" in lowered_text:
         return "handoff"
     if "gate" in rel or "mutation gate" in lowered_text or "local gate" in lowered_text:
@@ -2359,8 +2372,11 @@ def _workflow_operator_intent(target: str, signals: list[str], source_kind: str)
     return f"Classify {source_kind} material for workflow catalog backlog review."
 
 
-def _workflow_coverage_status(target: str) -> str:
-    contract = {item.id: item for item in workflow_contracts()}.get(target)
+def _workflow_coverage_status(
+    target: str,
+    contracts: dict[str, WorkflowContract],
+) -> str:
+    contract = contracts.get(target)
     if contract is None:
         return "backlog-candidate"
     if contract.available and contract.implementation_status == "current":
@@ -2416,8 +2432,10 @@ def _workflow_signal_basis(signal: str) -> str:
     }.get(signal, "source path or source kind")
 
 
-def _workflow_catalog_evidence(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    contracts = {item.id: item for item in workflow_contracts()}
+def _workflow_catalog_evidence(
+    entries: list[dict[str, Any]],
+    contracts: dict[str, WorkflowContract],
+) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for entry in entries:
         workflow_id = entry["likely_workflow_catalog_target"]
