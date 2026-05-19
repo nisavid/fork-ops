@@ -34,6 +34,7 @@ from fork_ops.core import (
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
+    render_migration_narrative,
     schema_artifact_report,
     schema_json,
 )
@@ -1815,6 +1816,7 @@ uncertainty_destination = "ask-human-operator"
         self.assertFalse(dry_run["can_execute"])
         self.assertFalse(dry_run["narrative"]["refusal"]["active"])
         self.assertIn("config creation is blocked", dry_run["narrative"]["text"])
+        self.assertNotIn("blocked_steps", dry_run["narrative"]["text"])
         self.assertNotIn("refused mutation", dry_run["narrative"]["text"])
 
     def test_cli_exposes_migration_dry_run(self) -> None:
@@ -2119,6 +2121,22 @@ uncertainty_destination = "ask-human-operator"
         self.assertIn("semantic_coverage.incomplete", narrative["text"])
         self.assertIn("docs/maintainers/upstream-notes.md", narrative["text"])
         self.assertIn("config creation is blocked", narrative["text"])
+
+        single_blocker_narrative = render_migration_narrative(
+            {
+                "operation": "migration-execution",
+                "status": "blocked",
+                "blockers": [{"code": "semantic_coverage.incomplete"}],
+            }
+        )
+        self.assertIn(
+            "semantic_coverage.incomplete is present",
+            single_blocker_narrative["text"],
+        )
+        self.assertNotIn(
+            "semantic_coverage.incomplete are present",
+            single_blocker_narrative["text"],
+        )
 
     def test_blocker_resolution_explains_semantic_coverage_from_workflow_output(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
