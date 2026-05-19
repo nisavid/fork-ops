@@ -25,7 +25,9 @@ The assessment should not mutate Lemonade. It should preserve these facts as evi
 Expected migration plan sections:
 
 - evidence for the upstream-ref source material and extracted facts
+- migration map entries with source material dispositions and target surfaces
+- proposed migration review artifact entries for durable decisions outside config
 - proposed config patch for `.agents/fork-ops.toml`
-- retained source material with removal deferred until dry run and execution
+- retained source material with removal deferred outside this migration slice
 - required review for the config proposal and retained source material
 - validation requirements for config validation and capability reporting

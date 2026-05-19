@@ -10,8 +10,9 @@ local development checks.
 > The foundation version targets `track-aware`. It supports config discovery,
 > schema validation, upstream release-channel and upstream track modeling, live
 > Git ref checks, CLI access, MCP access, workflow migration inventory,
-> read-only migration assessment, and migration plan, dry-run, guarded
-> execution, and config proposal generation.
+> read-only migration assessment, migration plans with disposition maps and
+> proposed review artifacts, dry-run, guarded execution, and config proposal
+> generation.
 > Broad sync mutations, publication closeout, arbitrary migration edits, and
 > source-material removal are designed but not enabled yet.
 

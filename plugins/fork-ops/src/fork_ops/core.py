@@ -128,6 +128,16 @@ _WORKFLOW_POLICY_PATH_QUALIFIERS = {
     "sync",
     "upstream",
 }
+SOURCE_MATERIAL_DISPOSITION_TYPES = (
+    "extracted_into_config",
+    "retained_as_fork_local_authority",
+    "mapped_to_workflow_backlog",
+    "irrelevant_to_fork_ops",
+    "unsupported_extractor_shape",
+    "needs_human_decision",
+    "deferred_with_rationale",
+)
+MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH = "docs/agents/fork-ops-migration-review.md"
 
 
 class ForkOpsError(RuntimeError):
@@ -1255,20 +1265,27 @@ def generate_migration_plan(
     proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
     evidence = _migration_plan_evidence(migration_candidates)
     retained_source_materials = _retained_source_materials(migration_candidates)
+    migration_map = _migration_map(migration_candidates, proposed_config_patch)
+    migration_review_artifact = _migration_review_artifact(migration_map)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
     return {
         "repo_path": str(repo),
         "mode": "non-mutating",
         "operation": "migration-plan",
         "requires_review": True,
+        "source_material_disposition_types": list(SOURCE_MATERIAL_DISPOSITION_TYPES),
         "summary": {
             "candidate_count": len(migration_candidates),
             "evidence_source_count": len(evidence),
+            "migration_map_entry_count": len(migration_map),
+            "review_artifact_entry_count": len(migration_review_artifact["entries"]),
             "retained_source_material_count": len(retained_source_materials),
             "blocker_count": len(blockers),
             "semantic_coverage": _semantic_coverage_status(blockers),
         },
         "evidence": evidence,
+        "migration_map": migration_map,
+        "migration_review_artifact": migration_review_artifact,
         "proposed_config_patch": proposed_config_patch,
         "retained_source_materials": retained_source_materials,
         "deferred_removals": _deferred_removals(retained_source_materials),
@@ -1277,11 +1294,12 @@ def generate_migration_plan(
         "validation_requirements": _migration_plan_validation_requirements(),
         "limitations": [
             "This migration plan is non-mutating and does not apply config or edit source files.",
-            "Retain source materials until migration dry run and migration execution exist.",
+            "Source-material removal is not implemented; source materials remain preserved.",
             "Review semantic coverage before replacing or deleting fork-local authority.",
         ],
         "next_actions": [
             "Review proposed_config_patch against evidence.",
+            "Review migration_review_artifact for durable decisions outside fork ops config.",
             "Resolve blockers before migration dry run.",
             "Run validation requirements after any manual application of the proposed config.",
         ],
@@ -1356,6 +1374,8 @@ def dry_run_migration_plan(
     normalized_repo_path = _dry_run_repo_path(plan, repo_path)
     file_edits = _dry_run_file_edits(proposed_config_patch)
     config_changes = _dry_run_config_changes(proposed_config_patch)
+    migration_map = _require_plan_list(plan, "migration_map")
+    migration_review_artifact = _require_migration_review_artifact(plan)
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
     blocked_steps = _dry_run_blocked_steps(plan)
@@ -1390,24 +1410,29 @@ def dry_run_migration_plan(
         "summary": {
             "file_edit_count": len(file_edits),
             "config_change_count": len(config_changes),
+            "migration_map_entry_count": len(migration_map),
+            "review_artifact_entry_count": len(
+                _review_artifact_entries(migration_review_artifact)
+            ),
             "retained_material_count": len(retained_materials),
             "blocked_step_count": len(blocked_steps),
             "verification_command_count": len(expected_verification_commands),
         },
         "file_edits": file_edits,
         "config_changes": config_changes,
+        "migration_map": migration_map,
+        "migration_review_artifact": migration_review_artifact,
         "retained_materials": retained_materials,
         "deferred_removals": deferred_removals,
         "blocked_steps": blocked_steps,
         "expected_verification_commands": expected_verification_commands,
         "limitations": [
             "This migration dry run is non-mutating and does not apply config or edit files.",
-            (
-                "Retain source materials until migration execution validates the replacement."
-            ),
+            "Source-material removal is not implemented; source materials remain preserved.",
         ],
         "next_actions": [
             "Review file_edits and config_changes against the migration plan evidence.",
+            "Review migration_review_artifact before treating retained authority as covered.",
             "Resolve or explicitly waive blocked_steps before migration execution.",
             (
                 "Run expected_verification_commands after migration execution applies changes."
@@ -1618,6 +1643,25 @@ def _require_plan_list(plan: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return [copy.deepcopy(item) for item in value]
 
 
+def _require_plan_dict(plan: dict[str, Any], key: str) -> dict[str, Any]:
+    if key not in plan:
+        raise ForkOpsError(f"Migration dry run input is missing {key}.")
+    value = plan[key]
+    if not isinstance(value, dict):
+        raise ForkOpsError(f"Migration dry run input has malformed {key}.")
+    return copy.deepcopy(value)
+
+
+def _require_migration_review_artifact(plan: dict[str, Any]) -> dict[str, Any]:
+    artifact = _require_plan_dict(plan, "migration_review_artifact")
+    entries = artifact.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ForkOpsError(
+            "Migration dry run input has malformed migration_review_artifact.entries."
+        )
+    return artifact
+
+
 def _require_patch_list(patch: dict[str, Any], key: str) -> list[dict[str, Any]]:
     value = patch.get(key, [])
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
@@ -1630,6 +1674,18 @@ def _require_preview_list(preview: dict[str, Any], key: str) -> list[dict[str, A
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise ForkOpsError(f"Migration execution preview has malformed {key}.")
     return [copy.deepcopy(item) for item in value]
+
+
+def _optional_preview_list(preview: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = preview.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        return []
+    return [copy.deepcopy(item) for item in value]
+
+
+def _optional_preview_dict(preview: dict[str, Any], key: str) -> dict[str, Any]:
+    value = preview.get(key, {})
+    return copy.deepcopy(value) if isinstance(value, dict) else {}
 
 
 def _migration_execution_result(
@@ -1651,11 +1707,22 @@ def _migration_execution_result(
         "summary": {
             "applied_edit_count": len(applied_edits),
             "skipped_edit_count": len(skipped_edits),
+            "migration_map_entry_count": len(_optional_preview_list(preview, "migration_map")),
+            "review_artifact_entry_count": len(
+                _review_artifact_entries(
+                    _optional_preview_dict(preview, "migration_review_artifact")
+                )
+            ),
             "blocker_count": len(blockers),
             "verification_result_count": len(verification_results),
         },
         "applied_edits": applied_edits,
         "skipped_edits": skipped_edits,
+        "migration_map": _optional_preview_list(preview, "migration_map"),
+        "migration_review_artifact": _optional_preview_dict(
+            preview,
+            "migration_review_artifact",
+        ),
         "blockers": blockers,
         "verification_results": verification_results,
     }
@@ -2092,6 +2159,247 @@ def _migration_plan_evidence(candidates: list[dict[str, Any]]) -> list[dict[str,
     return evidence
 
 
+def _migration_map(
+    candidates: list[dict[str, Any]],
+    proposed_config_patch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        _migration_map_entry(candidate, proposed_config_patch)
+        for candidate in sorted(candidates, key=lambda item: item["path"])
+    ]
+
+
+def _migration_map_entry(
+    candidate: dict[str, Any],
+    proposed_config_patch: dict[str, Any],
+) -> dict[str, Any]:
+    disposition_type = _source_material_disposition(candidate, proposed_config_patch)
+    source_path = candidate["path"]
+    entry_id = _migration_map_entry_id(source_path)
+    return {
+        "id": entry_id,
+        "source_path": source_path,
+        "source_kind": candidate["kind"],
+        "content_sha256": candidate["content_sha256"],
+        "domains": list(candidate["domains"]),
+        "signals": list(candidate["signals"]),
+        "disposition": {
+            "type": disposition_type,
+            "requires_review": True,
+        },
+        "target_surface": _migration_map_target_surface(disposition_type, candidate),
+        "retained_source_material": True,
+        "review_artifact_entry_id": f"{entry_id}:review",
+    }
+
+
+def _migration_map_entry_id(source_path: str) -> str:
+    digest = hashlib.sha256(source_path.encode()).hexdigest()
+    return f"migration-map:{digest[:16]}"
+
+
+def _source_material_disposition(
+    candidate: dict[str, Any],
+    proposed_config_patch: dict[str, Any],
+) -> str:
+    facts = candidate["extracted_facts"]
+    if _candidate_needs_human_decision(candidate, proposed_config_patch):
+        return "needs_human_decision"
+    if not facts and _candidate_is_retained_authority(candidate):
+        return "retained_as_fork_local_authority"
+    if not facts and _candidate_maps_to_workflow_backlog(candidate):
+        return "mapped_to_workflow_backlog"
+    if not facts and _candidate_is_irrelevant(candidate):
+        return "irrelevant_to_fork_ops"
+    if not facts:
+        return "unsupported_extractor_shape"
+    if proposed_config_patch.get("operation") != "create":
+        return "deferred_with_rationale"
+    return "extracted_into_config"
+
+
+def _candidate_needs_human_decision(
+    candidate: dict[str, Any],
+    proposed_config_patch: dict[str, Any],
+) -> bool:
+    default_baseline_refs = {
+        fact["value"]
+        for fact in candidate["extracted_facts"]
+        if fact["kind"] == "default_sync_baseline"
+    }
+    if not default_baseline_refs:
+        return False
+    for diagnostic in proposed_config_patch.get("diagnostics", []):
+        if (
+            isinstance(diagnostic, dict)
+            and diagnostic.get("code") == "migration.default_sync_baseline_ambiguous"
+        ):
+            return True
+    return False
+
+
+def _candidate_maps_to_workflow_backlog(candidate: dict[str, Any]) -> bool:
+    return _has_review_publication_signal(set(candidate["signals"]))
+
+
+def _candidate_is_retained_authority(candidate: dict[str, Any]) -> bool:
+    return candidate["kind"] in {"agent_instruction", "config"}
+
+
+def _candidate_is_irrelevant(candidate: dict[str, Any]) -> bool:
+    return not candidate["domains"] and not candidate["extracted_facts"]
+
+
+def _migration_map_target_surface(
+    disposition_type: str,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    if disposition_type == "extracted_into_config":
+        return {
+            "type": "fork_ops_config",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "sections": _candidate_config_sections(candidate),
+        }
+    if disposition_type == "retained_as_fork_local_authority":
+        return {
+            "type": "fork_local_authority",
+            "path": candidate["path"],
+        }
+    if disposition_type == "mapped_to_workflow_backlog":
+        return {
+            "type": "workflow_catalog_backlog",
+            "workflow_id": _candidate_workflow_backlog_target(candidate),
+        }
+    if disposition_type == "irrelevant_to_fork_ops":
+        return {
+            "type": "none",
+        }
+    return {
+        "type": "migration_review_artifact",
+        "path": MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH,
+        "section": _migration_review_artifact_section(disposition_type),
+    }
+
+
+def _candidate_config_sections(candidate: dict[str, Any]) -> list[str]:
+    return sorted({fact["suggested_config"] for fact in candidate["extracted_facts"]})
+
+
+def _candidate_workflow_backlog_target(candidate: dict[str, Any]) -> str:
+    if _has_review_publication_signal(set(candidate["signals"])):
+        return "publication-closeout"
+    return "fork-authority-migration"
+
+
+def _migration_review_artifact_section(disposition_type: str) -> str:
+    return {
+        "unsupported_extractor_shape": "unsupported extractor shapes",
+        "needs_human_decision": "human decisions",
+        "deferred_with_rationale": "deferred mappings",
+    }.get(disposition_type, "migration decisions")
+
+
+def _migration_review_artifact(migration_map: list[dict[str, Any]]) -> dict[str, Any]:
+    entries = [
+        {
+            "id": entry["review_artifact_entry_id"],
+            "source_path": entry["source_path"],
+            "disposition": copy.deepcopy(entry["disposition"]),
+            "target_surface": copy.deepcopy(entry["target_surface"]),
+            "retained_source_material": entry["retained_source_material"],
+            "rationale": _migration_review_rationale(entry),
+        }
+        for entry in migration_map
+    ]
+    artifact = {
+        "status": "proposed",
+        "target_path": MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH,
+        "content_kind": "migration-review-artifact",
+        "entries": entries,
+    }
+    artifact["markdown"] = _migration_review_artifact_markdown(entries)
+    return artifact
+
+
+def _migration_review_rationale(entry: dict[str, Any]) -> str:
+    disposition_type = entry["disposition"]["type"]
+    if disposition_type == "extracted_into_config":
+        return (
+            "Machine-actionable facts are represented in the proposed fork ops config; "
+            "the source material remains preserved until replacement coverage is reviewed."
+        )
+    if disposition_type == "retained_as_fork_local_authority":
+        return (
+            "This source remains fork-local authority because the migration does not "
+            "replace always-loaded or checked-in authority surfaces."
+        )
+    if disposition_type == "mapped_to_workflow_backlog":
+        return (
+            "This source describes workflow behavior that belongs in workflow catalog "
+            "follow-up work, not in machine-actionable fork ops config."
+        )
+    if disposition_type == "irrelevant_to_fork_ops":
+        return "This source matched a broad scan signal but does not describe fork ops authority."
+    if disposition_type == "unsupported_extractor_shape":
+        return (
+            "This source appears relevant, but the deterministic extractor did not produce "
+            "structured facts for the current config proposal."
+        )
+    if disposition_type == "needs_human_decision":
+        return (
+            "The source contributes a migration choice that cannot be resolved "
+            "deterministically and needs an operator decision."
+        )
+    if disposition_type == "deferred_with_rationale":
+        return (
+            "The source has extractable facts, but the current guarded execution slice "
+            "does not merge arbitrary edits into existing fork ops config."
+        )
+    raise ForkOpsError(f"Unknown source material disposition: {disposition_type}")
+
+
+def _migration_review_artifact_markdown(entries: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Fork Ops Migration Review",
+        "",
+        "Status: proposed",
+        "",
+        "This artifact records migration review decisions that do not belong in fork ops config.",
+    ]
+    for entry in entries:
+        lines.extend(
+            [
+                "",
+                f"## {entry['source_path']}",
+                "",
+                f"- Disposition: {entry['disposition']['type']}",
+                f"- Target surface: {entry['target_surface']['type']}",
+                *_target_surface_markdown_lines(entry["target_surface"]),
+                f"- Rationale: {entry['rationale']}",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _target_surface_markdown_lines(target_surface: dict[str, Any]) -> list[str]:
+    lines = []
+    for key in ("path", "workflow_id", "section"):
+        value = target_surface.get(key)
+        if isinstance(value, str) and value:
+            lines.append(f"- Target {key.replace('_', ' ')}: {value}")
+    sections = target_surface.get("sections")
+    if isinstance(sections, list) and all(isinstance(item, str) for item in sections):
+        lines.append(f"- Target sections: {', '.join(sections)}")
+    return lines
+
+
+def _review_artifact_entries(artifact: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = artifact.get("entries", [])
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        return []
+    return entries
+
+
 def _retained_source_materials(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     retained = []
     for candidate in candidates:
@@ -2145,7 +2453,10 @@ def _migration_plan_blockers(
             }
         )
     uncovered_paths = [
-        candidate["path"] for candidate in candidates if not candidate["extracted_facts"]
+        candidate["path"]
+        for candidate in candidates
+        if _source_material_disposition(candidate, proposed_config_patch)
+        == "unsupported_extractor_shape"
     ]
     if uncovered_paths:
         blockers.append(
@@ -2194,6 +2505,15 @@ def _migration_plan_required_review(blockers: list[dict[str, Any]]) -> list[dict
             "status": "required",
             "subject": "retained_source_materials",
             "reason": "Fork-local authority must remain until replacement coverage is verified.",
+        },
+        {
+            "code": "review.migration_review_artifact",
+            "status": "required",
+            "subject": "migration_review_artifact",
+            "reason": (
+                "Durable migration decisions that are not machine-actionable config "
+                "belong in the proposed review artifact."
+            ),
         },
     ]
     if blockers:
@@ -2547,6 +2867,8 @@ def _proposal_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _proposed_local_surfaces(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     surfaces = []
     for candidate in candidates:
+        if _candidate_is_irrelevant(candidate):
+            continue
         domains = candidate["domains"]
         surface = {
             "kind": candidate["kind"],
@@ -2555,7 +2877,7 @@ def _proposed_local_surfaces(candidates: list[dict[str, Any]]) -> list[dict[str,
             "domains": domains,
             "portability_hint": candidate["portability_hint"],
             "portability_hints": _portability_hints(candidate),
-            "notes": "Migration assessment candidate; review before replacing source material.",
+            "notes": "Discovered by fork authority migration assessment.",
         }
         scope = _repo_ops_candidate_scope(candidate)
         if scope:

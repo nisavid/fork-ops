@@ -48,6 +48,9 @@ uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 The plan output separates:
 
 - source evidence and extracted facts
+- a migration map entry for each candidate source material item
+- typed source material dispositions and target surfaces
+- a proposed migration review artifact for durable decisions outside config
 - the proposed config patch
 - retained source materials that remain fork-local authority
 - deferred removals
@@ -57,6 +60,21 @@ The plan output separates:
 The plan does not edit `.agents/fork-ops.toml` and does not remove source
 materials. It is an input to migration dry run.
 
+Migration map dispositions use these initial values:
+
+- `extracted_into_config`: machine-actionable facts are represented in the proposed fork ops config.
+- `retained_as_fork_local_authority`: the source remains checked-in fork-local authority.
+- `mapped_to_workflow_backlog`: the source belongs in workflow catalog follow-up work.
+- `irrelevant_to_fork_ops`: a broad scan signal matched material that does not describe fork ops authority.
+- `unsupported_extractor_shape`: the source appears relevant, but deterministic extraction did not produce structured facts.
+- `needs_human_decision`: the source contributes an ambiguous choice that needs an operator decision.
+- `deferred_with_rationale`: the source has extractable facts, but the current guarded execution slice cannot apply the needed merge.
+
+The migration review artifact is proposed as
+`docs/agents/fork-ops-migration-review.md`. It records each migration map entry,
+including its disposition rationale and target-surface details. That rationale
+belongs in the review artifact, not in `.agents/fork-ops.toml`.
+
 Migration dry run previews a migration plan without mutating the repository.
 When no plan file is supplied, the CLI generates the current plan internally.
 
@@ -65,9 +83,10 @@ uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-plan.json
 ```
 
-The dry-run output reports planned file edits, config changes, retained source
-materials, blocked steps, and expected verification commands. It does not edit
-config, source material, or branch state.
+The dry-run output reports planned file edits, config changes, migration map
+entries, the proposed review artifact, retained source materials, blocked
+steps, and expected verification commands. It does not edit config, source
+material, or branch state.
 
 Migration execution applies a blocker-free migration plan through guarded
 operations. When no plan file is supplied, the CLI generates the current plan
@@ -79,16 +98,17 @@ uv run --package fork-ops fork-ops migration execute --plan /path/to/migration-p
 ```
 
 The current execution slice supports creating `.agents/fork-ops.toml` from the
-validated config proposal, preserving retained source materials, and verifying
-the resulting Fork Ops capability level. It returns structured evidence for
-applied edits, skipped preservation steps, blockers, and verification results.
-It refuses malformed plans, plans with blockers, unsupported edit actions,
-unsafe target paths, and config content that fails parse or validation checks.
+validated config proposal, preserving retained source materials, reporting the
+migration map and proposed review artifact, and verifying the resulting Fork Ops
+capability level. It returns structured evidence for applied edits, skipped
+preservation steps, blockers, and verification results. It refuses malformed
+plans, plans with blockers, unsupported edit actions, unsafe target paths, and
+config content that fails parse or validation checks.
 
 ## Migration Lifecycle
 
 1. Migration assessment maps existing material to proposed Fork Ops config sections, docs, skills, tools, hooks, and portability hints.
-2. Migration plan defines the specific edits, removals, replacements, blockers, and verification steps.
+2. Migration plan defines the migration map, review artifact proposal, specific edits, blockers, and verification steps.
 3. Migration dry run previews the migration plan without mutating the repo.
 4. Migration execution applies a validated plan and verifies the resulting Fork Ops capability level.
 
