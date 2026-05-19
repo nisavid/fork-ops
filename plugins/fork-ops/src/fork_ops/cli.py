@@ -13,6 +13,7 @@ from .core import (
     CONFIG_RELATIVE_PATH,
     ForkOpsError,
     assess_migration,
+    build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
     create_initial_config_text,
@@ -153,6 +154,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source file or directory to scan. May be provided more than once.",
     )
     workflow_inventory_parser.set_defaults(func=cmd_workflow_inventory)
+
+    plugin = subcommands.add_parser("plugin", help="Inspect Fork Ops plugin package state.")
+    plugin_subcommands = plugin.add_subparsers(dest="plugin_command", required=True)
+    plugin_health = plugin_subcommands.add_parser(
+        "health",
+        help="Report Fork Ops plugin health diagnostics.",
+    )
+    plugin_health.add_argument(
+        "--plugin-root",
+        help="Fork Ops plugin root to inspect. Defaults to the installed package root.",
+    )
+    plugin_health.add_argument(
+        "--repo-root",
+        help="Repository root containing plugin marketplace metadata.",
+    )
+    ui_visibility = plugin_health.add_mutually_exclusive_group()
+    ui_visibility.add_argument(
+        "--ui-visible",
+        action="store_true",
+        help="Report UI visibility as ready from an external UI inspection.",
+    )
+    ui_visibility.add_argument(
+        "--ui-hidden",
+        action="store_true",
+        help="Report UI visibility as failed from an external UI inspection.",
+    )
+    plugin_health.set_defaults(func=cmd_plugin_health)
 
     schema = subcommands.add_parser("schema", help="Print schema information.")
     schema_subcommands = schema.add_subparsers(dest="schema_command", required=True)
@@ -329,6 +357,23 @@ def cmd_workflow_inventory(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_plugin_health(args: argparse.Namespace) -> int:
+    ui_visible: bool | None
+    if args.ui_visible:
+        ui_visible = True
+    elif args.ui_hidden:
+        ui_visible = False
+    else:
+        ui_visible = None
+    report = build_plugin_health_report(
+        args.plugin_root,
+        repo_root=args.repo_root,
+        ui_visible=ui_visible,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 1 if report["summary"]["status"] == "failed" else 0
 
 
 def cmd_schema_print(args: argparse.Namespace) -> int:

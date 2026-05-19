@@ -3,6 +3,7 @@
 Start configured-fork operations by locating fork-local authority.
 
 ```bash
+uv run --package fork-ops fork-ops plugin health
 uv run --package fork-ops fork-ops workflow catalog
 uv run --package fork-ops fork-ops capability report --repo /path/to/configured-fork
 ```
@@ -35,6 +36,7 @@ uv run --package fork-ops fork-ops config init --repo /path/to/fork --repository
 
 MCP tools expose the same surface for agents:
 
+- `fork_ops_plugin_health`
 - `fork_ops_config_read`
 - `fork_ops_config_validate`
 - `fork_ops_capability_report`
@@ -46,6 +48,21 @@ MCP tools expose the same surface for agents:
 - `fork_ops_migration_execute`
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
+
+## Plugin Health
+
+Use plugin health when first bringing Fork Ops online or when one control
+surface works while another is missing. The report checks plugin registration,
+skill discovery, CLI execution, MCP config resolution, MCP process startup, MCP
+tool listing, and UI visibility when a UI inspection result is supplied.
+
+```bash
+uv run --package fork-ops fork-ops plugin health
+```
+
+Each readiness path reports one status: `ready`, `failed`, `unavailable`, or
+`uninspectable`. MCP failures include next paths, and the report keeps CLI
+fallback guidance available when CLI execution is ready.
 
 ## Workflow Migration Inventory
 

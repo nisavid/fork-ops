@@ -103,12 +103,30 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "operator onboarding",
         ),
         capability_gate="plugin-health",
-        implementation_status="next-slice",
-        available=False,
+        implementation_status="current",
+        available=True,
         authority_reads=("plugin registration", "skill discovery", "CLI and MCP surfaces"),
-        preflight_checks=("Confirm catalog access.", "Check CLI fallback availability."),
+        preflight_checks=(
+            "Check plugin registration.",
+            "Check skill discovery.",
+            "Check CLI execution.",
+            "Check MCP config, startup, and tool listing.",
+            "Report UI visibility only when an inspection surface exists.",
+        ),
         mutation_gates=("No repository mutation is allowed during onboarding diagnostics.",),
         entrypoints=(
+            WorkflowEntrypoint(
+                kind="cli",
+                id="fork-ops plugin health",
+                label="Report independent Fork Ops plugin readiness paths.",
+                surface="fork-ops plugin health",
+            ),
+            WorkflowEntrypoint(
+                kind="mcp",
+                id="fork_ops_plugin_health",
+                label="Return Fork Ops plugin health diagnostics to MCP clients.",
+                surface="MCP tool",
+            ),
             _CATALOG_ENTRYPOINT,
             _MCP_CATALOG_ENTRYPOINT,
             WorkflowEntrypoint(
@@ -119,19 +137,21 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             ),
         ),
         evidence_expectations=(
-            "Plugin health evidence for independently checkable readiness paths.",
-            "Visible workflow catalog data.",
+            "Independent readiness paths for plugin registration, skill discovery, CLI, "
+            "MCP, and UI visibility.",
+            "Actionable MCP failure output and CLI fallback guidance when CLI execution works.",
         ),
         refusal_behavior=(
-            "Refuse to claim full onboarding diagnostics are implemented; provide the "
-            "catalog entrypoint and the currently available CLI/MCP fallback paths."
+            "Refuse repository mutation during onboarding diagnostics; report unavailable "
+            "or uninspectable paths without failing unrelated ready paths."
         ),
         handoff_expectations=(
             "Ask the operator for any missing plugin registration or UI state that the "
             "agent cannot inspect.",
         ),
         closeout_criteria=(
-            "Catalog visibility has been verified or the missing surface is named.",
+            "Each plugin readiness path is ready, failed, unavailable, or uninspectable.",
+            "CLI fallback guidance is reported when MCP or UI surfaces are not usable.",
         ),
     ),
     WorkflowContract(

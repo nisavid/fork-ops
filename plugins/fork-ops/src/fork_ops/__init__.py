@@ -3,6 +3,7 @@
 from .core import (
     CONFIG_RELATIVE_PATH,
     assess_migration,
+    build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
     create_initial_config_text,
@@ -15,6 +16,7 @@ from .workflow_catalog import workflow_catalog
 __all__ = [
     "CONFIG_RELATIVE_PATH",
     "assess_migration",
+    "build_plugin_health_report",
     "build_status_report",
     "build_workflow_migration_inventory",
     "create_initial_config_text",
