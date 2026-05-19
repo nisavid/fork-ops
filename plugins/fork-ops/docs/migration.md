@@ -115,5 +115,7 @@ uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/sou
 ```
 
 Inventory evidence uses references, source kinds, material scope, coverage
-status, and line numbers. It does not duplicate source text or make backlog
-candidates available as implemented workflows.
+status, and line numbers when in-file evidence exists. Path-only evidence uses a
+null line value. The report also lists source roots that cannot be resolved. It
+does not duplicate source text or make backlog candidates available as
+implemented workflows.

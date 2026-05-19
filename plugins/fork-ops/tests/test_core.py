@@ -228,6 +228,8 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(inventory["mode"], "read-only")
         self.assertEqual(inventory["summary"]["entry_count"], 7)
         self.assertEqual(inventory["summary"]["source_root_count"], 3)
+        self.assertEqual(inventory["summary"]["unresolvable_source_root_count"], 0)
+        self.assertEqual(inventory["unresolvable_source_roots"], [])
         self.assertGreaterEqual(inventory["summary"]["backlog_candidate_count"], 1)
         self.assertEqual(inventory["mutation_policy"], "no source roots are modified")
 
@@ -255,6 +257,10 @@ class ForkOpsCoreTests(unittest.TestCase):
             entries["global-skill"]["likely_workflow_catalog_target"],
             "upstream-sync-planning",
         )
+        global_skill_evidence = {
+            evidence["signal"]: evidence for evidence in entries["global-skill"]["evidence"]
+        }
+        self.assertIsNone(global_skill_evidence["global-skill"]["line"])
         self.assertEqual(
             entries["repo-local-skill"]["material_scope"],
             "fork-local-authority-material",
@@ -274,8 +280,44 @@ class ForkOpsCoreTests(unittest.TestCase):
             for evidence in entry["evidence"]:
                 self.assertTrue(evidence["id"])
                 self.assertTrue(evidence["signal"])
-                self.assertGreaterEqual(evidence["line"], 1)
+                if evidence["line"] is not None:
+                    self.assertGreaterEqual(evidence["line"], 1)
                 self.assertNotIn("source_text", evidence)
+
+    def test_workflow_migration_inventory_avoids_path_substring_source_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            docs = Path(workspace) / "docs"
+            docs.mkdir()
+            for filename in (
+                "aggregate-stats.md",
+                "privacy-policy.md",
+                "backhandoff.md",
+            ):
+                (docs / filename).write_text(
+                    "# Workflow Notes\n\n"
+                    "This maintained fork records upstream sync evidence for operator review.\n"
+                )
+
+            inventory = build_workflow_migration_inventory([docs])
+
+        entries_by_path = {entry["source_path"]: entry for entry in inventory["entries"]}
+        self.assertEqual(
+            set(entries_by_path),
+            {"aggregate-stats.md", "privacy-policy.md", "backhandoff.md"},
+        )
+        for entry in entries_by_path.values():
+            self.assertEqual(entry["source_kind"], "doc")
+
+    def test_workflow_migration_inventory_reports_unresolvable_source_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            missing = Path(workspace) / "missing-source-root"
+
+            inventory = build_workflow_migration_inventory([missing])
+
+        self.assertEqual(inventory["entries"], [])
+        self.assertEqual(inventory["summary"]["source_root_count"], 1)
+        self.assertEqual(inventory["summary"]["unresolvable_source_root_count"], 1)
+        self.assertEqual(inventory["unresolvable_source_roots"], [str(missing.resolve())])
 
     def test_workflow_migration_inventory_groups_catalog_evidence_by_reference(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
