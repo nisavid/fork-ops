@@ -2222,7 +2222,7 @@ def _workflow_inventory_roots(
 ) -> list[Path]:
     if source_roots is None:
         raw_roots: list[str | Path] = ["."]
-    elif isinstance(source_roots, str | Path):
+    elif isinstance(source_roots, (str, Path)):
         raw_roots = [source_roots]
     else:
         raw_roots = list(source_roots)
@@ -2357,11 +2357,29 @@ def _workflow_material_scope(source_kind: str, source_path: str, raw_text: str) 
     lowered_text = raw_text.lower()
     if source_kind == "global-skill":
         return "reusable-workflow-material"
-    if source_kind in {"repo-local-skill", "agent-instruction", "policy", "gate", "config"}:
+    if source_kind in {"repo-local-skill", "agent-instruction", "config"}:
         return "fork-local-authority-material"
-    if "fork-local authority" in lowered_text or ".agents/" in source_path:
+    if source_kind in {"policy", "gate"}:
+        if _workflow_path_or_content_is_fork_local_authority(source_path, lowered_text):
+            return "fork-local-authority-material"
+        return "reusable-workflow-material"
+    if _workflow_path_or_content_is_fork_local_authority(source_path, lowered_text):
         return "fork-local-authority-material"
     return "reusable-workflow-material"
+
+
+def _workflow_path_or_content_is_fork_local_authority(
+    source_path: str,
+    lowered_text: str,
+) -> bool:
+    lowered_path = source_path.lower()
+    return (
+        lowered_path in {"agents.md", "claude.md"}
+        or lowered_path.startswith(".agents/")
+        or lowered_path.startswith("docs/agents/")
+        or "fork-local authority" in lowered_text
+        or "maintained fork" in lowered_text
+    )
 
 
 def _workflow_catalog_target(signals: list[str], source_kind: str, raw_text: str) -> str:
