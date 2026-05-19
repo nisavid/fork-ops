@@ -136,6 +136,31 @@ def _migration_map_by_path(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {entry["source_path"]: entry for entry in plan["migration_map"]}
 
 
+def _mark_reviewed_retain(plan: dict[str, Any], source_path: str) -> None:
+    for entry in plan["migration_review_artifact"]["entries"]:
+        if entry["source_path"] == source_path:
+            entry["review_decision"] = {
+                "status": "reviewed",
+                "choice": "retain",
+                "authority": "fork-local-authority",
+                "rationale": "Reviewed as retained fork-local authority.",
+            }
+            return
+    raise AssertionError(f"Missing migration review entry for {source_path}")
+
+
+def _mark_reviewed_exclude(plan: dict[str, Any], source_path: str) -> None:
+    for entry in plan["migration_review_artifact"]["entries"]:
+        if entry["source_path"] == source_path:
+            entry["review_decision"] = {
+                "status": "reviewed",
+                "choice": "exclude",
+                "rationale": "Reviewed as outside fork-local authority.",
+            }
+            return
+    raise AssertionError(f"Missing migration review entry for {source_path}")
+
+
 class ForkOpsCoreTests(unittest.TestCase):
     def test_workflow_catalog_defines_intent_level_contracts(self) -> None:
         catalog = workflow_catalog()
@@ -1513,6 +1538,18 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(review_entry["target_surface"]["workflow_id"], "publication-closeout")
 
         artifact = plan["migration_review_artifact"]
+        decisions = {
+            entry["source_path"]: entry["review_decision"]["proposed_choice"]
+            for entry in artifact["entries"]
+        }
+        self.assertEqual(
+            decisions[".agents/skills/working-with-upstream-refs/SKILL.md"],
+            "retain",
+        )
+        self.assertEqual(
+            decisions["docs/agents/review-policy.md"],
+            "defer",
+        )
         self.assertEqual(artifact["status"], "proposed")
         self.assertEqual(artifact["target_path"], "docs/agents/fork-ops-migration-review.md")
         artifact_entries = {entry["source_path"]: entry for entry in artifact["entries"]}
@@ -1681,6 +1718,41 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(plan["blockers"][0]["code"], "semantic_coverage.incomplete")
         self.assertEqual(plan["blockers"][0]["paths"], ["docs/maintainers/upstream-notes.md"])
 
+    def test_migration_review_artifact_records_review_decision_choices(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            path = repo_path / "docs/maintainers/upstream-notes.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("The upstream track policy is described narratively without refs.\n")
+
+            plan = generate_migration_plan(repo)
+
+        artifact = plan["migration_review_artifact"]
+        self.assertEqual(
+            artifact["source_material_review_decision_types"],
+            [
+                "retain",
+                "exclude",
+                "defer",
+                "needs-human-decision",
+                "unsupported-extractor",
+            ],
+        )
+        [entry] = artifact["entries"]
+        self.assertEqual(entry["review_decision"]["status"], "pending")
+        self.assertEqual(
+            entry["review_decision"]["proposed_choice"],
+            "unsupported-extractor",
+        )
+        self.assertIn("retain", entry["review_decision"]["choices"])
+        self.assertIn("- Review status: pending", artifact["markdown"])
+        self.assertIn("- Proposed review choice: unsupported-extractor", artifact["markdown"])
+        self.assertIn(
+            "- Review choices: retain, exclude, defer, needs-human-decision, "
+            "unsupported-extractor",
+            artifact["markdown"],
+        )
+
     def test_migration_plan_accepts_default_baseline_without_separate_ref_role(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -1786,6 +1858,23 @@ uncertainty_destination = "ask-human-operator"
             ):
                 dry_run_migration_plan(plan)
 
+    def test_migration_dry_run_rejects_duplicate_review_artifact_source_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["migration_review_artifact"]["entries"].append(
+                dict(plan["migration_review_artifact"]["entries"][0])
+            )
+
+            with self.assertRaisesRegex(
+                ForkOpsError,
+                "duplicate source_path: .agents/skills/working-with-upstream-refs/SKILL.md",
+            ):
+                dry_run_migration_plan(plan)
+
     def test_migration_dry_run_uses_embedded_repo_path_for_supplied_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -1818,6 +1907,102 @@ uncertainty_destination = "ask-human-operator"
         self.assertIn("config creation is blocked", dry_run["narrative"]["text"])
         self.assertNotIn("blocked_steps", dry_run["narrative"]["text"])
         self.assertNotIn("refused mutation", dry_run["narrative"]["text"])
+
+    def test_reviewed_retain_unblocks_lemonade_config_creation_and_preserves_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            modeled_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            retained_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            modeled_path.parent.mkdir(parents=True)
+            retained_path.parent.mkdir(parents=True)
+            modeled_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            retained_path.write_text(
+                "Lemonade upstream track policy is described here as fork-local "
+                "authority without a machine-readable upstream ref.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_reviewed_retain(plan, "docs/agents/lemonade-local-policy.md")
+
+            dry_run = dry_run_migration_plan(plan)
+            result = execute_migration_plan(plan)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertEqual(
+                retained_path.read_text(),
+                (
+                    "Lemonade upstream track policy is described here as fork-local "
+                    "authority without a machine-readable upstream ref.\n"
+                ),
+            )
+
+        self.assertTrue(dry_run["can_execute"])
+        dry_run_blocker_codes = {item["code"] for item in dry_run["blocked_steps"]}
+        self.assertNotIn("semantic_coverage.incomplete", dry_run_blocker_codes)
+        dry_run_authority = {
+            item["path"]: item for item in dry_run["retained_authority"]
+        }
+        self.assertEqual(
+            dry_run_authority["docs/agents/lemonade-local-policy.md"]["review_decision"][
+                "choice"
+            ],
+            "retain",
+        )
+        self.assertIn(
+            "source-material replacement/removal",
+            dry_run_authority["docs/agents/lemonade-local-policy.md"]["blocks"],
+        )
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["summary"]["blocker_count"], 0)
+        result_authority = {item["path"]: item for item in result["retained_authority"]}
+        self.assertTrue(result_authority["docs/agents/lemonade-local-policy.md"]["read_required"])
+        self.assertIn(
+            "docs/agents/lemonade-local-policy.md",
+            {item["path"] for item in result["deferred_removals"]},
+        )
+
+    def test_reviewed_exclude_does_not_report_retained_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            excluded_path = repo_path / ".codex/process-notes.md"
+            source_path.parent.mkdir(parents=True)
+            excluded_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            excluded_path.write_text(
+                "The test harness can fork a child process while running examples.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_reviewed_exclude(plan, ".codex/process-notes.md")
+
+            dry_run = dry_run_migration_plan(plan)
+
+        retained_authority_paths = {item["path"] for item in dry_run["retained_authority"]}
+        self.assertIn(
+            ".agents/skills/working-with-upstream-refs/SKILL.md",
+            retained_authority_paths,
+        )
+        self.assertNotIn(".codex/process-notes.md", retained_authority_paths)
+
+    def test_missing_review_decision_does_not_report_retained_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            for entry in plan["migration_review_artifact"]["entries"]:
+                if entry["source_path"] == ".agents/skills/working-with-upstream-refs/SKILL.md":
+                    del entry["review_decision"]
+
+            dry_run = dry_run_migration_plan(plan)
+
+        retained_authority_paths = {item["path"] for item in dry_run["retained_authority"]}
+        self.assertNotIn(
+            ".agents/skills/working-with-upstream-refs/SKILL.md",
+            retained_authority_paths,
+        )
 
     def test_cli_exposes_migration_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

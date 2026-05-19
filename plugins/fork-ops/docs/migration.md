@@ -51,8 +51,11 @@ The plan output separates:
 - a migration map entry for each candidate source material item
 - typed source material dispositions and target surfaces
 - a proposed migration review artifact for durable decisions outside config
+- review decision choices for retain, exclude, defer, needs-human-decision, and
+  unsupported-extractor outcomes
 - the proposed config patch
-- retained source materials that remain fork-local authority
+- retained source materials that remain preserved
+- retained authority that agents still need to read after config creation
 - deferred removals
 - blockers such as incomplete semantic coverage or config diagnostics
 - required review and validation requirements
@@ -73,7 +76,12 @@ Migration map dispositions use these initial values:
 
 The migration review artifact is proposed as
 `docs/agents/fork-ops-migration-review.md`. It records each migration map entry,
-including its disposition rationale and target-surface details. That rationale
+including its disposition rationale, target-surface details, and review decision
+state. Review decisions use `retain`, `exclude`, `defer`,
+`needs-human-decision`, and `unsupported-extractor` choices. A reviewed
+`retain` decision records that the source remains fork-local authority for
+guarded config creation. Other choices remain durable review decisions, but they
+do not authorize source-material replacement or removal. Review rationale
 belongs in the review artifact, not in `.agents/fork-ops.toml`.
 
 Migration dry run previews a migration plan without mutating the repository.
@@ -86,12 +94,16 @@ uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-p
 
 The dry-run output reports planned file edits, config changes, migration map
 entries, the proposed review artifact, retained source materials, blocked
-steps, expected verification commands, and an operator-readable narrative. It
-does not edit config, source material, or branch state.
+steps, expected verification commands, retained authority that agents still
+need to read, unavailable migration work, and an operator-readable narrative. If
+all `semantic_coverage.incomplete` paths have reviewed `retain` decisions in
+the migration review artifact, guarded config creation can proceed while
+source-material replacement and removal stay unavailable. It does not edit
+config, source material, or branch state.
 
-Migration execution applies a blocker-free migration plan through guarded
-operations. When no plan file is supplied, the CLI generates the current plan
-internally.
+Migration execution applies a migration plan through guarded operations when
+the dry-run preview has no blockers. When no plan file is supplied, the CLI
+generates the current plan internally.
 
 ```bash
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
@@ -102,10 +114,10 @@ The current execution slice supports creating `.agents/fork-ops.toml` from the
 validated config proposal, preserving retained source materials, reporting the
 migration map and proposed review artifact, and verifying the resulting Fork Ops
 capability level. It returns structured evidence for applied edits, skipped
-preservation steps, blockers, verification results, and narrative refusal
-context. It refuses malformed plans, plans with blockers, unsupported edit
-actions, unsafe target paths, and config content that fails parse or validation
-checks.
+preservation steps, retained authority, deferred removals, blockers,
+verification results, and narrative refusal context. It refuses malformed plans,
+plans with unresolved dry-run blockers, unsupported edit actions, unsafe target
+paths, and config content that fails parse or validation checks.
 
 Migration outputs include a `narrative` object. The narrative is rendered from
 the structured output and names source paths, dispositions, blockers, retained
@@ -135,7 +147,9 @@ The implementation supports migration assessment, non-mutating proposed config
 patch generation, non-mutating migration plan generation, non-mutating migration
 dry run, operator-readable migration narratives, and blocker explanations.
 Migration execution supports guarded config creation and capability verification
-for blocker-free plans.
+for plans whose dry-run blockers are resolved for config creation. Retained
+authority remains checked-in source material and remains a blocker for
+replacement or removal.
 
 ## Migration Boundaries
 

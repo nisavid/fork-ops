@@ -17,9 +17,9 @@ The first fully operational implementation target is `track-aware`. `sync-ready`
 
 Migration support should start with read-only migration assessment, non-mutating
 proposed config patches, non-mutating migration plans, and non-mutating dry
-runs. Migration execution should apply blocker-free plans through guarded
-operations and verify the resulting capability level before source-material
-removal is available.
+runs. Migration execution should apply plans through guarded operations when
+the dry-run preview has no blockers and verify the resulting capability level
+before source-material removal is available.
 
 ## Capability Levels
 

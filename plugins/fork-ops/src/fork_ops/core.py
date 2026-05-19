@@ -138,6 +138,13 @@ SOURCE_MATERIAL_DISPOSITION_TYPES = (
     "needs_human_decision",
     "deferred_with_rationale",
 )
+SOURCE_MATERIAL_REVIEW_DECISION_TYPES = (
+    "retain",
+    "exclude",
+    "defer",
+    "needs-human-decision",
+    "unsupported-extractor",
+)
 MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH = "docs/agents/fork-ops-migration-review.md"
 UNAVAILABLE_MIGRATION_WORK = (
     "source-material replacement/removal",
@@ -1387,7 +1394,8 @@ def dry_run_migration_plan(
     migration_review_artifact = _require_migration_review_artifact(plan)
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
-    blocked_steps = _dry_run_blocked_steps(plan)
+    retained_authority = _retained_authority(retained_materials, migration_review_artifact)
+    blocked_steps = _dry_run_blocked_steps(plan, migration_review_artifact)
     blocked_steps.extend(_proposed_config_patch_consistency_blockers(proposed_config_patch))
     blocked_steps.extend(
         _migration_execution_blockers(
@@ -1432,9 +1440,11 @@ def dry_run_migration_plan(
         "migration_map": migration_map,
         "migration_review_artifact": migration_review_artifact,
         "retained_materials": retained_materials,
+        "retained_authority": retained_authority,
         "deferred_removals": deferred_removals,
         "blocked_steps": blocked_steps,
         "expected_verification_commands": expected_verification_commands,
+        "unavailable_work": list(UNAVAILABLE_MIGRATION_WORK),
         "limitations": [
             "This migration dry run is non-mutating and does not apply config or edit files.",
             "Source-material removal is not implemented; source materials remain preserved.",
@@ -1442,7 +1452,10 @@ def dry_run_migration_plan(
         "next_actions": [
             "Review file_edits and config_changes against the migration plan evidence.",
             "Review migration_review_artifact before treating retained authority as covered.",
-            "Resolve or explicitly waive reported dry-run blockers before migration execution.",
+            (
+                "Resolve reported dry-run blockers with durable review evidence before "
+                "migration execution."
+            ),
             (
                 "Run expected_verification_commands after migration execution applies changes."
             ),
@@ -2208,13 +2221,31 @@ def _proposed_config_patch_consistency_blockers(
     ]
 
 
-def _dry_run_blocked_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
+def _dry_run_blocked_steps(
+    plan: dict[str, Any],
+    migration_review_artifact: dict[str, Any],
+) -> list[dict[str, Any]]:
     blocked_steps: list[dict[str, Any]] = []
+    reviewed_retained_paths = _reviewed_retained_source_paths(migration_review_artifact)
     for blocker in _require_plan_list(plan, "blockers"):
+        if _blocker_resolved_by_reviewed_retain(blocker, reviewed_retained_paths):
+            continue
         blocker.setdefault("step", "review_migration_plan")
         blocker.setdefault("source", "migration_plan")
         blocked_steps.append(blocker)
     return blocked_steps
+
+
+def _blocker_resolved_by_reviewed_retain(
+    blocker: dict[str, Any],
+    reviewed_retained_paths: set[str],
+) -> bool:
+    if blocker.get("code") != "semantic_coverage.incomplete":
+        return False
+    paths = _string_list(blocker.get("paths"))
+    if not paths:
+        return False
+    return all(path in reviewed_retained_paths for path in paths)
 
 
 def _require_plan_list(plan: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -2292,6 +2323,9 @@ def _migration_execution_result(
             "skipped_edit_count": len(skipped_edits),
             "migration_map_entry_count": len(_optional_preview_list(preview, "migration_map")),
             "retained_material_count": len(_optional_preview_list(preview, "retained_materials")),
+            "retained_authority_count": len(
+                _optional_preview_list(preview, "retained_authority")
+            ),
             "review_artifact_entry_count": len(
                 _review_artifact_entries(
                     _optional_preview_dict(preview, "migration_review_artifact")
@@ -2304,12 +2338,15 @@ def _migration_execution_result(
         "skipped_edits": skipped_edits,
         "migration_map": _optional_preview_list(preview, "migration_map"),
         "retained_materials": _optional_preview_list(preview, "retained_materials"),
+        "retained_authority": _optional_preview_list(preview, "retained_authority"),
+        "deferred_removals": _optional_preview_list(preview, "deferred_removals"),
         "migration_review_artifact": _optional_preview_dict(
             preview,
             "migration_review_artifact",
         ),
         "blockers": blockers,
         "verification_results": verification_results,
+        "unavailable_work": list(UNAVAILABLE_MIGRATION_WORK),
     }
     return _with_migration_narrative(result)
 
@@ -2893,6 +2930,7 @@ def _migration_review_artifact(migration_map: list[dict[str, Any]]) -> dict[str,
             "disposition": copy.deepcopy(entry["disposition"]),
             "target_surface": copy.deepcopy(entry["target_surface"]),
             "retained_source_material": entry["retained_source_material"],
+            "review_decision": _default_review_decision(entry),
             "rationale": _migration_review_rationale(entry),
         }
         for entry in migration_map
@@ -2901,10 +2939,33 @@ def _migration_review_artifact(migration_map: list[dict[str, Any]]) -> dict[str,
         "status": "proposed",
         "target_path": MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH,
         "content_kind": "migration-review-artifact",
+        "source_material_review_decision_types": list(SOURCE_MATERIAL_REVIEW_DECISION_TYPES),
         "entries": entries,
     }
     artifact["markdown"] = _migration_review_artifact_markdown(entries)
     return artifact
+
+
+def _default_review_decision(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "proposed_choice": _proposed_review_choice(entry),
+        "choices": list(SOURCE_MATERIAL_REVIEW_DECISION_TYPES),
+    }
+
+
+def _proposed_review_choice(entry: dict[str, Any]) -> str:
+    disposition = entry.get("disposition", {})
+    disposition_type = disposition.get("type") if isinstance(disposition, dict) else ""
+    return {
+        "extracted_into_config": "retain",
+        "retained_as_fork_local_authority": "retain",
+        "irrelevant_to_fork_ops": "exclude",
+        "mapped_to_workflow_backlog": "defer",
+        "deferred_with_rationale": "defer",
+        "needs_human_decision": "needs-human-decision",
+        "unsupported_extractor_shape": "unsupported-extractor",
+    }.get(str(disposition_type), "needs-human-decision")
 
 
 def _migration_review_rationale(entry: dict[str, Any]) -> str:
@@ -2961,6 +3022,7 @@ def _migration_review_artifact_markdown(entries: list[dict[str, Any]]) -> str:
                 f"- Disposition: {entry['disposition']['type']}",
                 f"- Target surface: {entry['target_surface']['type']}",
                 *_target_surface_markdown_lines(entry["target_surface"]),
+                *_review_decision_markdown_lines(entry.get("review_decision")),
                 f"- Rationale: {entry['rationale']}",
             ]
         )
@@ -2979,11 +3041,97 @@ def _target_surface_markdown_lines(target_surface: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _review_decision_markdown_lines(review_decision: Any) -> list[str]:
+    if not isinstance(review_decision, dict):
+        return []
+    lines: list[str] = []
+    status = review_decision.get("status")
+    if isinstance(status, str) and status:
+        lines.append(f"- Review status: {status}")
+    choice = review_decision.get("choice")
+    if isinstance(choice, str) and choice:
+        lines.append(f"- Review choice: {choice}")
+    proposed_choice = review_decision.get("proposed_choice")
+    if isinstance(proposed_choice, str) and proposed_choice:
+        lines.append(f"- Proposed review choice: {proposed_choice}")
+    choices = _string_list(review_decision.get("choices"))
+    if choices:
+        lines.append(f"- Review choices: {', '.join(choices)}")
+    rationale = review_decision.get("rationale")
+    if isinstance(rationale, str) and rationale:
+        lines.append(f"- Review rationale: {rationale}")
+    return lines
+
+
 def _review_artifact_entries(artifact: dict[str, Any]) -> list[dict[str, Any]]:
     entries = artifact.get("entries", [])
     if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
         return []
     return entries
+
+
+def _review_decisions_by_path(artifact: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    decisions: dict[str, dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    for entry in _review_artifact_entries(artifact):
+        source_path = entry.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            continue
+        if source_path in seen_paths:
+            raise ForkOpsError(
+                f"Migration review artifact has duplicate source_path: {source_path}"
+            )
+        seen_paths.add(source_path)
+        decision = entry.get("review_decision")
+        if isinstance(decision, dict):
+            decisions[source_path] = copy.deepcopy(decision)
+    return decisions
+
+
+def _reviewed_retained_source_paths(artifact: dict[str, Any]) -> set[str]:
+    retained_paths: set[str] = set()
+    for path, decision in _review_decisions_by_path(artifact).items():
+        if decision.get("status") == "reviewed" and decision.get("choice") == "retain":
+            retained_paths.add(path)
+    return retained_paths
+
+
+def _retained_authority(
+    retained_materials: list[dict[str, Any]],
+    migration_review_artifact: dict[str, Any],
+) -> list[dict[str, Any]]:
+    decisions = _review_decisions_by_path(migration_review_artifact)
+    authority: list[dict[str, Any]] = []
+    for material in retained_materials:
+        path = material.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        decision = decisions.get(path, {})
+        if _review_decision_choice(decision) != "retain":
+            continue
+        authority.append(
+            {
+                "path": path,
+                "kind": material.get("kind"),
+                "domains": copy.deepcopy(material.get("domains", [])),
+                "authority_status": "authoritative_after_config_creation",
+                "read_required": True,
+                "replacement_status": material.get("replacement_status", "deferred"),
+                "review_decision": copy.deepcopy(decision),
+                "blocks": ["source-material replacement/removal"],
+            }
+        )
+    return authority
+
+
+def _review_decision_choice(decision: dict[str, Any]) -> str:
+    choice = decision.get("choice")
+    if isinstance(choice, str) and choice:
+        return choice
+    proposed_choice = decision.get("proposed_choice")
+    if isinstance(proposed_choice, str) and proposed_choice:
+        return proposed_choice
+    return ""
 
 
 def _retained_source_materials(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3108,7 +3256,7 @@ def _migration_plan_required_review(blockers: list[dict[str, Any]]) -> list[dict
                 "code": "review.blockers",
                 "status": "required",
                 "subject": "blockers",
-                "reason": "Blockers must be resolved or explicitly waived before dry run.",
+                "reason": "Blockers must be resolved with durable review evidence before dry run.",
             }
         )
     return required_review

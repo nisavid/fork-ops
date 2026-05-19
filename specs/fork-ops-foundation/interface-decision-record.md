@@ -15,8 +15,8 @@ The first fully operational target is the `track-aware` capability level. The co
 The first migration surface includes read-only migration assessment,
 non-mutating config proposal generation, and non-mutating migration plan
 generation. Migration execution must support dry-run preview before mutation,
-apply blocker-free plans through guarded operations, and verify the resulting
-capability level.
+apply plans through guarded operations when the dry-run preview has no blockers,
+and verify the resulting capability level.
 
 Use Python for the initial core library, CLI, and MCP server implementation.
 
