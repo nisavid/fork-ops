@@ -29,6 +29,7 @@ from fork_ops.core import (
     dry_run_migration_plan,
     execute_migration,
     execute_migration_plan,
+    explain_migration_blocker,
     generate_migration_plan,
     normalize_config,
     parse_config_text,
@@ -40,8 +41,11 @@ from fork_ops.mcp_server import (
     fork_ops_capability_report,
     fork_ops_config_read,
     fork_ops_config_validate,
+    fork_ops_migration_assessment,
+    fork_ops_migration_blocker_resolution,
     fork_ops_migration_dry_run,
     fork_ops_migration_execute,
+    fork_ops_migration_plan,
     fork_ops_plugin_health,
     fork_ops_schema,
     fork_ops_workflow_catalog,
@@ -148,7 +152,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             "carried-divergence-review": ("sync-ready", "planned", False),
             "review-preparation": ("review-ready", "planned", False),
             "publication-closeout": ("review-ready", "planned", False),
-            "blocker-resolution": ("identified", "next-slice", False),
+            "blocker-resolution": ("identified", "diagnostic-only", True),
         }
         self.assertEqual(set(workflows), set(expected_contracts))
         self.assertEqual(len(catalog["workflows"]), len(workflows))
@@ -187,6 +191,15 @@ class ForkOpsCoreTests(unittest.TestCase):
             _entrypoint_ids(migration),
         )
         self.assertIn("source material disposition", " ".join(migration["evidence_expectations"]))
+        blocker_resolution = workflows["blocker-resolution"]
+        self.assertIn(
+            "fork-ops migration explain-blocker",
+            _entrypoint_ids(blocker_resolution),
+        )
+        self.assertIn(
+            "fork_ops_migration_blocker_resolution",
+            _entrypoint_ids(blocker_resolution),
+        )
 
         workflow_inventory = workflows["workflow-migration-inventory"]
         self.assertIn("workflow migration inventory", workflow_inventory["trigger_phrases"])
@@ -1259,6 +1272,11 @@ uncertainty_destination = "ask-human-operator"
         )
         self.assertIn("upstream_intelligence", candidate["domains"])
         self.assertIn("sync", candidate["domains"])
+        narrative = assessment["narrative"]
+        self.assertEqual(narrative["workflow_id"], "fork-authority-migration")
+        self.assertIn("read-only migration assessment", narrative["text"])
+        self.assertIn(".agents/skills/working-with-upstream-refs/SKILL.md", narrative["text"])
+        self.assertIn("structured facts", narrative["text"])
 
     def test_proposed_config_patch_preserves_upstream_ref_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1573,6 +1591,15 @@ uncertainty_destination = "ask-human-operator"
             surface["path"] for surface in plan["proposed_config_patch"]["config"]["local_surfaces"]
         }
         self.assertNotIn(".codex/process-notes.md", config_surface_paths)
+        narrative_text = plan["narrative"]["text"]
+        self.assertIn("retained_as_fork_local_authority", narrative_text)
+        self.assertIn("AGENTS.md", narrative_text)
+        self.assertIn("unsupported_extractor_shape", narrative_text)
+        self.assertIn("docs/maintainers/upstream-notes.md", narrative_text)
+        self.assertIn("needs_human_decision", narrative_text)
+        self.assertIn("docs/agents/default-lts.md", narrative_text)
+        self.assertIn("semantic_coverage.incomplete", narrative_text)
+        self.assertIn("safe continuations", narrative_text)
 
     def test_migration_map_defers_existing_config_merge_without_source_removal(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1698,6 +1725,12 @@ uncertainty_destination = "ask-human-operator"
         self.assertNotIn("migration_execution.unavailable", blocker_codes)
         verification_codes = {item["code"] for item in dry_run["expected_verification_commands"]}
         self.assertIn("validation.config_validate", verification_codes)
+        narrative_text = dry_run["narrative"]["text"]
+        self.assertIn("guarded config creation can proceed", narrative_text)
+        self.assertIn(".agents/fork-ops.toml", narrative_text)
+        self.assertIn("retained source material", narrative_text)
+        self.assertIn(".agents/skills/working-with-upstream-refs/SKILL.md", narrative_text)
+        self.assertIn("source-material replacement/removal is unavailable", narrative_text)
 
     def test_migration_dry_run_output_does_not_alias_input_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1780,6 +1813,9 @@ uncertainty_destination = "ask-human-operator"
         blocker_codes = [item["code"] for item in dry_run["blocked_steps"]]
         self.assertIn("semantic_coverage.incomplete", blocker_codes)
         self.assertFalse(dry_run["can_execute"])
+        self.assertFalse(dry_run["narrative"]["refusal"]["active"])
+        self.assertIn("config creation is blocked", dry_run["narrative"]["text"])
+        self.assertNotIn("refused mutation", dry_run["narrative"]["text"])
 
     def test_cli_exposes_migration_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1796,6 +1832,61 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["operation"], "migration-dry-run")
         self.assertTrue(payload["can_execute"])
+        self.assertIn("narrative", payload)
+        self.assertIn("guarded config creation can proceed", payload["narrative"]["text"])
+
+    def test_cli_and_mcp_expose_shared_migration_narratives(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(["migration", "plan", "--repo", str(repo_path)])
+            cli_payload = json.loads(output.getvalue())
+            mcp_assessment = fork_ops_migration_assessment(str(repo_path))
+            mcp_plan = fork_ops_migration_plan(str(repo_path))
+            mcp_resolution = fork_ops_migration_blocker_resolution(
+                generate_migration_plan(repo_path),
+                "source_material.none_found",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cli_payload["narrative"], mcp_plan["narrative"])
+        self.assertIn("read-only migration assessment", mcp_assessment["narrative"]["text"])
+        self.assertEqual(mcp_resolution["operation"], "blocker-resolution")
+
+    def test_cli_explains_migration_blocker_from_workflow_output(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            plan_path = repo_path / "migration-plan.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "The upstream track policy is described narratively without refs.\n"
+            )
+            plan_path.write_text(json.dumps(generate_migration_plan(repo_path)))
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(
+                    [
+                        "migration",
+                        "explain-blocker",
+                        "--input",
+                        str(plan_path),
+                        "--blocker-code",
+                        "semantic_coverage.incomplete",
+                    ]
+                )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["operation"], "blocker-resolution")
+        self.assertEqual(payload["blocker"]["code"], "semantic_coverage.incomplete")
+        self.assertIn("docs/maintainers/upstream-notes.md", payload["narrative"]["text"])
 
     def test_cli_accepts_migration_plan_file_for_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -2022,6 +2113,55 @@ uncertainty_destination = "ask-human-operator"
         blocker_codes = {blocker["code"] for blocker in result["blockers"]}
         self.assertIn("semantic_coverage.incomplete", blocker_codes)
         self.assertEqual(result["skipped_edits"][0]["reason"], "blocked_steps_present")
+        narrative = result["narrative"]
+        self.assertTrue(narrative["refusal"]["active"])
+        self.assertIn("refused", narrative["text"])
+        self.assertIn("semantic_coverage.incomplete", narrative["text"])
+        self.assertIn("docs/maintainers/upstream-notes.md", narrative["text"])
+        self.assertIn("config creation is blocked", narrative["text"])
+
+    def test_blocker_resolution_explains_semantic_coverage_from_workflow_output(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "The upstream track policy is described narratively without refs.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+
+            resolution = explain_migration_blocker(plan, "semantic_coverage.incomplete")
+
+        self.assertEqual(resolution["operation"], "blocker-resolution")
+        self.assertEqual(resolution["source_operation"], "migration-plan")
+        self.assertEqual(resolution["originating_workflow"]["id"], "fork-authority-migration")
+        self.assertEqual(resolution["resolution_workflow"]["id"], "blocker-resolution")
+        self.assertEqual(resolution["blocker"]["code"], "semantic_coverage.incomplete")
+        self.assertEqual(
+            resolution["evidence"]["paths"],
+            ["docs/maintainers/upstream-notes.md"],
+        )
+        self.assertEqual(
+            resolution["evidence"]["migration_map_entries"][0]["source_path"],
+            "docs/maintainers/upstream-notes.md",
+        )
+        self.assertIn(
+            "deterministic extractor did not produce structured facts",
+            resolution["narrative"]["text"],
+        )
+        self.assertIn("docs/maintainers/upstream-notes.md", resolution["narrative"]["text"])
+        self.assertIn(
+            "Keep the listed source material as fork-local authority",
+            resolution["narrative"]["text"],
+        )
+        self.assertIn(
+            "Keep the listed source material as fork-local authority",
+            resolution["safe_continuations"],
+        )
+        self.assertIn(
+            "source-material replacement/removal",
+            resolution["unavailable_work"],
+        )
 
     def test_migration_execution_applies_config_and_preserves_source_material(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

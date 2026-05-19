@@ -35,6 +35,7 @@ MCP_TOOL_IDS = (
     "fork_ops_migration_plan",
     "fork_ops_migration_dry_run",
     "fork_ops_migration_execute",
+    "fork_ops_migration_blocker_resolution",
     "fork_ops_migration_config_patch",
     "fork_ops_schema",
     "fork_ops_workflow_catalog",
@@ -138,6 +139,12 @@ SOURCE_MATERIAL_DISPOSITION_TYPES = (
     "deferred_with_rationale",
 )
 MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH = "docs/agents/fork-ops-migration-review.md"
+UNAVAILABLE_MIGRATION_WORK = (
+    "source-material replacement/removal",
+    "arbitrary migration edits",
+    "broad upstream sync mutation",
+    "PR publication closeout",
+)
 
 
 class ForkOpsError(RuntimeError):
@@ -1199,6 +1206,7 @@ def assess_migration(
     assessment: dict[str, Any] = {
         "repo_path": str(repo),
         "mode": "read-only",
+        "operation": "migration-assessment",
         "summary": {
             "candidate_count": len(candidates),
             "has_fork_ops_config": (repo / CONFIG_RELATIVE_PATH).exists(),
@@ -1213,7 +1221,7 @@ def assess_migration(
     }
     if include_proposed_config_patch:
         assessment["proposed_config_patch"] = propose_migration_config_patch(repo, candidates)
-    return assessment
+    return _with_migration_narrative(assessment)
 
 
 def propose_migration_config_patch(
@@ -1268,7 +1276,7 @@ def generate_migration_plan(
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     migration_review_artifact = _migration_review_artifact(migration_map)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
-    return {
+    plan = {
         "repo_path": str(repo),
         "mode": "non-mutating",
         "operation": "migration-plan",
@@ -1304,6 +1312,7 @@ def generate_migration_plan(
             "Run validation requirements after any manual application of the proposed config.",
         ],
     }
+    return _with_migration_narrative(plan)
 
 
 def build_workflow_migration_inventory(
@@ -1401,7 +1410,7 @@ def dry_run_migration_plan(
         )
     else:
         blocked_steps.extend(_validation_requirement_blockers(expected_verification_commands))
-    return {
+    dry_run = {
         "repo_path": normalized_repo_path,
         "mode": "non-mutating",
         "operation": "migration-dry-run",
@@ -1439,6 +1448,7 @@ def dry_run_migration_plan(
             ),
         ],
     }
+    return _with_migration_narrative(dry_run)
 
 
 def execute_migration(
@@ -1501,6 +1511,560 @@ def execute_migration_plan(
         blockers=verification_blockers,
         verification_results=verification_results,
     )
+
+
+def explain_migration_blocker(
+    workflow_output: dict[str, Any],
+    blocker_code: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(workflow_output, dict):
+        raise ForkOpsError("Blocker resolution requires a workflow output object.")
+    blocker = _select_blocker(workflow_output, blocker_code)
+    evidence = _blocker_evidence(workflow_output, blocker)
+    result = {
+        "operation": "blocker-resolution",
+        "mode": "read-only",
+        "source_operation": workflow_output.get("operation"),
+        "originating_workflow": _workflow_contract_dict(_originating_migration_workflow_id()),
+        "resolution_workflow": _workflow_contract_dict("blocker-resolution"),
+        "blocker": copy.deepcopy(blocker),
+        "evidence": evidence,
+        "safe_continuations": _safe_continuations_for_blocker(blocker, evidence),
+        "unavailable_work": list(UNAVAILABLE_MIGRATION_WORK),
+    }
+    return _with_migration_narrative(result)
+
+
+def render_migration_narrative(workflow_output: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(workflow_output, dict):
+        raise ForkOpsError("Migration narrative requires a workflow output object.")
+    operation = workflow_output.get("operation")
+    workflow_id = _narrative_workflow_id(operation)
+    title = _narrative_title(operation)
+    summary = _narrative_summary(workflow_output)
+    sections = _narrative_sections(workflow_output)
+    blocker_explanations = _blocker_explanations(workflow_output)
+    safe_continuations = _safe_continuations(workflow_output, blocker_explanations)
+    unavailable_work = _narrative_unavailable_work(workflow_output)
+    refusal = _narrative_refusal(workflow_output, blocker_explanations)
+    narrative = {
+        "kind": "operator-readable-narrative",
+        "workflow_id": workflow_id,
+        "title": title,
+        "summary": summary,
+        "sections": sections,
+        "blocker_explanations": blocker_explanations,
+        "safe_continuations": safe_continuations,
+        "unavailable_work": unavailable_work,
+        "refusal": refusal,
+    }
+    narrative["text"] = _render_narrative_text(
+        title,
+        summary,
+        sections,
+        safe_continuations,
+        unavailable_work,
+        refusal,
+    )
+    return narrative
+
+
+def _with_migration_narrative(workflow_output: dict[str, Any]) -> dict[str, Any]:
+    output = copy.deepcopy(workflow_output)
+    output["narrative"] = render_migration_narrative(output)
+    return output
+
+
+def _narrative_workflow_id(operation: Any) -> str:
+    if operation == "blocker-resolution":
+        return "blocker-resolution"
+    return _originating_migration_workflow_id()
+
+
+def _originating_migration_workflow_id() -> str:
+    return "fork-authority-migration"
+
+
+def _narrative_title(operation: Any) -> str:
+    titles = {
+        "migration-assessment": "Migration assessment narrative",
+        "migration-plan": "Migration plan narrative",
+        "migration-dry-run": "Migration dry run narrative",
+        "migration-execution": "Migration execution narrative",
+        "blocker-resolution": "Blocker resolution narrative",
+    }
+    return titles.get(str(operation), "Migration narrative")
+
+
+def _narrative_summary(workflow_output: dict[str, Any]) -> str:
+    operation = workflow_output.get("operation")
+    summary = workflow_output.get("summary")
+    if operation == "migration-assessment" and isinstance(summary, dict):
+        return (
+            "This read-only migration assessment found "
+            f"{summary.get('candidate_count', 0)} candidate source material items."
+        )
+    if operation == "migration-plan" and isinstance(summary, dict):
+        return (
+            "This non-mutating migration plan maps "
+            f"{summary.get('migration_map_entry_count', 0)} source material items and "
+            f"reports {summary.get('blocker_count', 0)} blockers."
+        )
+    if operation == "migration-dry-run" and isinstance(summary, dict):
+        if workflow_output.get("can_execute"):
+            return "This non-mutating migration dry run shows guarded config creation can proceed."
+        return "This non-mutating migration dry run shows config creation is blocked."
+    if operation == "migration-execution":
+        status = workflow_output.get("status")
+        if status == "blocked":
+            return "Migration execution refused mutation because blockers are present."
+        if status == "applied":
+            return (
+                "Migration execution applied guarded config creation and preserved "
+                "retained authority."
+            )
+        if status == "verification_failed":
+            return "Migration execution applied edits but verification reported blockers."
+        return f"Migration execution status is {status}."
+    if operation == "blocker-resolution":
+        blocker = workflow_output.get("blocker", {})
+        code = blocker.get("code") if isinstance(blocker, dict) else None
+        return f"Blocker-resolution output explains {code or 'the requested blocker'}."
+    return "This migration output includes an operator-readable narrative."
+
+
+def _narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    operation = workflow_output.get("operation")
+    if operation == "migration-assessment":
+        return _assessment_narrative_sections(workflow_output)
+    if operation == "migration-plan":
+        return _plan_narrative_sections(workflow_output)
+    if operation == "migration-dry-run":
+        return _dry_run_narrative_sections(workflow_output)
+    if operation == "migration-execution":
+        return _execution_narrative_sections(workflow_output)
+    if operation == "blocker-resolution":
+        return _blocker_resolution_narrative_sections(workflow_output)
+    return []
+
+
+def _assessment_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    items = []
+    for candidate in _optional_dict_list(workflow_output, "candidates"):
+        facts = _optional_dict_list(candidate, "extracted_facts")
+        domains = _string_list(candidate.get("domains"))
+        fact_label = f"{len(facts)} structured facts"
+        domain_label = f"; domains: {', '.join(domains)}" if domains else ""
+        items.append(f"{candidate.get('path')}: {fact_label}{domain_label}")
+    if not items:
+        items.append("No candidate source material was detected in the scan scope.")
+    return [
+        {
+            "heading": "source materials",
+            "items": items,
+        }
+    ]
+
+
+def _plan_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    sections = [
+        {"heading": "migration map", "items": _migration_map_narrative_items(workflow_output)},
+        {
+            "heading": "retained authority",
+            "items": _retained_material_narrative_items(workflow_output),
+        },
+        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+    ]
+    sections.append(
+        {
+            "heading": "safe config creation",
+            "items": [_safe_config_creation_line(workflow_output)],
+        }
+    )
+    return sections
+
+
+def _dry_run_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    edit_items = []
+    for edit in _optional_dict_list(workflow_output, "file_edits"):
+        edit_items.append(
+            f"{edit.get('action')} {edit.get('path')} ({edit.get('status')})"
+        )
+    if not edit_items:
+        edit_items.append("No file edits were previewed.")
+    return [
+        {"heading": "safe config creation", "items": [_safe_config_creation_line(workflow_output)]},
+        {"heading": "file edits", "items": edit_items},
+        {
+            "heading": "retained authority",
+            "items": _retained_material_narrative_items(workflow_output),
+        },
+        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+    ]
+
+
+def _execution_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    applied = [
+        f"{edit.get('action')} {edit.get('path')} ({edit.get('status')})"
+        for edit in _optional_dict_list(workflow_output, "applied_edits")
+    ]
+    skipped = [
+        f"{edit.get('action')} {edit.get('path')} ({edit.get('reason')})"
+        for edit in _optional_dict_list(workflow_output, "skipped_edits")
+    ]
+    return [
+        {"heading": "safe config creation", "items": [_safe_config_creation_line(workflow_output)]},
+        {"heading": "applied edits", "items": applied or ["No edits were applied."]},
+        {"heading": "skipped edits", "items": skipped or ["No edits were skipped."]},
+        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+    ]
+
+
+def _blocker_resolution_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    blocker = workflow_output.get("blocker", {})
+    evidence = workflow_output.get("evidence", {})
+    path_items = _string_list(evidence.get("paths")) if isinstance(evidence, dict) else []
+    map_entries = (
+        _optional_dict_list(evidence, "migration_map_entries")
+        if isinstance(evidence, dict)
+        else []
+    )
+    evidence_items = [f"Source path: {path}" for path in path_items]
+    for entry in map_entries:
+        disposition = entry.get("disposition", {})
+        disposition_type = (
+            disposition.get("type") if isinstance(disposition, dict) else "unknown"
+        )
+        evidence_items.append(
+            f"{entry.get('source_path')}: {disposition_type} -> "
+            f"{_target_surface_type(entry.get('target_surface'))}"
+        )
+    if not evidence_items:
+        evidence_items.append("No matching blocker evidence was present in the workflow output.")
+    code = blocker.get("code") if isinstance(blocker, dict) else "unknown"
+    return [
+        {
+            "heading": "blocker",
+            "items": [f"{code}: {_blocker_summary(blocker, evidence)}"],
+        },
+        {"heading": "evidence", "items": evidence_items},
+    ]
+
+
+def _migration_map_narrative_items(workflow_output: dict[str, Any]) -> list[str]:
+    items = []
+    for entry in _optional_dict_list(workflow_output, "migration_map"):
+        disposition = entry.get("disposition", {})
+        disposition_type = disposition.get("type") if isinstance(disposition, dict) else "unknown"
+        target_surface = entry.get("target_surface")
+        items.append(
+            f"{entry.get('source_path')}: {disposition_type} -> "
+            f"{_target_surface_label(target_surface)}; retained source material: "
+            f"{bool(entry.get('retained_source_material'))}"
+        )
+    if not items:
+        items.append("No migration map entries are present.")
+    return items
+
+
+def _retained_material_narrative_items(workflow_output: dict[str, Any]) -> list[str]:
+    materials = _optional_dict_list(workflow_output, "retained_source_materials")
+    if not materials:
+        materials = _optional_dict_list(workflow_output, "retained_materials")
+    items = [
+        f"retained source material {material.get('path')}: "
+        f"{material.get('replacement_status', 'deferred')}"
+        for material in materials
+    ]
+    if not items:
+        items.append("No retained source material is listed.")
+    return items
+
+
+def _blocker_narrative_items(workflow_output: dict[str, Any]) -> list[str]:
+    explanations = _blocker_explanations(workflow_output)
+    if not explanations:
+        return ["No blockers are reported."]
+    items = []
+    for explanation in explanations:
+        paths = explanation.get("paths", [])
+        path_text = f" Paths: {', '.join(paths)}." if paths else ""
+        continuations = explanation.get("safe_continuations", [])
+        continuation_text = (
+            f" safe continuations: {'; '.join(continuations)}." if continuations else ""
+        )
+        items.append(
+            f"{explanation.get('code')}: {explanation.get('summary')}.{path_text}"
+            f"{continuation_text}"
+        )
+    return items
+
+
+def _safe_config_creation_line(workflow_output: dict[str, Any]) -> str:
+    operation = workflow_output.get("operation")
+    if operation == "migration-plan":
+        if _blockers_from_output(workflow_output):
+            return "Guarded config creation is blocked until blockers resolve."
+        return "Guarded config creation can proceed after required review and validation."
+    if operation == "migration-dry-run":
+        if workflow_output.get("can_execute"):
+            return "guarded config creation can proceed for .agents/fork-ops.toml."
+        return "config creation is blocked by blocked_steps."
+    if operation == "migration-execution":
+        status = workflow_output.get("status")
+        if status == "applied":
+            return "guarded config creation was applied for .agents/fork-ops.toml."
+        if status == "blocked":
+            return "config creation is blocked by the reported blockers."
+        return "guarded config creation requires verification review."
+    return "Guarded config creation remains subject to migration review."
+
+
+def _blocker_explanations(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    explanations = []
+    for blocker in _blockers_from_output(workflow_output):
+        evidence = _blocker_evidence(workflow_output, blocker)
+        explanations.append(
+            {
+                "code": blocker.get("code"),
+                "message": blocker.get("message"),
+                "summary": _blocker_summary(blocker, evidence),
+                "paths": _string_list(evidence.get("paths")),
+                "migration_map_entries": evidence.get("migration_map_entries", []),
+                "safe_continuations": _safe_continuations_for_blocker(blocker, evidence),
+            }
+        )
+    return explanations
+
+
+def _blockers_from_output(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("blockers", "blocked_steps"):
+        value = workflow_output.get(key)
+        if isinstance(value, list):
+            return [copy.deepcopy(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _select_blocker(
+    workflow_output: dict[str, Any],
+    blocker_code: str | None,
+) -> dict[str, Any]:
+    blockers = _blockers_from_output(workflow_output)
+    if blocker_code:
+        for blocker in blockers:
+            if blocker.get("code") == blocker_code:
+                return copy.deepcopy(blocker)
+        return {
+            "code": blocker_code,
+            "message": "No matching blocker evidence was present in the workflow output.",
+        }
+    if blockers:
+        return copy.deepcopy(blockers[0])
+    return {
+        "code": "blocker.none_found",
+        "message": "No blocker evidence was present in the workflow output.",
+    }
+
+
+def _blocker_evidence(
+    workflow_output: dict[str, Any],
+    blocker: dict[str, Any],
+) -> dict[str, Any]:
+    paths = _string_list(blocker.get("paths"))
+    if not paths:
+        path = blocker.get("path")
+        paths = [path] if isinstance(path, str) and path else []
+    migration_map_entries = []
+    for entry in _optional_dict_list(workflow_output, "migration_map"):
+        source_path = entry.get("source_path")
+        if paths and source_path in paths:
+            migration_map_entries.append(copy.deepcopy(entry))
+    return {
+        "paths": paths,
+        "migration_map_entries": migration_map_entries,
+        "blocker_message": blocker.get("message"),
+    }
+
+
+def _blocker_summary(blocker: dict[str, Any], evidence: dict[str, Any]) -> str:
+    code = blocker.get("code")
+    if code == "semantic_coverage.incomplete":
+        return (
+            "semantic_coverage.incomplete means the deterministic extractor did not "
+            "produce structured facts for the listed source material paths"
+        )
+    if code == "proposed_config_patch.diagnostics_failed":
+        return "the proposed config patch has diagnostics that must be resolved before dry run"
+    if isinstance(blocker.get("message"), str):
+        return str(blocker["message"])
+    if evidence.get("paths"):
+        return "the listed source material paths need review before continuation"
+    return "the requested blocker needs review against the workflow output"
+
+
+def _safe_continuations_for_blocker(
+    blocker: dict[str, Any],
+    evidence: dict[str, Any],
+) -> list[str]:
+    code = blocker.get("code")
+    if code == "semantic_coverage.incomplete":
+        return [
+            "Review the listed source material paths before replacing or removing them",
+            "Keep the listed source material as fork-local authority",
+            "Add structured migration evidence or improve extraction coverage",
+            "Re-run migration plan and dry run after coverage changes",
+        ]
+    if code == "source_material.none_found":
+        return [
+            "Confirm the migration scan scope",
+            "Add or point Fork Ops at fork-local authority source material",
+        ]
+    if code == "proposed_config_patch.diagnostics_failed":
+        return [
+            "Review proposed_config_patch.diagnostics",
+            "Update source material or config proposal inputs before dry run",
+        ]
+    if str(code).startswith("migration_execution."):
+        return [
+            "Keep source material unchanged",
+            "Resolve the execution blocker before retrying migration execution",
+        ]
+    if evidence.get("paths"):
+        return ["Review the listed source material paths before continuing"]
+    return ["Review the workflow output and select a safe next path"]
+
+
+def _safe_continuations(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> list[str]:
+    continuations: list[str] = []
+    for explanation in blocker_explanations:
+        for item in explanation.get("safe_continuations", []):
+            if isinstance(item, str) and item not in continuations:
+                continuations.append(item)
+    for action in _string_list(workflow_output.get("safe_continuations")):
+        if action not in continuations:
+            continuations.append(action)
+    for action in _string_list(workflow_output.get("next_actions")):
+        if action not in continuations:
+            continuations.append(action)
+    return continuations
+
+
+def _narrative_unavailable_work(workflow_output: dict[str, Any]) -> list[str]:
+    operation = workflow_output.get("operation")
+    if operation in {
+        "migration-plan",
+        "migration-dry-run",
+        "migration-execution",
+        "blocker-resolution",
+    }:
+        return list(UNAVAILABLE_MIGRATION_WORK)
+    return []
+
+
+def _narrative_refusal(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    active = (
+        workflow_output.get("operation") == "migration-execution"
+        and workflow_output.get("status") == "blocked"
+    )
+    reason = ""
+    if active:
+        codes = [str(item.get("code")) for item in blocker_explanations if item.get("code")]
+        reason = (
+            "Migration execution refused mutation because "
+            f"{', '.join(codes) if codes else 'blockers'} are present."
+        )
+    return {"active": active, "reason": reason}
+
+
+def _render_narrative_text(
+    title: str,
+    summary: str,
+    sections: list[dict[str, Any]],
+    safe_continuations: list[str],
+    unavailable_work: list[str],
+    refusal: dict[str, Any],
+) -> str:
+    lines = [title, "", summary]
+    if refusal.get("active") and refusal.get("reason"):
+        lines.extend(["", f"refusal: {refusal['reason']}"])
+    for section in sections:
+        heading = section.get("heading")
+        items = section.get("items", [])
+        if not isinstance(heading, str) or not isinstance(items, list):
+            continue
+        lines.extend(["", f"{heading}:"])
+        for item in items:
+            if isinstance(item, str):
+                lines.append(f"- {item}")
+    if safe_continuations:
+        lines.extend(["", "safe continuations:"])
+        lines.extend(f"- {item}" for item in safe_continuations)
+    if unavailable_work:
+        lines.extend(["", "unavailable work:"])
+        for item in unavailable_work:
+            if item == "source-material replacement/removal":
+                lines.append("- source-material replacement/removal is unavailable.")
+            elif item.endswith("s"):
+                lines.append(f"- {item} are unavailable.")
+            else:
+                lines.append(f"- {item} is unavailable.")
+    return "\n".join(lines).rstrip()
+
+
+def _workflow_contract_dict(workflow_id: str) -> dict[str, Any]:
+    for contract in workflow_contracts():
+        if contract.id == workflow_id:
+            return contract.to_dict()
+    return {
+        "id": workflow_id,
+        "title": workflow_id,
+        "available": False,
+        "implementation_status": "unknown",
+    }
+
+
+def _target_surface_label(target_surface: Any) -> str:
+    if not isinstance(target_surface, dict):
+        return "unknown"
+    surface_type = _target_surface_type(target_surface)
+    path = target_surface.get("path")
+    workflow_id = target_surface.get("workflow_id")
+    section = target_surface.get("section")
+    details = []
+    if isinstance(path, str) and path:
+        details.append(path)
+    if isinstance(workflow_id, str) and workflow_id:
+        details.append(workflow_id)
+    if isinstance(section, str) and section:
+        details.append(section)
+    if details:
+        return f"{surface_type} ({', '.join(details)})"
+    return surface_type
+
+
+def _target_surface_type(target_surface: Any) -> str:
+    if isinstance(target_surface, dict) and isinstance(target_surface.get("type"), str):
+        return str(target_surface["type"])
+    return "unknown"
+
+
+def _optional_dict_list(source: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = source.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def _repo_path_mismatch_result(
@@ -1698,7 +2262,7 @@ def _migration_execution_result(
     blockers: list[dict[str, Any]],
     verification_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    return {
+    result = {
         "repo_path": str(repo),
         "mode": "mutating",
         "operation": "migration-execution",
@@ -1726,6 +2290,7 @@ def _migration_execution_result(
         "blockers": blockers,
         "verification_results": verification_results,
     }
+    return _with_migration_narrative(result)
 
 
 def _skipped_preview_edits(preview: dict[str, Any], reason: str) -> list[dict[str, Any]]:

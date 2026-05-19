@@ -20,6 +20,7 @@ from .core import (
     dry_run_migration,
     dry_run_migration_plan,
     execute_migration,
+    explain_migration_blocker,
     generate_migration_plan,
     load_raw_config,
     propose_migration_config_patch,
@@ -128,6 +129,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read an existing migration plan JSON file instead of generating one from --repo.",
     )
     execute.set_defaults(func=cmd_migration_execute)
+    explain_blocker = migration_subcommands.add_parser(
+        "explain-blocker",
+        help="Explain a migration blocker from workflow output JSON.",
+    )
+    explain_blocker.add_argument(
+        "--input",
+        required=True,
+        help="Read workflow output JSON from a file, or '-' for stdin.",
+    )
+    explain_blocker.add_argument(
+        "--blocker-code",
+        help="Explain a specific blocker code from the workflow output.",
+    )
+    explain_blocker.set_defaults(func=cmd_migration_explain_blocker)
     propose = migration_subcommands.add_parser(
         "propose-config",
         help="Generate a non-mutating Fork Ops config proposal.",
@@ -332,6 +347,20 @@ def cmd_migration_execute(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "applied" else 1
 
 
+def cmd_migration_explain_blocker(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            explain_migration_blocker(
+                _read_json_workflow_output(args.input),
+                args.blocker_code,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_migration_propose_config(args: argparse.Namespace) -> int:
     patch = propose_migration_config_patch(args.repo)
     if args.format == "toml":
@@ -425,6 +454,19 @@ def _read_json_plan(path: str) -> dict[str, Any]:
         raise ForkOpsError(f"Migration plan JSON parse failed for {path}: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ForkOpsError("Migration plan JSON must parse to an object.")
+    return parsed
+
+
+def _read_json_workflow_output(path: str) -> dict[str, Any]:
+    try:
+        raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text()
+        parsed = json.loads(raw)
+    except OSError as exc:
+        raise ForkOpsError(f"Workflow output read failed: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ForkOpsError(f"Workflow output JSON parse failed for {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ForkOpsError("Workflow output JSON must parse to an object.")
     return parsed
 
 

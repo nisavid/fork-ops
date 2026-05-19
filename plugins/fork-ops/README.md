@@ -11,8 +11,8 @@ local development checks.
 > schema validation, upstream release-channel and upstream track modeling, live
 > Git ref checks, CLI access, MCP access, workflow migration inventory,
 > read-only migration assessment, migration plans with disposition maps and
-> proposed review artifacts, dry-run, guarded execution, and config proposal
-> generation.
+> proposed review artifacts, dry-run, guarded execution, config proposal
+> generation, operator-readable migration narratives, and blocker explanations.
 > Broad sync mutations, publication closeout, arbitrary migration edits, and
 > source-material removal are designed but not enabled yet.
 
@@ -21,7 +21,7 @@ local development checks.
 - Skill: `skills/fork-ops/SKILL.md`
 - CLI: `uv run --package fork-ops fork-ops ...`
 - Plugin health: `uv run --package fork-ops fork-ops plugin health`
-- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
+- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
 - Schema: `schema/fork-ops.schema.json` and packaged runtime copy `src/fork_ops/fork-ops.schema.json`
 - Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
 
@@ -54,6 +54,7 @@ uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
+uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
 ```
 
 Apply a reviewed, blocker-free migration plan through guarded config creation:
@@ -77,6 +78,7 @@ uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
+uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
 uv run --package fork-ops fork-ops capability report --repo /path/to/configured-fork
 uv run --package fork-ops ruff check --cache-dir .ruff_cache
 uv run --package fork-ops pytest plugins/fork-ops/tests -q

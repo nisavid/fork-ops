@@ -22,7 +22,7 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
 - CLI: `uv run --project ${PLUGIN_ROOT} fork-ops ...`
 - Plugin health: `uv run --project ${PLUGIN_ROOT} fork-ops plugin health`
 - Workflow catalog: `uv run --project ${PLUGIN_ROOT} fork-ops workflow catalog`
-- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_config_patch`, `fork_ops_schema`
+- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, `fork_ops_schema`
 - Schema: `${PLUGIN_ROOT}/schema/fork-ops.schema.json`
 - Operation docs: `${PLUGIN_ROOT}/docs/operation-guide.md`
 
@@ -72,7 +72,13 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
    uv run --project ${PLUGIN_ROOT} fork-ops migration propose-config --repo /path/to/fork --format toml
    ```
 
-8. Treat sync, publication, source-material removal, and arbitrary migration mutations as unavailable unless the config capability level and tool surface explicitly support them.
+8. For a migration blocker, explain the blocker from the workflow output instead of inferring from prose:
+
+   ```bash
+   uv run --project ${PLUGIN_ROOT} fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
+   ```
+
+9. Treat sync, publication, source-material removal, and arbitrary migration mutations as unavailable unless the config capability level and tool surface explicitly support them.
 
 ## Escalation Boundaries
 
@@ -80,4 +86,4 @@ Escalate when fork-local authority is missing, contradictory, or insufficient fo
 
 ## Current Capability
 
-This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and proposed review artifacts, generate dry runs and config proposals, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.
+This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and proposed review artifacts, generate dry runs and config proposals, render operator-readable migration narratives, explain migration blockers, and execute guarded config creation for blocker-free plans. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.

@@ -56,6 +56,7 @@ The plan output separates:
 - deferred removals
 - blockers such as incomplete semantic coverage or config diagnostics
 - required review and validation requirements
+- an operator-readable narrative generated from the same structured evidence
 
 The plan does not edit `.agents/fork-ops.toml` and does not remove source
 materials. It is an input to migration dry run.
@@ -85,8 +86,8 @@ uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-p
 
 The dry-run output reports planned file edits, config changes, migration map
 entries, the proposed review artifact, retained source materials, blocked
-steps, and expected verification commands. It does not edit config, source
-material, or branch state.
+steps, expected verification commands, and an operator-readable narrative. It
+does not edit config, source material, or branch state.
 
 Migration execution applies a blocker-free migration plan through guarded
 operations. When no plan file is supplied, the CLI generates the current plan
@@ -101,9 +102,27 @@ The current execution slice supports creating `.agents/fork-ops.toml` from the
 validated config proposal, preserving retained source materials, reporting the
 migration map and proposed review artifact, and verifying the resulting Fork Ops
 capability level. It returns structured evidence for applied edits, skipped
-preservation steps, blockers, and verification results. It refuses malformed
-plans, plans with blockers, unsupported edit actions, unsafe target paths, and
-config content that fails parse or validation checks.
+preservation steps, blockers, verification results, and narrative refusal
+context. It refuses malformed plans, plans with blockers, unsupported edit
+actions, unsafe target paths, and config content that fails parse or validation
+checks.
+
+Migration outputs include a `narrative` object. The narrative is rendered from
+the structured output and names source paths, dispositions, blockers, retained
+authority, safe continuations, and unavailable work. Treat the structured fields
+as authoritative when writing automation; use the narrative to orient operators.
+
+Use blocker explanation for an existing migration output JSON object:
+
+```bash
+uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
+```
+
+For `semantic_coverage.incomplete`, blocker-resolution output lists the affected
+source material paths, links them back to migration map entries when present,
+explains that deterministic extraction did not produce structured facts, and
+keeps source-material replacement/removal unavailable until coverage is
+reviewed.
 
 ## Migration Lifecycle
 
@@ -113,9 +132,10 @@ config content that fails parse or validation checks.
 4. Migration execution applies a validated plan and verifies the resulting Fork Ops capability level.
 
 The implementation supports migration assessment, non-mutating proposed config
-patch generation, non-mutating migration plan generation, and non-mutating
-migration dry run. Migration execution supports guarded config creation and
-capability verification for blocker-free plans.
+patch generation, non-mutating migration plan generation, non-mutating migration
+dry run, operator-readable migration narratives, and blocker explanations.
+Migration execution supports guarded config creation and capability verification
+for blocker-free plans.
 
 ## Migration Boundaries
 

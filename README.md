@@ -18,8 +18,9 @@ migration, and execute the first guarded config-creation migration slice.
 > **Done:** Codex plugin foundation, `.agents/fork-ops.toml` schema, Python
 > core library, CLI, MCP server, capability reporting, live Git diagnostics,
 > plugin health diagnostics, workflow migration inventory, read-only migration
-> assessment, non-mutating config proposal generation, and migration plan
-> generation, migration dry run, and guarded migration execution.
+> assessment, non-mutating config proposal generation, migration plan
+> generation, migration dry run, guarded migration execution, migration
+> narratives, and blocker explanations.
 >
 > **Planned:** Lemonade onboarding, broader migration edits, source-material
 > removal, and later mutation-capable sync, review, and publication workflows.
@@ -53,8 +54,9 @@ docs, policies, and refs that are authoritative for that fork.
 | Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
 | Plan a reviewed migration | Migration plan generation combines evidence, a migration map with source material dispositions, a proposed review artifact, config patch, retained source material, blockers, and validation requirements without editing files. |
-| Preview a migration plan | Migration dry run reports file edits, config changes, migration map entries, the proposed review artifact, retained materials, blocked steps, and expected verification commands without editing files. |
-| Apply a migration plan | Guarded migration execution creates `.agents/fork-ops.toml` from a blocker-free plan, preserves retained source materials, and verifies capability. |
+| Preview a migration plan | Migration dry run reports file edits, config changes, migration map entries, the proposed review artifact, retained materials, blocked steps, expected verification commands, and narrative guidance without editing files. |
+| Apply a migration plan | Guarded migration execution creates `.agents/fork-ops.toml` from a blocker-free plan, preserves retained source materials, explains refusals, and verifies capability. |
+| Explain a blocker | Blocker resolution explains a migration blocker from workflow output, including source paths, migration map evidence, safe continuations, and unavailable work. |
 | Draft a starting config | Config proposal generation emits review-required TOML without editing the fork. |
 | Validate fork authority | The schema and CLI validate `.agents/fork-ops.toml` for defined capability levels. |
 | See supported operations | Capability reporting combines config state with live Git remote and ref checks. |
@@ -97,6 +99,7 @@ uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
+uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
 ```
 
 ### Inspect a configured fork

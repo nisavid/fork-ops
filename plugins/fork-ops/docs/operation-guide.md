@@ -46,6 +46,7 @@ MCP tools expose the same surface for agents:
 - `fork_ops_migration_plan`
 - `fork_ops_migration_dry_run`
 - `fork_ops_migration_execute`
+- `fork_ops_migration_blocker_resolution`
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
 
@@ -106,10 +107,11 @@ Use `provenance-ready` only when source, artifact, package, runtime, or install-
 The foundation implementation supports guarded migration execution for
 blocker-free plans that create `.agents/fork-ops.toml`, preserve retained source
 materials, report migration map dispositions and proposed review artifact
-content, and verify the resulting capability level. It does not run broad sync
-mutations, PR publication closeout, arbitrary migration edits, or
-source-material removal. Agents should report missing capabilities and provide
-the smallest safe next step.
+content, render operator-readable narratives, explain migration blockers, and
+verify the resulting capability level. It does not run broad sync mutations, PR
+publication closeout, arbitrary migration edits, or source-material removal.
+Agents should report missing capabilities and provide the smallest safe next
+step.
 
 When mutation surfaces exist, they should share core mutation gate logic:
 
