@@ -1442,7 +1442,7 @@ def dry_run_migration_plan(
         "next_actions": [
             "Review file_edits and config_changes against the migration plan evidence.",
             "Review migration_review_artifact before treating retained authority as covered.",
-            "Resolve or explicitly waive blocked_steps before migration execution.",
+            "Resolve or explicitly waive reported dry-run blockers before migration execution.",
             (
                 "Run expected_verification_commands after migration execution applies changes."
             ),
@@ -1542,8 +1542,8 @@ def render_migration_narrative(workflow_output: dict[str, Any]) -> dict[str, Any
     workflow_id = _narrative_workflow_id(operation)
     title = _narrative_title(operation)
     summary = _narrative_summary(workflow_output)
-    sections = _narrative_sections(workflow_output)
     blocker_explanations = _blocker_explanations(workflow_output)
+    sections = _narrative_sections(workflow_output, blocker_explanations)
     safe_continuations = _safe_continuations(workflow_output, blocker_explanations)
     unavailable_work = _narrative_unavailable_work(workflow_output)
     refusal = _narrative_refusal(workflow_output, blocker_explanations)
@@ -1633,16 +1633,19 @@ def _narrative_summary(workflow_output: dict[str, Any]) -> str:
     return "This migration output includes an operator-readable narrative."
 
 
-def _narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+def _narrative_sections(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     operation = workflow_output.get("operation")
     if operation == "migration-assessment":
         return _assessment_narrative_sections(workflow_output)
     if operation == "migration-plan":
-        return _plan_narrative_sections(workflow_output)
+        return _plan_narrative_sections(workflow_output, blocker_explanations)
     if operation == "migration-dry-run":
-        return _dry_run_narrative_sections(workflow_output)
+        return _dry_run_narrative_sections(workflow_output, blocker_explanations)
     if operation == "migration-execution":
-        return _execution_narrative_sections(workflow_output)
+        return _execution_narrative_sections(workflow_output, blocker_explanations)
     if operation == "blocker-resolution":
         return _blocker_resolution_narrative_sections(workflow_output)
     return []
@@ -1666,14 +1669,17 @@ def _assessment_narrative_sections(workflow_output: dict[str, Any]) -> list[dict
     ]
 
 
-def _plan_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+def _plan_narrative_sections(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     sections = [
         {"heading": "migration map", "items": _migration_map_narrative_items(workflow_output)},
         {
             "heading": "retained authority",
             "items": _retained_material_narrative_items(workflow_output),
         },
-        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+        {"heading": "blockers", "items": _blocker_narrative_items(blocker_explanations)},
     ]
     sections.append(
         {
@@ -1684,7 +1690,10 @@ def _plan_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, 
     return sections
 
 
-def _dry_run_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+def _dry_run_narrative_sections(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     edit_items = []
     for edit in _optional_dict_list(workflow_output, "file_edits"):
         edit_items.append(
@@ -1699,11 +1708,14 @@ def _dry_run_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[st
             "heading": "retained authority",
             "items": _retained_material_narrative_items(workflow_output),
         },
-        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+        {"heading": "blockers", "items": _blocker_narrative_items(blocker_explanations)},
     ]
 
 
-def _execution_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
+def _execution_narrative_sections(
+    workflow_output: dict[str, Any],
+    blocker_explanations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     applied = [
         f"{edit.get('action')} {edit.get('path')} ({edit.get('status')})"
         for edit in _optional_dict_list(workflow_output, "applied_edits")
@@ -1716,7 +1728,7 @@ def _execution_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[
         {"heading": "safe config creation", "items": [_safe_config_creation_line(workflow_output)]},
         {"heading": "applied edits", "items": applied or ["No edits were applied."]},
         {"heading": "skipped edits", "items": skipped or ["No edits were skipped."]},
-        {"heading": "blockers", "items": _blocker_narrative_items(workflow_output)},
+        {"heading": "blockers", "items": _blocker_narrative_items(blocker_explanations)},
     ]
 
 
@@ -1781,12 +1793,11 @@ def _retained_material_narrative_items(workflow_output: dict[str, Any]) -> list[
     return items
 
 
-def _blocker_narrative_items(workflow_output: dict[str, Any]) -> list[str]:
-    explanations = _blocker_explanations(workflow_output)
-    if not explanations:
+def _blocker_narrative_items(blocker_explanations: list[dict[str, Any]]) -> list[str]:
+    if not blocker_explanations:
         return ["No blockers are reported."]
     items = []
-    for explanation in explanations:
+    for explanation in blocker_explanations:
         paths = explanation.get("paths", [])
         path_text = f" Paths: {', '.join(paths)}." if paths else ""
         continuations = explanation.get("safe_continuations", [])
@@ -1809,7 +1820,7 @@ def _safe_config_creation_line(workflow_output: dict[str, Any]) -> str:
     if operation == "migration-dry-run":
         if workflow_output.get("can_execute"):
             return "guarded config creation can proceed for .agents/fork-ops.toml."
-        return "config creation is blocked by blocked_steps."
+        return "config creation is blocked by the reported dry-run blockers."
     if operation == "migration-execution":
         status = workflow_output.get("status")
         if status == "applied":
@@ -1975,9 +1986,11 @@ def _narrative_refusal(
     reason = ""
     if active:
         codes = [str(item.get("code")) for item in blocker_explanations if item.get("code")]
+        subject = ", ".join(codes) if codes else "blockers"
+        verb = "is" if len(codes) == 1 else "are"
         reason = (
             "Migration execution refused mutation because "
-            f"{', '.join(codes) if codes else 'blockers'} are present."
+            f"{subject} {verb} present."
         )
     return {"active": active, "reason": reason}
 

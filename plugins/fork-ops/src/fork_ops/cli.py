@@ -445,28 +445,23 @@ def _diagnostics_have_errors(diagnostics: list[dict[str, Any]]) -> bool:
 
 
 def _read_json_plan(path: str) -> dict[str, Any]:
-    try:
-        raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text()
-        parsed = json.loads(raw)
-    except OSError as exc:
-        raise ForkOpsError(f"Migration plan read failed: {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ForkOpsError(f"Migration plan JSON parse failed for {path}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ForkOpsError("Migration plan JSON must parse to an object.")
-    return parsed
+    return _read_json_object(path, "Migration plan")
 
 
 def _read_json_workflow_output(path: str) -> dict[str, Any]:
+    return _read_json_object(path, "Workflow output")
+
+
+def _read_json_object(path: str, label: str) -> dict[str, Any]:
     try:
         raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text()
         parsed = json.loads(raw)
     except OSError as exc:
-        raise ForkOpsError(f"Workflow output read failed: {path}: {exc}") from exc
+        raise ForkOpsError(f"{label} read failed: {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise ForkOpsError(f"Workflow output JSON parse failed for {path}: {exc}") from exc
+        raise ForkOpsError(f"{label} JSON parse failed for {path}: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise ForkOpsError("Workflow output JSON must parse to an object.")
+        raise ForkOpsError(f"{label} JSON must parse to an object.")
     return parsed
 
 
