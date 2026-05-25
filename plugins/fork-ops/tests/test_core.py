@@ -21,6 +21,8 @@ from fork_ops.core import (
     MCP_TOOL_IDS,
     ForkOpsError,
     _default_command_runner,
+    _github_repo_root_slug_from_url,
+    _github_slug_from_url,
     assess_migration,
     build_plugin_health_report,
     build_status_report,
@@ -1151,6 +1153,34 @@ uncertainty_destination = "ask-human-operator"
             patch = propose_migration_config_patch(repo_path)
 
         self.assertEqual(patch["config"]["upstreams"][0]["default_branch"], "trunk")
+
+    def test_github_slug_parsing_requires_github_host(self) -> None:
+        self.assertEqual(
+            _github_slug_from_url("https://github.com/nisavid/lemonade.git"),
+            ("nisavid", "lemonade"),
+        )
+        self.assertEqual(
+            _github_slug_from_url("git@github.com:lemonade-sdk/lemonade.git"),
+            ("lemonade-sdk", "lemonade"),
+        )
+        self.assertEqual(
+            _github_slug_from_url("ssh://git@github.com/lemonade-sdk/lemonade.git"),
+            ("lemonade-sdk", "lemonade"),
+        )
+        self.assertIsNone(_github_slug_from_url("https://example.com/github.com/owner/repo.git"))
+        self.assertIsNone(_github_slug_from_url("https://github.com.example.com/owner/repo.git"))
+
+    def test_github_repo_root_slug_rejects_embedded_github_url(self) -> None:
+        self.assertEqual(
+            _github_repo_root_slug_from_url("https://github.com/nisavid/lemonade.git"),
+            ("nisavid", "lemonade"),
+        )
+        self.assertIsNone(
+            _github_repo_root_slug_from_url("https://example.com/github.com/owner/repo.git")
+        )
+        self.assertIsNone(
+            _github_repo_root_slug_from_url("https://github.com/owner/repo/releases")
+        )
 
     def test_upstream_stable_track_does_not_require_release_channel_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

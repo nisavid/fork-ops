@@ -3755,15 +3755,23 @@ def _find_remote_url(candidates: list[dict[str, Any]], remote_name: str) -> str:
     return ""
 
 
-def _github_slug_from_url(url: str) -> tuple[str, str] | None:
-    if not url:
-        return None
-    normalized = url.removesuffix(".git")
+def _github_path_from_url(url: str) -> str:
+    normalized = url.strip().rstrip("/")
+    if not normalized:
+        return ""
     if normalized.startswith("git@github.com:"):
-        path = normalized.split(":", 1)[1]
-    elif "github.com/" in normalized:
-        path = normalized.split("github.com/", 1)[1]
-    else:
+        return normalized.split(":", 1)[1].removesuffix(".git")
+    parsed = urlparse(normalized)
+    if parsed.hostname != "github.com":
+        return ""
+    if parsed.scheme not in {"git", "http", "https", "ssh"}:
+        return ""
+    return parsed.path.strip("/").removesuffix(".git")
+
+
+def _github_slug_from_url(url: str) -> tuple[str, str] | None:
+    path = _github_path_from_url(url)
+    if not path:
         return None
     parts = path.strip("/").split("/")
     if len(parts) < 2:
@@ -3772,14 +3780,8 @@ def _github_slug_from_url(url: str) -> tuple[str, str] | None:
 
 
 def _github_repo_root_slug_from_url(url: str) -> tuple[str, str] | None:
-    if not url:
-        return None
-    normalized = url.strip().rstrip("/").removesuffix(".git")
-    if normalized.startswith("git@github.com:"):
-        path = normalized.split(":", 1)[1]
-    elif "github.com/" in normalized:
-        path = normalized.split("github.com/", 1)[1]
-    else:
+    path = _github_path_from_url(url)
+    if not path:
         return None
     parts = path.strip("/").split("/")
     if len(parts) != 2:
