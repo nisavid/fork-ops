@@ -14,6 +14,7 @@ from .core import (
     CONFIG_RELATIVE_PATH,
     ForkOpsError,
     assess_migration,
+    build_equipment_migration_preflight,
     build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
@@ -119,6 +120,15 @@ def fork_ops_migration_assessment(
 ) -> dict[str, Any]:
     """Run a read-only migration assessment for fork-related materials."""
     return assess_migration(repo_path, include_proposed_config_patch=include_proposed_config_patch)
+
+
+@_tool
+def fork_ops_equipment_migration_preflight(
+    repo_path: str = ".",
+    source_roots: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a read-only equipment migration preflight for onboarding."""
+    return build_equipment_migration_preflight(repo_path, source_roots)
 
 
 @_tool

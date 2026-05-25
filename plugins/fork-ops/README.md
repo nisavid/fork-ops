@@ -10,18 +10,20 @@ local development checks.
 > The foundation version targets `track-aware`. It supports config discovery,
 > schema validation, upstream release-channel and upstream track modeling, live
 > Git ref checks, CLI access, MCP access, workflow migration inventory,
-> read-only migration assessment, migration plans with disposition maps and
-> proposed review artifacts, dry-run, guarded execution, config proposal
-> generation, operator-readable migration narratives, and blocker explanations.
-> Broad sync mutations, publication closeout, arbitrary migration edits, and
-> source-material removal are designed but not enabled yet.
+> read-only migration assessment, equipment migration preflight, migration plans
+> with disposition maps, proposed review artifacts, proposed equipment review
+> records, activation-readiness reports, dry-run, guarded execution, config
+> proposal generation, operator-readable migration narratives, and blocker
+> explanations. Broad sync mutations, publication closeout, arbitrary migration
+> edits, equipment edits, equipment disabling, and source-material removal are
+> designed but not enabled yet.
 
 ## Surfaces
 
 - Skill: `skills/fork-ops/SKILL.md`
 - CLI: `uv run --package fork-ops fork-ops ...`
 - Plugin health: `uv run --package fork-ops fork-ops plugin health`
-- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
+- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_equipment_migration_preflight`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
 - Schema: `schema/fork-ops.schema.json` and packaged runtime copy `src/fork_ops/fork-ops.schema.json`
 - Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
 
@@ -51,6 +53,7 @@ Assess existing fork-related materials without editing the fork:
 
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
@@ -75,6 +78,7 @@ uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/sou
 uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork

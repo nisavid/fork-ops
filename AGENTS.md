@@ -44,14 +44,18 @@ The merged foundation supports:
   roots, with catalog evidence references and backlog candidates.
 - Read-only migration assessment, non-mutating config proposal generation, and
   non-mutating migration plan generation.
-- Non-mutating migration dry run for migration plan previews.
+- Read-only equipment migration preflight for repo-local materials and
+  operator-provided source roots, with proposed TOML equipment review records
+  and unassessed-area reporting.
+- Non-mutating migration dry run for migration plan previews, including
+  activation-readiness and replayable wet-run metadata.
 - Guarded migration execution for blocker-free plans that create
   `.agents/fork-ops.toml`, preserve retained source materials, and verify the
   resulting capability level.
 
 Do not describe broad upstream sync, publication closeout, source-material
-removal, or arbitrary migration edits as implemented. They are planned
-follow-up work.
+removal, equipment edits, equipment disabling, or arbitrary migration edits as
+implemented. They are planned follow-up work.
 
 ## Source Map
 

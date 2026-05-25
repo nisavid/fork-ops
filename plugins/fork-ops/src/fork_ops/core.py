@@ -32,6 +32,7 @@ MCP_TOOL_IDS = (
     "fork_ops_config_validate",
     "fork_ops_capability_report",
     "fork_ops_migration_assessment",
+    "fork_ops_equipment_migration_preflight",
     "fork_ops_migration_plan",
     "fork_ops_migration_dry_run",
     "fork_ops_migration_execute",
@@ -146,6 +147,20 @@ SOURCE_MATERIAL_REVIEW_DECISION_TYPES = (
     "unsupported-extractor",
 )
 MIGRATION_REVIEW_ARTIFACT_RELATIVE_PATH = "docs/agents/fork-ops-migration-review.md"
+EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH = "docs/agents/fork-ops-equipment-review.toml"
+EQUIPMENT_DISPOSITION_TYPES = (
+    "migrate_to_fork_ops",
+    "retain_authoritative_owner",
+    "defer_to_follow_up",
+    "ignore",
+    "decide_item_by_item",
+)
+EQUIPMENT_DECISION_STATUS_TYPES = (
+    "proposed",
+    "pending_operator_decision",
+    "reviewed",
+    "superseded",
+)
 UNAVAILABLE_MIGRATION_WORK = (
     "source-material replacement/removal",
     "arbitrary migration edits",
@@ -1009,11 +1024,13 @@ def build_status_report(
                 path=str(CONFIG_RELATIVE_PATH),
             )
         )
+        capability = capability_report({}, diagnostics)
+        capability["equipment_review"] = _equipment_review_record_report(repo)
         return {
             "repo_path": str(repo),
             "config_path": str(config_file),
             "config_exists": False,
-            "capability": capability_report({}, diagnostics),
+            "capability": capability,
             "diagnostics": [item.to_dict() for item in diagnostics],
         }
 
@@ -1028,11 +1045,13 @@ def build_status_report(
                 path=str(CONFIG_RELATIVE_PATH),
             )
         )
+        capability = capability_report({}, diagnostics)
+        capability["equipment_review"] = _equipment_review_record_report(repo)
         return {
             "repo_path": str(repo),
             "config_path": str(config_file),
             "config_exists": True,
-            "capability": capability_report({}, diagnostics),
+            "capability": capability,
             "diagnostics": [item.to_dict() for item in diagnostics],
         }
 
@@ -1040,6 +1059,7 @@ def build_status_report(
     diagnostics.extend(schema_diagnostics(normalized))
     diagnostics.extend(reference_diagnostics(normalized))
     diagnostics.extend(git_diagnostics(repo, normalized))
+    equipment_review = _equipment_review_record_report(repo)
 
     payload: dict[str, Any] = {
         "repo_path": str(repo),
@@ -1049,6 +1069,7 @@ def build_status_report(
         "capability": capability_report(normalized, diagnostics),
         "diagnostics": [item.to_dict() for item in diagnostics],
     }
+    payload["capability"]["equipment_review"] = equipment_review
     if include_config:
         payload["config"] = _json_safe(normalized)
     return payload
@@ -1283,21 +1304,43 @@ def generate_migration_plan(
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     migration_review_artifact = _migration_review_artifact(migration_map)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
+    equipment_preflight = _equipment_migration_preflight(
+        repo,
+        migration_candidates,
+        migration_map,
+        blockers,
+        source_roots=None,
+        workflow_inventory=None,
+    )
+    equipment_review_record = _equipment_review_record(equipment_preflight)
     plan = {
         "repo_path": str(repo),
         "mode": "non-mutating",
         "operation": "migration-plan",
         "requires_review": True,
+        "workflow_run_mode": _migration_workflow_run_mode(),
         "source_material_disposition_types": list(SOURCE_MATERIAL_DISPOSITION_TYPES),
+        "equipment_disposition_types": list(EQUIPMENT_DISPOSITION_TYPES),
         "summary": {
             "candidate_count": len(migration_candidates),
             "evidence_source_count": len(evidence),
             "migration_map_entry_count": len(migration_map),
             "review_artifact_entry_count": len(migration_review_artifact["entries"]),
+            "equipment_group_count": len(equipment_preflight["equipment_groups"]),
+            "unassessed_equipment_area_count": len(
+                equipment_preflight["unassessed_equipment_areas"]
+            ),
             "retained_source_material_count": len(retained_source_materials),
             "blocker_count": len(blockers),
             "semantic_coverage": _semantic_coverage_status(blockers),
         },
+        "equipment_migration_preflight": equipment_preflight,
+        "equipment_review_record": equipment_review_record,
+        "activation_readiness": _activation_readiness_report(
+            migration_map,
+            blockers,
+            equipment_preflight,
+        ),
         "evidence": evidence,
         "migration_map": migration_map,
         "migration_review_artifact": migration_review_artifact,
@@ -1320,6 +1363,34 @@ def generate_migration_plan(
         ],
     }
     return _with_migration_narrative(plan)
+
+
+def build_equipment_migration_preflight(
+    repo_path: str | Path = ".",
+    source_roots: Iterable[str | Path] | str | Path | None = None,
+) -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    migration_candidates = _migration_candidates(repo)
+    proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
+    migration_map = _migration_map(migration_candidates, proposed_config_patch)
+    blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
+    roots = _normalize_equipment_source_roots(source_roots)
+    workflow_inventory = build_workflow_migration_inventory(roots) if roots else None
+    preflight = _equipment_migration_preflight(
+        repo,
+        migration_candidates,
+        migration_map,
+        blockers,
+        source_roots=roots,
+        workflow_inventory=workflow_inventory,
+    )
+    preflight["equipment_review_record"] = _equipment_review_record(preflight)
+    preflight["activation_readiness"] = _activation_readiness_report(
+        migration_map,
+        blockers,
+        preflight,
+    )
+    return preflight
 
 
 def build_workflow_migration_inventory(
@@ -1392,10 +1463,20 @@ def dry_run_migration_plan(
     config_changes = _dry_run_config_changes(proposed_config_patch)
     migration_map = _require_plan_list(plan, "migration_map")
     migration_review_artifact = _require_migration_review_artifact(plan)
+    equipment_review_record = _optional_plan_dict(plan, "equipment_review_record")
+    equipment_preflight = _optional_plan_dict(plan, "equipment_migration_preflight")
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
-    retained_authority = _retained_authority(retained_materials, migration_review_artifact)
-    blocked_steps = _dry_run_blocked_steps(plan, migration_review_artifact)
+    retained_authority = _retained_authority(
+        retained_materials,
+        migration_review_artifact,
+        equipment_review_record,
+    )
+    blocked_steps = _dry_run_blocked_steps(
+        plan,
+        migration_review_artifact,
+        equipment_review_record,
+    )
     blocked_steps.extend(_proposed_config_patch_consistency_blockers(proposed_config_patch))
     blocked_steps.extend(
         _migration_execution_blockers(
@@ -1418,11 +1499,19 @@ def dry_run_migration_plan(
         )
     else:
         blocked_steps.extend(_validation_requirement_blockers(expected_verification_commands))
+    activation_readiness = _activation_readiness_report(
+        migration_map,
+        blocked_steps,
+        equipment_preflight,
+    )
     dry_run = {
         "repo_path": normalized_repo_path,
         "mode": "non-mutating",
         "operation": "migration-dry-run",
         "plan_operation": plan.get("operation"),
+        "workflow_run_mode": copy.deepcopy(
+            plan.get("workflow_run_mode", _migration_workflow_run_mode())
+        ),
         "can_execute": not blocked_steps,
         "summary": {
             "file_edit_count": len(file_edits),
@@ -1438,6 +1527,10 @@ def dry_run_migration_plan(
         "file_edits": file_edits,
         "config_changes": config_changes,
         "migration_map": migration_map,
+        "equipment_migration_preflight": equipment_preflight,
+        "equipment_review_record": equipment_review_record,
+        "activation_readiness": activation_readiness,
+        "replayable_wet_run": _replayable_wet_run(plan, blocked_steps),
         "migration_review_artifact": migration_review_artifact,
         "retained_materials": retained_materials,
         "retained_authority": retained_authority,
@@ -2224,9 +2317,13 @@ def _proposed_config_patch_consistency_blockers(
 def _dry_run_blocked_steps(
     plan: dict[str, Any],
     migration_review_artifact: dict[str, Any],
+    equipment_review_record: dict[str, Any],
 ) -> list[dict[str, Any]]:
     blocked_steps: list[dict[str, Any]] = []
-    reviewed_retained_paths = _reviewed_retained_source_paths(migration_review_artifact)
+    reviewed_retained_paths = _reviewed_retained_source_paths(
+        migration_review_artifact,
+        equipment_review_record,
+    )
     for blocker in _require_plan_list(plan, "blockers"):
         if _blocker_resolved_by_reviewed_retain(blocker, reviewed_retained_paths):
             continue
@@ -2261,6 +2358,15 @@ def _require_plan_dict(plan: dict[str, Any], key: str) -> dict[str, Any]:
     if key not in plan:
         raise ForkOpsError(f"Migration dry run input is missing {key}.")
     value = plan[key]
+    if not isinstance(value, dict):
+        raise ForkOpsError(f"Migration dry run input has malformed {key}.")
+    return copy.deepcopy(value)
+
+
+def _optional_plan_dict(plan: dict[str, Any], key: str) -> dict[str, Any]:
+    value = plan.get(key, {})
+    if value is None:
+        return {}
     if not isinstance(value, dict):
         raise ForkOpsError(f"Migration dry run input has malformed {key}.")
     return copy.deepcopy(value)
@@ -2331,12 +2437,29 @@ def _migration_execution_result(
                     _optional_preview_dict(preview, "migration_review_artifact")
                 )
             ),
+            "equipment_group_count": len(
+                _optional_preview_list(
+                    _optional_preview_dict(preview, "equipment_migration_preflight"),
+                    "equipment_groups",
+                )
+            ),
             "blocker_count": len(blockers),
             "verification_result_count": len(verification_results),
         },
         "applied_edits": applied_edits,
         "skipped_edits": skipped_edits,
         "migration_map": _optional_preview_list(preview, "migration_map"),
+        "equipment_migration_preflight": _optional_preview_dict(
+            preview,
+            "equipment_migration_preflight",
+        ),
+        "equipment_review_record": _optional_preview_dict(
+            preview,
+            "equipment_review_record",
+        ),
+        "activation_readiness": _optional_preview_dict(preview, "activation_readiness"),
+        "workflow_run_mode": _optional_preview_dict(preview, "workflow_run_mode"),
+        "replayable_wet_run": _optional_preview_dict(preview, "replayable_wet_run"),
         "retained_materials": _optional_preview_list(preview, "retained_materials"),
         "retained_authority": _optional_preview_list(preview, "retained_authority"),
         "deferred_removals": _optional_preview_list(preview, "deferred_removals"),
@@ -3063,6 +3186,750 @@ def _review_decision_markdown_lines(review_decision: Any) -> list[str]:
     return lines
 
 
+def _normalize_equipment_source_roots(
+    source_roots: Iterable[str | Path] | str | Path | None,
+) -> list[Path]:
+    if source_roots is None:
+        return []
+    if isinstance(source_roots, str | Path):
+        raw_roots: Iterable[str | Path] = [source_roots]
+    else:
+        raw_roots = source_roots
+    return [Path(root).expanduser().resolve() for root in raw_roots]
+
+
+def _equipment_migration_preflight(
+    repo: Path,
+    candidates: list[dict[str, Any]],
+    migration_map: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    *,
+    source_roots: list[Path] | None,
+    workflow_inventory: dict[str, Any] | None,
+) -> dict[str, Any]:
+    map_by_path = {entry["source_path"]: entry for entry in migration_map}
+    groups = [
+        _repo_candidate_equipment_group(repo, candidate, map_by_path[candidate["path"]])
+        for candidate in candidates
+    ]
+    if workflow_inventory:
+        groups.extend(_workflow_inventory_equipment_groups(workflow_inventory))
+    groups.sort(
+        key=lambda item: (
+            item["source_scope"],
+            item["source_root"],
+            item["source_path"],
+            item["id"],
+        )
+    )
+    evidence_entries = _equipment_evidence_entries(groups)
+    discovery_scopes = _equipment_discovery_scopes(
+        repo,
+        source_roots or [],
+        candidates,
+        workflow_inventory,
+    )
+    unassessed_areas = _unassessed_equipment_areas(
+        source_roots or [],
+        workflow_inventory,
+        blockers,
+    )
+    return {
+        "operation": "equipment-migration-preflight",
+        "mode": "read-only",
+        "default_onboarding_intent": "migrate_toward_fork_ops",
+        "discovery_scopes": discovery_scopes,
+        "unassessed_equipment_areas": unassessed_areas,
+        "summary": {
+            "discovery_scope_count": len(discovery_scopes),
+            "equipment_group_count": len(groups),
+            "evidence_entry_count": len(evidence_entries),
+            "unassessed_equipment_area_count": len(unassessed_areas),
+            "default_onboarding_intent": "migrate_toward_fork_ops",
+        },
+        "equipment_groups": groups,
+        "evidence": evidence_entries,
+        "operator_prompts": _equipment_operator_prompts(groups, unassessed_areas),
+        "limitations": [
+            "Installed or checked-in equipment is not treated as current operator intent.",
+            "Group-level dispositions guide review but do not activate overlapping behavior.",
+            "Unassessed equipment areas limit activation-readiness and replacement claims.",
+        ],
+    }
+
+
+def _repo_candidate_equipment_group(
+    repo: Path,
+    candidate: dict[str, Any],
+    migration_entry: dict[str, Any],
+) -> dict[str, Any]:
+    source_path = candidate["path"]
+    evidence_id = _equipment_evidence_id("repo-local", source_path)
+    disposition = _equipment_disposition_from_source_disposition(
+        migration_entry["disposition"]["type"]
+    )
+    return {
+        "id": _equipment_group_id("repo-local", source_path),
+        "identifier": f"repo-local:{source_path}",
+        "source_scope": "repo-local",
+        "source_root": str(repo),
+        "source_path": source_path,
+        "source_kind": candidate["kind"],
+        "content_sha256": candidate["content_sha256"],
+        "equipment_classification": _repo_equipment_classification(candidate, migration_entry),
+        "classification_confidence": _equipment_classification_confidence(
+            candidate,
+            migration_entry,
+        ),
+        "disposition": disposition,
+        "decision_status": _equipment_decision_status(disposition),
+        "activation_impact": _equipment_activation_impact(disposition),
+        "evidence_ids": [evidence_id],
+        "facets": [
+            {
+                "id": f"{_equipment_group_id('repo-local', source_path)}:facet:source-material",
+                "kind": "source-material",
+                "domains": list(candidate["domains"]),
+                "signals": list(candidate["signals"]),
+                "source_material_disposition": migration_entry["disposition"]["type"],
+                "equipment_disposition": disposition,
+            }
+        ],
+        "compatibility_entries": [],
+    }
+
+
+def _workflow_inventory_equipment_groups(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for entry in inventory.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        source_root = str(entry.get("source_root", ""))
+        source_path = str(entry.get("source_path", ""))
+        if not source_root or not source_path:
+            continue
+        scope = "operator-source-root"
+        evidence_id = _equipment_evidence_id(scope, f"{source_root}:{source_path}")
+        coverage_status = str(entry.get("coverage_status", "unknown"))
+        disposition = _equipment_disposition_from_workflow_coverage(coverage_status)
+        groups.append(
+            {
+                "id": _equipment_group_id(scope, f"{source_root}:{source_path}"),
+                "identifier": f"{scope}:{source_root}:{source_path}",
+                "source_scope": scope,
+                "source_root": source_root,
+                "source_path": source_path,
+                "source_kind": str(entry.get("source_kind", "unknown")),
+                "content_sha256": str(entry.get("content_sha256", "")),
+                "equipment_classification": _workflow_equipment_classification(entry),
+                "classification_confidence": "medium",
+                "disposition": disposition,
+                "decision_status": _equipment_decision_status(disposition),
+                "activation_impact": _equipment_activation_impact(disposition),
+                "evidence_ids": [evidence_id],
+                "facets": [
+                    {
+                        "id": (
+                            f"{_equipment_group_id(scope, f'{source_root}:{source_path}')}"
+                            ":facet:workflow-material"
+                        ),
+                        "kind": "workflow-material",
+                        "material_scope": entry.get("material_scope"),
+                        "likely_workflow_catalog_target": entry.get(
+                            "likely_workflow_catalog_target"
+                        ),
+                        "coverage_status": coverage_status,
+                        "equipment_disposition": disposition,
+                    }
+                ],
+                "compatibility_entries": _consumer_compatibility_entries(entry),
+            }
+        )
+    return groups
+
+
+def _equipment_evidence_entries(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for group in groups:
+        evidence_id = group["evidence_ids"][0]
+        evidence.append(
+            {
+                "id": evidence_id,
+                "equipment_id": group["id"],
+                "source_scope": group["source_scope"],
+                "source_root": group["source_root"],
+                "source_path": group["source_path"],
+                "source_kind": group["source_kind"],
+                "content_sha256": group.get("content_sha256", ""),
+                "basis": "equipment migration discovery",
+            }
+        )
+    return evidence
+
+
+def _equipment_discovery_scopes(
+    repo: Path,
+    source_roots: list[Path],
+    candidates: list[dict[str, Any]],
+    workflow_inventory: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    scopes = [
+        {
+            "id": "scope:repo-local",
+            "kind": "repo-local",
+            "path": str(repo),
+            "status": "scanned",
+            "equipment_group_count": len(candidates),
+        }
+    ]
+    inventory_entries = workflow_inventory.get("entries", []) if workflow_inventory else []
+    unresolvable = set(
+        workflow_inventory.get("unresolvable_source_roots", []) if workflow_inventory else []
+    )
+    for root in source_roots:
+        root_text = str(root)
+        entry_count = len(
+            [
+                entry
+                for entry in inventory_entries
+                if isinstance(entry, dict) and entry.get("source_root") == root_text
+            ]
+        )
+        scopes.append(
+            {
+                "id": _equipment_scope_id(root_text),
+                "kind": "operator-source-root",
+                "path": root_text,
+                "status": "unresolvable" if root_text in unresolvable else "scanned",
+                "equipment_group_count": entry_count,
+            }
+        )
+    return scopes
+
+
+def _unassessed_equipment_areas(
+    source_roots: list[Path],
+    workflow_inventory: dict[str, Any] | None,
+    blockers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    areas: list[dict[str, Any]] = []
+    if not source_roots:
+        areas.append(
+            {
+                "id": "unassessed:user-global-equipment",
+                "scope": "user-global",
+                "reason": "No operator-provided global or user equipment source root was scanned.",
+                "activation_impact": (
+                    "Do not claim replacement coverage for global or user equipment."
+                ),
+            }
+        )
+    if workflow_inventory:
+        for root in workflow_inventory.get("unresolvable_source_roots", []):
+            areas.append(
+                {
+                    "id": f"unassessed:{_short_digest(str(root))}",
+                    "scope": "operator-source-root",
+                    "path": str(root),
+                    "reason": "The operator-provided source root could not be resolved.",
+                    "activation_impact": "Treat this source root as not reviewed.",
+                }
+            )
+    for blocker in blockers:
+        if blocker.get("code") != "semantic_coverage.incomplete":
+            continue
+        for path in _string_list(blocker.get("paths")):
+            areas.append(
+                {
+                    "id": f"unassessed:semantic-coverage:{_short_digest(path)}",
+                    "scope": "repo-local",
+                    "path": path,
+                    "reason": "Deterministic extraction did not prove semantic coverage.",
+                    "activation_impact": (
+                        "Keep replacement and source-material removal unavailable."
+                    ),
+                }
+            )
+    return areas
+
+
+def _equipment_operator_prompts(
+    groups: list[dict[str, Any]],
+    unassessed_areas: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prompts: list[dict[str, Any]] = [
+        {
+            "id": "onboarding-intent",
+            "status": "recommended-default",
+            "recommended": "migrate_toward_fork_ops",
+            "message": (
+                "Confirm overall onboarding intent before resolving per-equipment "
+                "dispositions."
+            ),
+        }
+    ]
+    if any(group["decision_status"] == "pending_operator_decision" for group in groups):
+        prompts.append(
+            {
+                "id": "equipment-dispositions",
+                "status": "required",
+                "message": "Review pending equipment dispositions item by item.",
+            }
+        )
+    if unassessed_areas:
+        prompts.append(
+            {
+                "id": "unassessed-equipment-areas",
+                "status": "required-before-replacement-coverage",
+                "message": "Scan, accept risk for, or keep limits for unassessed areas.",
+            }
+        )
+    return prompts
+
+
+def _equipment_review_record(preflight: dict[str, Any]) -> dict[str, Any]:
+    entries = [
+        _equipment_review_record_entry(group) for group in preflight["equipment_groups"]
+    ]
+    record = {
+        "artifact_kind": "equipment_review",
+        "schema_version": "0.1",
+        "status": "proposed",
+        "target_path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+        "content_kind": "equipment-review-record",
+        "default_onboarding_intent": preflight["default_onboarding_intent"],
+        "equipment_disposition_types": list(EQUIPMENT_DISPOSITION_TYPES),
+        "equipment_decision_status_types": list(EQUIPMENT_DECISION_STATUS_TYPES),
+        "review_freshness_policy": (
+            "revalidate when source hashes, discovery scopes, or activation gates change"
+        ),
+        "discovery_scopes": copy.deepcopy(preflight["discovery_scopes"]),
+        "unassessed_equipment_areas": copy.deepcopy(preflight["unassessed_equipment_areas"]),
+        "evidence": copy.deepcopy(preflight["evidence"]),
+        "equipment": entries,
+    }
+    record["toml"] = _equipment_review_record_toml(record)
+    return record
+
+
+def _equipment_review_record_entry(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"{group['id']}:decision",
+        "equipment_id": group["id"],
+        "identifier": group["identifier"],
+        "source_scope": group["source_scope"],
+        "source_root": group["source_root"],
+        "source_path": group["source_path"],
+        "source_kind": group["source_kind"],
+        "content_sha256": group.get("content_sha256", ""),
+        "equipment_classification": group["equipment_classification"],
+        "classification_confidence": group["classification_confidence"],
+        "disposition": group["disposition"],
+        "decision_status": group["decision_status"],
+        "activation_impact": group["activation_impact"],
+        "evidence_ids": list(group["evidence_ids"]),
+        "reason_recommended": _equipment_disposition_reason(group),
+    }
+
+
+def _equipment_review_record_toml(record: dict[str, Any]) -> str:
+    toml_payload = {
+        "artifact_kind": record["artifact_kind"],
+        "schema_version": record["schema_version"],
+        "status": record["status"],
+        "default_onboarding_intent": record["default_onboarding_intent"],
+        "review_freshness_policy": record["review_freshness_policy"],
+        "equipment_disposition_types": record["equipment_disposition_types"],
+        "equipment_decision_status_types": record["equipment_decision_status_types"],
+        "discovery_scopes": record["discovery_scopes"],
+        "unassessed_equipment_areas": record["unassessed_equipment_areas"],
+        "evidence": record["evidence"],
+        "equipment": record["equipment"],
+    }
+    return _toml_dumps(toml_payload)
+
+
+def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
+    path = repo / EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH
+    if not path.exists():
+        return {
+            "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+            "exists": False,
+            "valid": False,
+            "activation_readiness": "not_assessed",
+            "replacement_coverage_ready": False,
+            "retained_authority_paths": [],
+            "pending_decision_count": 0,
+            "unassessed_equipment_area_count": 0,
+        }
+    try:
+        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return {
+            "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+            "exists": True,
+            "valid": False,
+            "error": str(exc),
+            "activation_readiness": "equipment_review_invalid",
+            "replacement_coverage_ready": False,
+            "retained_authority_paths": [],
+            "pending_decision_count": 0,
+            "unassessed_equipment_area_count": 0,
+        }
+    if parsed.get("artifact_kind") != "equipment_review":
+        return {
+            "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+            "exists": True,
+            "valid": False,
+            "error": "artifact_kind must be equipment_review",
+            "activation_readiness": "equipment_review_invalid",
+            "replacement_coverage_ready": False,
+            "retained_authority_paths": [],
+            "pending_decision_count": 0,
+            "unassessed_equipment_area_count": 0,
+        }
+    malformed_section = _malformed_record_section(parsed, "equipment")
+    if malformed_section is None:
+        malformed_section = _malformed_record_section(parsed, "unassessed_equipment_areas")
+    if malformed_section is not None:
+        return {
+            "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+            "exists": True,
+            "valid": False,
+            "error": f"{malformed_section} must be a TOML array of tables",
+            "activation_readiness": "equipment_review_invalid",
+            "replacement_coverage_ready": False,
+            "retained_authority_paths": [],
+            "pending_decision_count": 0,
+            "unassessed_equipment_area_count": 0,
+        }
+    equipment_entries = _record_table_list(parsed.get("equipment"))
+    unassessed_areas = _record_table_list(parsed.get("unassessed_equipment_areas"))
+    reviewed_retained = [
+        entry["source_path"]
+        for entry in equipment_entries
+        if entry.get("decision_status") == "reviewed"
+        and entry.get("disposition") == "retain_authoritative_owner"
+        and isinstance(entry.get("source_path"), str)
+    ]
+    pending_count = len(
+        [
+            entry
+            for entry in equipment_entries
+            if entry.get("decision_status") in {"pending_operator_decision", "proposed"}
+        ]
+    )
+    if pending_count:
+        activation = "pending_equipment_review"
+    elif unassessed_areas:
+        activation = "ready_for_guarded_config_creation_with_limits"
+    else:
+        activation = "ready_for_guarded_config_creation"
+    return {
+        "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+        "exists": True,
+        "valid": True,
+        "artifact_kind": parsed.get("artifact_kind"),
+        "schema_version": parsed.get("schema_version"),
+        "activation_readiness": activation,
+        "replacement_coverage_ready": False,
+        "equipment_count": len(equipment_entries),
+        "reviewed_equipment_count": len(
+            [entry for entry in equipment_entries if entry.get("decision_status") == "reviewed"]
+        ),
+        "pending_decision_count": pending_count,
+        "unassessed_equipment_area_count": len(unassessed_areas),
+        "retained_authority_paths": reviewed_retained,
+    }
+
+
+def _record_table_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _malformed_record_section(record: dict[str, Any], key: str) -> str | None:
+    value = record.get(key, [])
+    if value in (None, []):
+        return None
+    if not isinstance(value, list):
+        return key
+    if any(not isinstance(item, dict) for item in value):
+        return key
+    return None
+
+
+def _activation_readiness_report(
+    migration_map: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    blocker_codes = _blocker_codes(blockers)
+    unassessed_areas = preflight.get("unassessed_equipment_areas", [])
+    can_create_config = not blockers
+    coverage_entries = [
+        _replacement_coverage_entry(entry, preflight) for entry in migration_map
+    ]
+    # Replacement-equivalence verification is not implemented in this slice.
+    replacement_ready = False
+    if blockers:
+        readiness = "blocked"
+    elif unassessed_areas:
+        readiness = "ready_for_guarded_config_creation_with_limits"
+    else:
+        readiness = "ready_for_guarded_config_creation"
+    return {
+        "operation": "activation-readiness-report",
+        "workflow_id": "fork-authority-migration",
+        "activation_readiness": readiness,
+        "config_creation_ready": can_create_config,
+        "replacement_coverage_ready": replacement_ready,
+        "operational_continuity": "retained_authority_preserved",
+        "shadow_mode_available": True,
+        "advisory_mode_available": True,
+        "blocked_by": blocker_codes,
+        "unassessed_equipment_area_count": len(unassessed_areas),
+        "covered_behaviors": coverage_entries,
+        "limits": _activation_readiness_limits(blockers, unassessed_areas),
+    }
+
+
+def _replacement_coverage_entry(
+    migration_entry: dict[str, Any],
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    disposition = migration_entry["disposition"]["type"]
+    source_path = migration_entry["source_path"]
+    group = _equipment_group_for_migration_entry(preflight, migration_entry)
+    if disposition == "extracted_into_config" and not preflight.get(
+        "unassessed_equipment_areas"
+    ):
+        coverage = "config_modeled_not_replacement_verified"
+    elif disposition == "extracted_into_config":
+        coverage = "limited_by_unassessed_equipment"
+    elif disposition in {"retained_as_fork_local_authority", "mapped_to_workflow_backlog"}:
+        coverage = "retained_owner_required"
+    elif disposition == "irrelevant_to_fork_ops":
+        coverage = "not_applicable"
+    else:
+        coverage = "blocked"
+    return {
+        "source_path": source_path,
+        "source_material_disposition": disposition,
+        "equipment_id": group.get("id") if group else "",
+        "replacement_coverage": coverage,
+        "activation_mode": _activation_mode_for_coverage(coverage),
+    }
+
+
+def _equipment_group_for_migration_entry(
+    preflight: dict[str, Any],
+    migration_entry: dict[str, Any],
+) -> dict[str, Any]:
+    source_path = migration_entry.get("source_path")
+    if not isinstance(source_path, str):
+        return {}
+    for group in preflight.get("equipment_groups", []):
+        if (
+            isinstance(group, dict)
+            and group.get("source_scope") == "repo-local"
+            and group.get("source_path") == source_path
+        ):
+            return group
+    return {}
+
+
+def _activation_mode_for_coverage(coverage: str) -> str:
+    if coverage == "config_modeled_not_replacement_verified":
+        return "guarded_config_creation"
+    if coverage == "limited_by_unassessed_equipment":
+        return "advisory_mode"
+    if coverage == "retained_owner_required":
+        return "operational_continuity_by_retained_owner"
+    if coverage == "not_applicable":
+        return "ignored"
+    return "blocked"
+
+
+def _activation_readiness_limits(
+    blockers: list[dict[str, Any]],
+    unassessed_areas: list[dict[str, Any]],
+) -> list[str]:
+    limits: list[str] = []
+    if blockers:
+        limits.append("Resolve blockers before guarded config creation.")
+    if unassessed_areas:
+        limits.append("Do not activate overlapping replacement behavior for unassessed areas.")
+    limits.append("Do not remove retained source material until replacement coverage validates.")
+    return limits
+
+
+def _migration_workflow_run_mode() -> dict[str, Any]:
+    return {
+        "default": "dry-run",
+        "available": ["dry-run", "wet-run"],
+        "wet_run_policy": "replay_reviewed_dry_run",
+        "drift_policy": "fail_closed_by_default",
+        "override_policy": (
+            "Operator overrides do not bypass mutation gates, authority checks, "
+            "or unresolved human decisions."
+        ),
+    }
+
+
+def _replayable_wet_run(
+    plan: dict[str, Any],
+    blocked_steps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "available": not blocked_steps,
+        "plan_fingerprint": _migration_plan_fingerprint(plan),
+        "requires_drift_check": True,
+        "drift_policy": "fail_closed_by_default",
+        "replay_scope": "guarded_config_creation",
+        "blocked_by": _blocker_codes(blocked_steps),
+    }
+
+
+def _migration_plan_fingerprint(plan: dict[str, Any]) -> str:
+    stable_plan = {
+        key: value
+        for key, value in plan.items()
+        if key != "narrative"
+    }
+    encoded = json.dumps(stable_plan, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _blocker_codes(blockers: list[dict[str, Any]]) -> list[str]:
+    return [
+        code
+        for blocker in blockers
+        if isinstance((code := blocker.get("code")), str) and code
+    ]
+
+
+def _equipment_disposition_from_source_disposition(source_disposition: str) -> str:
+    return {
+        "extracted_into_config": "migrate_to_fork_ops",
+        "retained_as_fork_local_authority": "retain_authoritative_owner",
+        "mapped_to_workflow_backlog": "defer_to_follow_up",
+        "irrelevant_to_fork_ops": "ignore",
+        "unsupported_extractor_shape": "decide_item_by_item",
+        "needs_human_decision": "decide_item_by_item",
+        "deferred_with_rationale": "decide_item_by_item",
+    }.get(source_disposition, "decide_item_by_item")
+
+
+def _equipment_disposition_from_workflow_coverage(coverage_status: str) -> str:
+    if coverage_status in {"covered-current", "covered-diagnostic-only"}:
+        return "migrate_to_fork_ops"
+    if coverage_status in {"cataloged-not-implemented", "backlog-candidate"}:
+        return "defer_to_follow_up"
+    return "decide_item_by_item"
+
+
+def _equipment_decision_status(disposition: str) -> str:
+    if disposition == "decide_item_by_item":
+        return "pending_operator_decision"
+    return "proposed"
+
+
+def _equipment_activation_impact(disposition: str) -> str:
+    return {
+        "migrate_to_fork_ops": "Fork Ops may proceed only after coverage validates.",
+        "retain_authoritative_owner": "Retained owner remains authoritative.",
+        "defer_to_follow_up": "Track follow-up before replacement.",
+        "ignore": "No Fork Ops activation impact.",
+        "decide_item_by_item": "Operator decision required before overlapping activation.",
+    }.get(disposition, "Operator decision required before overlapping activation.")
+
+
+def _repo_equipment_classification(
+    candidate: dict[str, Any],
+    migration_entry: dict[str, Any],
+) -> str:
+    disposition = migration_entry["disposition"]["type"]
+    if disposition == "irrelevant_to_fork_ops":
+        return "unrelated"
+    if candidate["kind"] in {"agent_instruction", "config"}:
+        return "fork_ops_owner"
+    if _has_review_publication_signal(set(candidate["signals"])):
+        return "mixed"
+    if candidate["extracted_facts"]:
+        return "fork_ops_owner"
+    return "unknown"
+
+
+def _workflow_equipment_classification(entry: dict[str, Any]) -> str:
+    source_kind = entry.get("source_kind")
+    material_scope = entry.get("material_scope")
+    if source_kind in {"global-skill", "repo-local-skill", "policy", "gate", "procedure"}:
+        return "fork_ops_owner"
+    if material_scope == "fork-local-authority-material":
+        return "fork_ops_owner"
+    if entry.get("likely_workflow_catalog_target"):
+        return "mixed"
+    return "unknown"
+
+
+def _equipment_classification_confidence(
+    candidate: dict[str, Any],
+    migration_entry: dict[str, Any],
+) -> str:
+    disposition = migration_entry["disposition"]["type"]
+    if disposition in {"unsupported_extractor_shape", "needs_human_decision"}:
+        return "low"
+    if candidate["extracted_facts"] or candidate["kind"] in {"agent_instruction", "config"}:
+        return "high"
+    return "medium"
+
+
+def _consumer_compatibility_entries(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    coverage_status = str(entry.get("coverage_status", ""))
+    if coverage_status not in {"covered-current", "covered-diagnostic-only"}:
+        return []
+    return [
+        {
+            "id": f"{entry['id']}:compatibility",
+            "status": "proposed",
+            "consumer": entry.get("source_kind"),
+            "required_output": entry.get("likely_workflow_catalog_target"),
+            "impact": "Verify before replacing or redirecting retained consumers.",
+        }
+    ]
+
+
+def _equipment_disposition_reason(group: dict[str, Any]) -> str:
+    disposition = group["disposition"]
+    return {
+        "migrate_to_fork_ops": (
+            "The material maps to Fork Ops config or a covered workflow surface."
+        ),
+        "retain_authoritative_owner": "The material remains authoritative during migration.",
+        "defer_to_follow_up": "The material maps to follow-up workflow work.",
+        "ignore": "The material does not affect Fork Ops activation.",
+        "decide_item_by_item": "The material needs operator review before activation.",
+    }.get(disposition, "The material needs operator review before activation.")
+
+
+def _equipment_group_id(scope: str, source_path: str) -> str:
+    return f"equipment:{_short_digest(f'{scope}:{source_path}')}"
+
+
+def _equipment_evidence_id(scope: str, source_path: str) -> str:
+    return f"equipment-evidence:{_short_digest(f'{scope}:{source_path}')}"
+
+
+def _equipment_scope_id(source_root: str) -> str:
+    return f"scope:{_short_digest(source_root)}"
+
+
+def _short_digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
 def _review_artifact_entries(artifact: dict[str, Any]) -> list[dict[str, Any]]:
     entries = artifact.get("entries", [])
     if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
@@ -3088,10 +3955,21 @@ def _review_decisions_by_path(artifact: dict[str, Any]) -> dict[str, dict[str, A
     return decisions
 
 
-def _reviewed_retained_source_paths(artifact: dict[str, Any]) -> set[str]:
+def _reviewed_retained_source_paths(
+    artifact: dict[str, Any],
+    equipment_review_record: dict[str, Any] | None = None,
+) -> set[str]:
     retained_paths: set[str] = set()
     for path, decision in _review_decisions_by_path(artifact).items():
         if decision.get("status") == "reviewed" and decision.get("choice") == "retain":
+            retained_paths.add(path)
+    for path, decision in _repo_local_equipment_review_decisions_by_path(
+        equipment_review_record or {}
+    ).items():
+        if (
+            decision.get("decision_status") == "reviewed"
+            and decision.get("disposition") == "retain_authoritative_owner"
+        ):
             retained_paths.add(path)
     return retained_paths
 
@@ -3099,16 +3977,29 @@ def _reviewed_retained_source_paths(artifact: dict[str, Any]) -> set[str]:
 def _retained_authority(
     retained_materials: list[dict[str, Any]],
     migration_review_artifact: dict[str, Any],
+    equipment_review_record: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     decisions = _review_decisions_by_path(migration_review_artifact)
+    equipment_decisions = _repo_local_equipment_review_decisions_by_path(
+        equipment_review_record or {}
+    )
     authority: list[dict[str, Any]] = []
     for material in retained_materials:
         path = material.get("path")
         if not isinstance(path, str) or not path:
             continue
         decision = decisions.get(path, {})
-        if _review_decision_choice(decision) != "retain":
+        equipment_decision = equipment_decisions.get(path, {})
+        migration_review_retained = _review_decision_choice(decision) == "retain"
+        equipment_review_retained = (
+            equipment_decision.get("decision_status") == "reviewed"
+            and equipment_decision.get("disposition") == "retain_authoritative_owner"
+        )
+        if not migration_review_retained and not equipment_review_retained:
             continue
+        review_decision = copy.deepcopy(decision)
+        if equipment_review_retained:
+            review_decision["equipment_review"] = copy.deepcopy(equipment_decision)
         authority.append(
             {
                 "path": path,
@@ -3117,11 +4008,38 @@ def _retained_authority(
                 "authority_status": "authoritative_after_config_creation",
                 "read_required": True,
                 "replacement_status": material.get("replacement_status", "deferred"),
-                "review_decision": copy.deepcopy(decision),
+                "review_decision": review_decision,
                 "blocks": ["source-material replacement/removal"],
             }
         )
     return authority
+
+
+def _repo_local_equipment_review_decisions_by_path(
+    record: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    entries = record.get("equipment", [])
+    if entries in (None, []):
+        return {}
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ForkOpsError(
+            "Migration dry run input has malformed equipment_review_record.equipment."
+        )
+    decisions: dict[str, dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    for entry in entries:
+        if entry.get("source_scope") != "repo-local":
+            continue
+        source_path = entry.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            continue
+        if source_path in seen_paths:
+            raise ForkOpsError(
+                f"Equipment review record has duplicate source_path: {source_path}"
+            )
+        seen_paths.add(source_path)
+        decisions[source_path] = copy.deepcopy(entry)
+    return decisions
 
 
 def _review_decision_choice(decision: dict[str, Any]) -> str:

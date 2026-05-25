@@ -13,6 +13,7 @@ from .core import (
     CONFIG_RELATIVE_PATH,
     ForkOpsError,
     assess_migration,
+    build_equipment_migration_preflight,
     build_plugin_health_report,
     build_status_report,
     build_workflow_migration_inventory,
@@ -102,6 +103,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include the non-mutating proposed config patch in the assessment output.",
     )
     assess.set_defaults(func=cmd_migration_assess)
+    preflight = migration_subcommands.add_parser(
+        "preflight",
+        help="Build a read-only equipment migration preflight.",
+    )
+    _add_repo_arg(preflight)
+    preflight.add_argument(
+        "--source-root",
+        action="append",
+        dest="source_roots",
+        help="Additional global or local equipment root to scan. May be provided more than once.",
+    )
+    preflight.set_defaults(func=cmd_migration_preflight)
     plan = migration_subcommands.add_parser(
         "plan",
         help="Generate a non-mutating migration plan.",
@@ -312,6 +325,17 @@ def cmd_migration_assess(args: argparse.Namespace) -> int:
                 args.repo,
                 include_proposed_config_patch=args.with_proposed_config,
             ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_migration_preflight(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            build_equipment_migration_preflight(args.repo, args.source_roots),
             indent=2,
             sort_keys=True,
         )

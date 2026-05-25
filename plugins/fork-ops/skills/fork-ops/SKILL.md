@@ -22,7 +22,7 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
 - CLI: `uv run --project ${PLUGIN_ROOT} fork-ops ...`
 - Plugin health: `uv run --project ${PLUGIN_ROOT} fork-ops plugin health`
 - Workflow catalog: `uv run --project ${PLUGIN_ROOT} fork-ops workflow catalog`
-- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, `fork_ops_schema`
+- MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_config_read`, `fork_ops_config_validate`, `fork_ops_capability_report`, `fork_ops_migration_assessment`, `fork_ops_equipment_migration_preflight`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, `fork_ops_schema`
 - Schema: `${PLUGIN_ROOT}/schema/fork-ops.schema.json`
 - Operation docs: `${PLUGIN_ROOT}/docs/operation-guide.md`
 
@@ -48,41 +48,51 @@ Fork-local authority is the source of truth for the specific fork. The plugin su
    uv run --project ${PLUGIN_ROOT} fork-ops migration assess --repo /path/to/fork
    ```
 
-4. For a reviewed migration path, generate a non-mutating migration plan:
+4. For prior equipment, run read-only equipment preflight before relying on
+   replacement or activation claims:
+
+   ```bash
+   uv run --project ${PLUGIN_ROOT} fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+   ```
+
+5. For a reviewed migration path, generate a non-mutating migration plan:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration plan --repo /path/to/fork
    ```
 
-5. For a migration preview, run a non-mutating dry run. If the plan includes
+6. For a migration preview, run a non-mutating dry run. If the plan includes
    `semantic_coverage.incomplete`, guarded config creation is available only
    when every affected source path has a reviewed `retain` decision in the
-   migration review artifact:
+   migration review artifact or a reviewed `retain_authoritative_owner`
+   disposition in the equipment review record:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration dry-run --repo /path/to/fork
    ```
 
-6. For a reviewed config migration whose dry run has no blockers, run guarded
+7. For a reviewed config migration whose dry run has no blockers, run guarded
    migration execution:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration execute --repo /path/to/fork
    ```
 
-7. For a first config draft, generate a non-mutating proposed config patch and review it against the source materials before applying it:
+8. For a first config draft, generate a non-mutating proposed config patch and review it against the source materials before applying it:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration propose-config --repo /path/to/fork --format toml
    ```
 
-8. For a migration blocker, explain the blocker from the workflow output instead of inferring from prose:
+9. For a migration blocker, explain the blocker from the workflow output instead of inferring from prose:
 
    ```bash
    uv run --project ${PLUGIN_ROOT} fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
    ```
 
-9. Treat sync, publication, source-material removal, and arbitrary migration mutations as unavailable unless the config capability level and tool surface explicitly support them.
+10. Treat sync, publication, equipment edits, equipment disabling,
+    source-material removal, and arbitrary migration mutations as unavailable
+    unless the config capability level and tool surface explicitly support them.
 
 ## Escalation Boundaries
 
@@ -90,4 +100,4 @@ Escalate when fork-local authority is missing, contradictory, or insufficient fo
 
 ## Current Capability
 
-This foundation version targets `track-aware`. It can discover, parse, validate, normalize, and report config state. It can inspect local Git remotes and configured upstream track refs. It can assess migration inputs, generate reviewed non-mutating migration plans with source material dispositions and review artifact decision choices, generate dry runs and config proposals, render operator-readable migration narratives, explain migration blockers, and execute guarded config creation when dry-run blockers are resolved for config creation. Reviewed `retain` decisions can unblock config creation for incomplete semantic coverage while retained authority remains preserved and source-material replacement/removal stays unavailable. It does not execute broad upstream sync, PR publication closeout, source-material removal, or arbitrary migration edits.
+This foundation version targets `track-aware`. Capabilities include discovering, parsing, validating, normalizing, and reporting config state. The implementation inspects local Git remotes and configured upstream track refs. Migration capabilities include assessment, equipment migration preflight, reviewed non-mutating migration plans with source material dispositions, review artifact decision choices, proposed equipment review records, activation-readiness reports, dry runs, config proposals, replayable wet-run metadata, operator-readable narratives, blocker explanations, and guarded config creation when dry-run blockers are resolved. Reviewed `retain` decisions and reviewed `retain_authoritative_owner` equipment dispositions can unblock config creation for incomplete semantic coverage while retained authority remains preserved and source-material replacement/removal stays unavailable. It does not execute broad upstream sync, PR publication closeout, equipment edits, equipment disabling, source-material removal, or arbitrary migration edits.
