@@ -12,6 +12,7 @@ For an unconfigured fork, start with migration assessment instead.
 
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
@@ -43,6 +44,7 @@ MCP tools expose the same surface for agents:
 - `fork_ops_workflow_catalog`
 - `fork_ops_workflow_migration_inventory`
 - `fork_ops_migration_assessment`
+- `fork_ops_equipment_migration_preflight`
 - `fork_ops_migration_plan`
 - `fork_ops_migration_dry_run`
 - `fork_ops_migration_execute`
@@ -79,6 +81,25 @@ uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/glo
 Backlog candidates in this report are evidence for future catalog work. They do
 not mean the workflow is available.
 
+## Equipment Migration Preflight
+
+Use equipment preflight before treating existing skills, configs, docs, hooks,
+or other equipment as replaced. The preflight is read-only. It reports assessed
+discovery scopes, proposed onboarding intent, equipment groups, proposed
+dispositions, unassessed areas, compatibility entries when detected, activation
+impact, and a proposed TOML equipment review record.
+
+```bash
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+```
+
+When no extra source root is supplied, preflight scans repo-local material and
+names user-global equipment as unassessed. Unassessed areas limit activation
+readiness and replacement coverage for overlapping behavior. Reviewed
+`retain_authoritative_owner` entries in the equipment review record can support
+guarded config creation while source-material replacement and removal remain
+unavailable.
+
 ## Schema Artifacts
 
 The documented schema copy and packaged runtime schema copy should stay aligned
@@ -102,20 +123,31 @@ Use `review-ready` only when PR, review, publication, and local gate policy are 
 
 Use `provenance-ready` only when source, artifact, package, runtime, or install-state verification surfaces are configured.
 
+Capability reports include a summary of
+`docs/agents/fork-ops-equipment-review.toml` when that record exists. The
+summary identifies whether the record is valid, how many equipment decisions
+are pending or reviewed, which reviewed paths remain retained authority, and
+whether unassessed equipment areas still limit activation readiness. The summary
+does not by itself authorize equipment edits, disabling, redirects, or
+source-material removal.
+
 ## Mutation Policy
 
 The foundation implementation supports guarded migration execution for
 plans whose dry-run blockers are resolved for config creation. It creates
 `.agents/fork-ops.toml`, preserves retained source materials, reports migration
-map dispositions and review artifact decisions, renders operator-readable
-narratives, explains migration blockers, and verifies the resulting capability
-level. A `semantic_coverage.incomplete` path only stops blocking guarded config
-creation when the migration review artifact records a reviewed `retain`
-decision for that path. Retained authority remains checked-in source material
-and still blocks source-material replacement or removal. The implementation does
-not run broad sync mutations, PR publication closeout, arbitrary migration
-edits, or source-material removal. Agents should report missing capabilities and
-provide the smallest safe next step.
+map dispositions, equipment preflight findings, review artifact decisions,
+activation-readiness limits, replayable wet-run evidence, operator-readable
+narratives, migration blockers, and resulting capability verification. A
+`semantic_coverage.incomplete` path only stops blocking guarded config creation
+when the migration review artifact records a reviewed `retain` decision or the
+equipment review record records a reviewed `retain_authoritative_owner`
+disposition for that path. Retained authority remains checked-in source
+material and still blocks source-material replacement or removal. The
+implementation does not run broad sync mutations, PR publication closeout,
+arbitrary migration edits, equipment edits, equipment disabling, or
+source-material removal. Agents should report missing capabilities and provide
+the smallest safe next step.
 
 When mutation surfaces exist, they should share core mutation gate logic:
 

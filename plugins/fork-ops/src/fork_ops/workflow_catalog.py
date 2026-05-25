@@ -189,6 +189,12 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             ),
             WorkflowEntrypoint(
                 kind="cli",
+                id="fork-ops migration preflight",
+                label="Build a read-only equipment migration preflight.",
+                surface="fork-ops migration preflight",
+            ),
+            WorkflowEntrypoint(
+                kind="cli",
                 id="fork-ops migration plan",
                 label="Generate a non-mutating migration plan.",
                 surface="fork-ops migration plan",
@@ -215,6 +221,12 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
                 kind="mcp",
                 id="fork_ops_migration_assessment",
                 label="Assess existing fork-related source materials for MCP clients.",
+                surface="MCP tool",
+            ),
+            WorkflowEntrypoint(
+                kind="mcp",
+                id="fork_ops_equipment_migration_preflight",
+                label="Return an equipment migration preflight to MCP clients.",
                 surface="MCP tool",
             ),
             WorkflowEntrypoint(
