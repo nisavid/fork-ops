@@ -13,6 +13,7 @@ For an unconfigured fork, start with migration assessment instead.
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --scan-profile full-breadth
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
@@ -70,16 +71,28 @@ fallback guidance when CLI execution is ready.
 ## Workflow Migration Inventory
 
 Use workflow inventory for product-surface workflow migration, not for replacing
-a maintained fork's authority. It scans operator-provided roots and reports
-source kind, material scope, candidate operator intent, likely workflow catalog
-target, coverage status, and evidence references.
+a maintained fork's authority. It scans operator-provided roots or the
+full-breadth profile and reports source kind, source scope, material scope,
+candidate operator intent, likely workflow catalog target, coverage status,
+accounting records, follow-up candidates, and evidence references.
 
 ```bash
 uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/global-skills --source-root /path/to/fork
+uv run --package fork-ops fork-ops workflow inventory --scan-profile full-breadth
 ```
 
 Backlog candidates in this report are evidence for future catalog work. They do
 not mean the workflow is available.
+
+The `full-breadth` profile scans known user-global roots, the maintained-fork
+repository set, and adjacent roots. It records the visited roots in
+`source_root_records`, preserves each root's scope, and accounts for each
+discovered workflow entry exactly once. Planned workflows, reusable Repo Ops
+candidates, and unassessed roots receive follow-up candidates. Repository roots
+are included only when `FORK_OPS_FULL_BREADTH_REPO_BASE` is set. Use
+`FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS` and
+`FORK_OPS_FULL_BREADTH_ADJACENT_REPOS` to run the same profile against another
+layout.
 
 ## Equipment Migration Preflight
 
@@ -91,6 +104,7 @@ impact, and a proposed TOML equipment review record.
 
 ```bash
 uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --scan-profile full-breadth
 ```
 
 When no extra source root is supplied, preflight scans repo-local material and
@@ -99,6 +113,12 @@ readiness and replacement coverage for overlapping behavior. Reviewed
 `retain_authoritative_owner` entries in the equipment review record can support
 guarded config creation while source-material replacement and removal remain
 unavailable.
+
+Use `--scan-profile full-breadth` when full-breadth accounting is required. The
+full-breadth preflight adds accounting records and follow-up candidates from the
+known user-global, maintained-fork, and adjacent-root surfaces to the repo-local
+equipment review record. Replacement coverage remains false until equivalent
+Fork Ops-owned behavior exists, validates, and is reported as covered behavior.
 
 ## Schema Artifacts
 
@@ -127,9 +147,11 @@ Capability reports include a summary of
 `docs/agents/fork-ops-equipment-review.toml` when that record exists. The
 summary identifies whether the record is valid, how many equipment decisions
 are pending or reviewed, which reviewed paths remain retained authority, and
-whether unassessed equipment areas still limit activation readiness. The summary
-does not by itself authorize equipment edits, disabling, redirects, or
-source-material removal.
+whether unassessed equipment areas still limit activation readiness. When the
+record contains accounting records, the capability summary reports accounting
+record counts, status counts, and follow-up candidate counts. The summary does
+not by itself authorize equipment edits, disabling, redirects, replacement
+coverage claims, or source-material removal.
 
 ## Mutation Policy
 

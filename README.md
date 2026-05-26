@@ -18,9 +18,9 @@ migration, and execute the first guarded config-creation migration slice.
 > **Done:** Codex plugin foundation, `.agents/fork-ops.toml` schema, Python
 > core library, CLI, MCP server, capability reporting, live Git diagnostics,
 > plugin health diagnostics, workflow migration inventory, read-only migration
-> assessment, non-mutating config proposal generation, migration plan
-> generation, migration dry run, guarded migration execution, migration
-> narratives, and blocker explanations.
+> assessment, full-breadth accounting, non-mutating config proposal generation,
+> migration plan generation, migration dry run, guarded migration execution,
+> migration narratives, and blocker explanations.
 >
 > **Planned:** Lemonade onboarding, broader migration edits, source-material
 > removal, and later mutation-capable sync, review, and publication workflows.
@@ -51,9 +51,9 @@ docs, policies, and refs that are authoritative for that fork.
 | User need | Current support |
 | --- | --- |
 | Check plugin readiness | The plugin health report independently checks readiness paths for registration, skill discovery, CLI, MCP, and UI visibility. |
-| Map reusable workflow material | Workflow migration inventory scans source roots and groups evidence by catalog target or backlog candidate without editing files. |
+| Map reusable workflow material | Workflow migration inventory scans custom source roots or the full-breadth profile, accounts for each discovered entry, and groups evidence by catalog target or backlog candidate without editing files. |
 | Understand existing fork materials | Migration assessment scans fork-related docs, configs, skills, and agent instructions. |
-| Preflight existing equipment | Equipment migration preflight groups repo-local and operator-provided equipment roots, proposes onboarding intent and dispositions, names unassessed areas, and emits a proposed TOML equipment review record without editing files. |
+| Preflight existing equipment | Equipment migration preflight groups repo-local and operator-provided equipment roots, proposes onboarding intent and dispositions, names unassessed areas, emits accounting records and follow-up candidates, and proposes a TOML equipment review record without editing files. |
 | Plan a reviewed migration | Migration plan generation combines evidence, a migration map with source material dispositions, a proposed review artifact with decision choices, config patch, retained source material, blockers, and validation requirements without editing files. |
 | Preview a migration plan | Migration dry run reports file edits, config changes, migration map entries, the proposed review artifact, the equipment review record, activation readiness, retained materials, retained authority, blocked steps, expected verification commands, replay evidence, and narrative guidance without editing files. |
 | Apply a migration plan | Guarded migration execution creates `.agents/fork-ops.toml` when dry-run blockers are resolved for config creation, preserves retained source materials, explains refusals, and verifies capability. |
@@ -88,7 +88,11 @@ skills, policies, gates, procedures, or handoff examples.
 
 ```bash
 uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
+uv run --package fork-ops fork-ops workflow inventory --scan-profile full-breadth
 ```
+
+The `full-breadth` profile includes repository roots when
+`FORK_OPS_FULL_BREADTH_REPO_BASE` is set, with optional repo-name-set overrides.
 
 ### Assess an unconfigured fork
 

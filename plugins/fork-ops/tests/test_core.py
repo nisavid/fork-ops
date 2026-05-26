@@ -918,6 +918,170 @@ class ForkOpsCoreTests(unittest.TestCase):
             self.assertEqual(candidate["coverage_status"], "backlog-candidate")
             self.assertTrue(candidate["entry_id"])
 
+    def test_full_breadth_inventory_expands_required_roots_and_accounts_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                inventory = build_workflow_migration_inventory(scan_profile="full-breadth")
+
+        self.assertEqual(inventory["scan_profile"], "full-breadth")
+        self.assertIn("Path.home()", inventory["profile_notes"][0])
+        self.assertEqual(inventory["summary"]["source_root_count"], 14)
+        self.assertEqual(inventory["summary"]["unresolvable_source_root_count"], 0)
+        source_roots = set(inventory["source_roots"])
+        self.assertIn(str(workspace_path / ".agents" / "skills"), source_roots)
+        self.assertIn(
+            str(workspace_path / ".codex" / "plugins" / "cache" / "fork-ops"),
+            source_roots,
+        )
+        self.assertIn(str(workspace_path / "repos" / "codex-app-linux"), source_roots)
+        self.assertIn(str(workspace_path / "repos" / "agent-armory"), source_roots)
+
+        entry_paths = {entry["source_path"] for entry in inventory["entries"]}
+        self.assertIn("sync-fork/SKILL.md", entry_paths)
+        self.assertIn("AGENTS.md", entry_paths)
+        self.assertNotIn("node_modules/ignored.md", entry_paths)
+        codex_skill = next(
+            entry
+            for entry in inventory["entries"]
+            if entry["source_root"] == str(workspace_path / ".codex" / "skills")
+            and entry["source_path"] == "review-loop/SKILL.md"
+        )
+        self.assertEqual(codex_skill["source_scope"], "user-global")
+        self.assertEqual(codex_skill["source_kind"], "global-skill")
+        self.assertEqual(codex_skill["material_scope"], "reusable-workflow-material")
+        cached_plugin_skill = next(
+            entry
+            for entry in inventory["entries"]
+            if entry["source_root"]
+            == str(workspace_path / ".codex" / "plugins" / "cache" / "fork-ops")
+            and entry["source_path"] == "skills/fork-ops/SKILL.md"
+        )
+        self.assertEqual(cached_plugin_skill["source_scope"], "user-global")
+        self.assertEqual(cached_plugin_skill["source_kind"], "global-skill")
+        self.assertEqual(
+            cached_plugin_skill["material_scope"],
+            "reusable-workflow-material",
+        )
+
+        records = inventory["accounting_records"]
+        self.assertEqual(
+            inventory["summary"]["accounting_record_count"],
+            len(records),
+        )
+        self.assertEqual(
+            len(records),
+            len(inventory["entries"]) + len(inventory["unresolvable_source_roots"]),
+        )
+        entry_ids = {entry["id"] for entry in inventory["entries"]}
+        accounted_entry_ids = {
+            record["source_entry_id"]
+            for record in records
+            if record.get("source_entry_id")
+        }
+        self.assertEqual(accounted_entry_ids, entry_ids)
+        statuses = {record["accounting_status"] for record in records}
+        self.assertIn("planned_workflow", statuses)
+        self.assertIn("retained_fork_local_authority", statuses)
+        self.assertTrue(inventory["follow_up_candidates"])
+
+    def test_full_breadth_inventory_uses_configured_repo_base_and_lists(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            home = workspace_path / "home"
+            repo_base = workspace_path / "repos"
+            for relative in (
+                ".agents/skills",
+                ".agents/spec",
+                ".agents/plan",
+                ".codex/skills",
+                ".codex/plugins/cache/fork-ops",
+            ):
+                (home / relative).mkdir(parents=True)
+            custom_fork = repo_base / "custom-fork"
+            custom_fork.mkdir(parents=True)
+            (custom_fork / "AGENTS.md").write_text(
+                "# Agent Instructions\n\n"
+                "Maintained fork authority records upstream sync policy.\n"
+            )
+            adjacent = repo_base / "ops-adjacent"
+            adjacent.mkdir(parents=True)
+            (adjacent / "AGENTS.md").write_text(
+                "# Agent Instructions\n\n"
+                "Review policy is a future Repo Ops candidate.\n"
+            )
+
+            with (
+                patch.object(Path, "home", return_value=home),
+                patch.dict(
+                    os.environ,
+                    {
+                        "FORK_OPS_FULL_BREADTH_REPO_BASE": str(repo_base),
+                        "FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS": "custom-fork",
+                        "FORK_OPS_FULL_BREADTH_ADJACENT_REPOS": "ops-adjacent",
+                    },
+                ),
+            ):
+                inventory = build_workflow_migration_inventory(scan_profile="full-breadth")
+
+        source_roots = set(inventory["source_roots"])
+        self.assertIn(str(custom_fork), source_roots)
+        self.assertIn(str(adjacent), source_roots)
+        self.assertNotIn(str(repo_base / "lemonade"), source_roots)
+        self.assertEqual(inventory["summary"]["source_root_count"], 7)
+        self.assertIn("FORK_OPS_FULL_BREADTH_REPO_BASE", inventory["profile_notes"][0])
+        scope_by_role = {
+            record["root_role"]: record["source_scope"]
+            for record in inventory["source_root_records"]
+        }
+        self.assertEqual(scope_by_role["custom-fork"], "maintained-fork")
+        self.assertEqual(scope_by_role["ops-adjacent"], "adjacent-root")
+
+    def test_workflow_inventory_records_unassessed_accounting_for_unresolvable_roots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            missing = Path(workspace) / "missing-source-root"
+
+            inventory = build_workflow_migration_inventory([missing])
+
+        [record] = inventory["accounting_records"]
+        self.assertEqual(record["accounting_status"], "unassessed")
+        self.assertEqual(record["source_root"], str(missing.resolve()))
+        self.assertEqual(record["next_action"], "Resolve or remove this source root.")
+        self.assertEqual(
+            inventory["follow_up_candidates"][0]["accounting_record_id"],
+            record["id"],
+        )
+
+    def test_workflow_migration_inventory_skips_arch_package_build_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace) / "arch-pkgs"
+            package = root / "packages" / "python-example"
+            source_doc = package / "src" / "upstream" / "README.md"
+            retained_doc = package / "README.md"
+            source_doc.parent.mkdir(parents=True)
+            (package / "PKGBUILD").write_text("# package build recipe\n")
+            source_doc.write_text(
+                "This upstream sync note belongs to unpacked package source.\n"
+            )
+            retained_doc.write_text(
+                "This maintained package records upstream sync policy for review.\n"
+            )
+
+            inventory = build_workflow_migration_inventory([root])
+
+        entry_paths = {entry["source_path"] for entry in inventory["entries"]}
+        self.assertIn("packages/python-example/README.md", entry_paths)
+        self.assertNotIn("packages/python-example/src/upstream/README.md", entry_paths)
+
     def test_workflow_migration_inventory_classifies_repo_local_skill_root(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             repo = Path(workspace) / "maintained-fork"
@@ -941,7 +1105,11 @@ class ForkOpsCoreTests(unittest.TestCase):
             source_roots = _write_workflow_inventory_fixture(workspace_path)
             output = io.StringIO()
 
-            with patch.object(Path, "home", return_value=workspace_path), redirect_stdout(output):
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+                redirect_stdout(output),
+            ):
                 exit_code = cli_main(
                     [
                         "workflow",
@@ -963,6 +1131,39 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(cli_payload, mcp_payload)
         self.assertEqual(cli_payload["operation"], "workflow-migration-inventory")
+
+    def test_cli_and_mcp_expose_full_breadth_workflow_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            output = io.StringIO()
+
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+                redirect_stdout(output),
+            ):
+                exit_code = cli_main(
+                    [
+                        "workflow",
+                        "inventory",
+                        "--scan-profile",
+                        "full-breadth",
+                    ]
+                )
+            cli_payload = json.loads(output.getvalue())
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                mcp_payload = fork_ops_workflow_migration_inventory(
+                    scan_profile="full-breadth"
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cli_payload, mcp_payload)
+        self.assertEqual(cli_payload["scan_profile"], "full-breadth")
+        self.assertTrue(cli_payload["accounting_records"])
 
     def test_track_aware_config_satisfies_track_aware_level(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1625,6 +1826,30 @@ uncertainty_destination = "ask-human-operator"
         review_codes = {item["code"] for item in plan["required_review"]}
         self.assertIn("review.migration_review_artifact", review_codes)
 
+    def test_migration_plan_full_breadth_carries_inventory_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(repo_path, scan_profile="full-breadth")
+
+        self.assertEqual(plan["scan_profile"], "full-breadth")
+        self.assertTrue(plan["accounting_records"])
+        self.assertTrue(plan["follow_up_candidates"])
+        self.assertEqual(
+            plan["accounting_records"],
+            plan["equipment_migration_preflight"]["accounting_records"],
+        )
+        scopes = {record["source_scope"] for record in plan["accounting_records"]}
+        self.assertIn("user-global", scopes)
+        self.assertIn("maintained-fork", scopes)
+        self.assertIn("adjacent-root", scopes)
+
     def test_equipment_migration_preflight_records_intent_and_review_toml(
         self,
     ) -> None:
@@ -1662,6 +1887,41 @@ uncertainty_destination = "ask-human-operator"
         self.assertTrue(parsed["equipment"])
         self.assertTrue(all("source_root" in entry for entry in parsed["equipment"]))
         self.assertTrue(parsed["evidence"][0]["content_sha256"])
+
+    def test_equipment_preflight_full_breadth_accounts_global_and_repo_sources(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                preflight = build_equipment_migration_preflight(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+
+        self.assertEqual(preflight["scan_profile"], "full-breadth")
+        self.assertTrue(preflight["accounting_records"])
+        self.assertTrue(preflight["follow_up_candidates"])
+        self.assertEqual(
+            preflight["summary"]["accounting_record_count"],
+            len(preflight["accounting_records"]),
+        )
+        self.assertEqual(
+            preflight["equipment_review_record"]["accounting_records"],
+            preflight["accounting_records"],
+        )
+        scopes = {record["source_scope"] for record in preflight["accounting_records"]}
+        self.assertIn("user-global", scopes)
+        self.assertIn("maintained-fork", scopes)
+        self.assertIn("adjacent-root", scopes)
+        area_ids = {area["id"] for area in preflight["unassessed_equipment_areas"]}
+        self.assertNotIn("unassessed:user-global-equipment", area_ids)
 
     def test_equipment_preflight_names_unassessed_global_scope_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1939,6 +2199,8 @@ uncertainty_destination = "ask-human-operator"
         )
         self.assertTrue(dry_run["activation_readiness"]["config_creation_ready"])
         self.assertEqual(dry_run["summary"]["file_edit_count"], 1)
+        self.assertEqual(dry_run["accounting_records"], plan["accounting_records"])
+        self.assertEqual(dry_run["follow_up_candidates"], plan["follow_up_candidates"])
         self.assertEqual(dry_run["file_edits"][0]["path"], ".agents/fork-ops.toml")
         self.assertEqual(dry_run["file_edits"][0]["action"], "create")
         self.assertEqual(dry_run["config_changes"][0]["target_path"], ".agents/fork-ops.toml")
@@ -2338,6 +2600,31 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(payload["operation"], "migration-dry-run")
         self.assertEqual(payload["plan_operation"], "migration-plan")
 
+    def test_cli_rejects_scan_profile_with_migration_plan_file_for_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            plan_path = repo_path / "migration-plan.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan_path.write_text(json.dumps(generate_migration_plan(repo_path)))
+            error = io.StringIO()
+
+            with redirect_stderr(error):
+                exit_code = cli_main(
+                    [
+                        "migration",
+                        "dry-run",
+                        "--plan",
+                        str(plan_path),
+                        "--scan-profile",
+                        "full-breadth",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--scan-profile cannot be used with --plan", error.getvalue())
+
     def test_cli_rejects_ambiguous_migration_dry_run_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -2497,6 +2784,25 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(payload["operation"], "migration-dry-run")
         self.assertTrue(payload["can_execute"])
 
+    def test_mcp_rejects_scan_profile_with_supplied_migration_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            with self.assertRaises(ForkOpsError) as raised:
+                fork_ops_migration_dry_run(
+                    migration_plan=plan,
+                    scan_profile="full-breadth",
+                )
+
+        self.assertEqual(
+            str(raised.exception),
+            "scan_profile cannot be used with migration_plan.",
+        )
+
     def test_mcp_smokes_config_tools_and_schema(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
@@ -2554,11 +2860,59 @@ reason_recommended = "Reviewed as retained authoritative equipment."
         self.assertTrue(equipment["exists"])
         self.assertTrue(equipment["valid"])
         self.assertEqual(equipment["equipment_count"], 1)
+        self.assertEqual(report["capability"]["accounting"]["accounting_record_count"], 0)
         self.assertEqual(equipment["reviewed_equipment_count"], 1)
         self.assertEqual(
             equipment["retained_authority_paths"],
             ["docs/agents/local-policy.md"],
         )
+
+    def test_capability_report_summarizes_equipment_accounting_records(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            config_path.parent.mkdir(parents=True)
+            review_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            review_path.write_text(
+                """artifact_kind = "equipment_review"
+schema_version = "0.1"
+status = "reviewed"
+default_onboarding_intent = "migrate_toward_fork_ops"
+
+[[accounting_records]]
+id = "accounting:review-policy"
+source_scope = "repo-local"
+source_root = "/tmp/fork"
+source_path = "docs/agents/review-policy.md"
+accounting_status = "planned_workflow"
+coverage_status = "cataloged-not-implemented"
+target_surface_type = "workflow"
+target_workflow_id = "publication-closeout"
+reason = "Publication closeout is cataloged but not implemented."
+next_action = "Track publication closeout follow-up."
+follow_up_id = "follow-up:publication-closeout"
+
+[[follow_up_candidates]]
+id = "follow-up:publication-closeout"
+accounting_record_id = "accounting:review-policy"
+audience_scope = "team-wide"
+status = "candidate"
+target_tracker = "github-issues"
+title = "Implement publication closeout"
+reason = "Publication closeout is cataloged but not implemented."
+next_action = "Create or link a durable GitHub issue."
+"""
+            )
+
+            report = build_status_report(repo_path, include_config=False)
+
+        accounting = report["capability"]["accounting"]
+        self.assertEqual(accounting["accounting_record_count"], 1)
+        self.assertEqual(accounting["follow_up_candidate_count"], 1)
+        self.assertEqual(accounting["status_counts"]["planned_workflow"], 1)
+        self.assertFalse(accounting["replacement_coverage_ready"])
 
     def test_capability_report_includes_equipment_review_when_config_missing(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -3611,6 +3965,105 @@ def _write_workflow_inventory_fixture(workspace: Path) -> list[Path]:
     )
 
     return [global_skills, maintained_fork, handoffs]
+
+
+def _full_breadth_env(workspace: Path) -> dict[str, str]:
+    return {
+        "FORK_OPS_FULL_BREADTH_REPO_BASE": str(workspace / "repos"),
+        "FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS": (
+            "fork-ops,lemonade,codex-app-linux,warp,utilyze,arch-pkgs,"
+            "arch-strix-halo-pkgs"
+        ),
+        "FORK_OPS_FULL_BREADTH_ADJACENT_REPOS": "agent-armory,tuned-limine",
+    }
+
+
+def _write_full_breadth_fixture(workspace: Path) -> None:
+    root_paths = [
+        workspace / ".agents" / "skills",
+        workspace / ".agents" / "spec",
+        workspace / ".agents" / "plan",
+        workspace / ".codex" / "skills",
+        workspace / ".codex" / "plugins" / "cache" / "fork-ops",
+    ]
+    repo_base = workspace / "repos"
+    for name in (
+        "fork-ops",
+        "lemonade",
+        "codex-app-linux",
+        "warp",
+        "utilyze",
+        "arch-pkgs",
+        "arch-strix-halo-pkgs",
+        "agent-armory",
+        "tuned-limine",
+    ):
+        root_paths.append(repo_base / name)
+    for path in root_paths:
+        path.mkdir(parents=True)
+
+    (workspace / ".agents" / "skills" / "sync-fork").mkdir()
+    (workspace / ".agents" / "skills" / "sync-fork" / "SKILL.md").write_text(
+        "# Sync Fork\n\n"
+        "Use when an operator asks to plan an upstream sync for a maintained fork. "
+        "Check origin/upstream-stable and record workflow catalog evidence.\n"
+    )
+    (workspace / ".agents" / "spec" / "publication-closeout.md").write_text(
+        "# Publication Closeout\n\n"
+        "Pull request publication closeout depends on review thread state and CodeQL.\n"
+    )
+    (workspace / ".agents" / "plan" / "human-handoff.md").write_text(
+        "# Handoff\n\n"
+        "Handoff contract records blocker, next action, and return contract.\n"
+    )
+    (workspace / ".codex" / "skills" / "review-loop").mkdir()
+    (workspace / ".codex" / "skills" / "review-loop" / "SKILL.md").write_text(
+        "# Review Loop\n\n"
+        "Use when preparing review evidence before pull request publication.\n"
+    )
+    (workspace / ".codex" / "plugins" / "cache" / "fork-ops" / "README.md").write_text(
+        "# Fork Ops Plugin\n\n"
+        "Fork Ops workflow catalog and plugin health documentation.\n"
+    )
+    (workspace / ".codex" / "plugins" / "cache" / "fork-ops" / "skills" / "fork-ops").mkdir(
+        parents=True
+    )
+    (
+        workspace
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "fork-ops"
+        / "skills"
+        / "fork-ops"
+        / "SKILL.md"
+    ).write_text(
+        "# Fork Ops\n\n"
+        "Use when operating a maintained repository fork through the plugin cache.\n"
+    )
+
+    lemonade = repo_base / "lemonade"
+    (lemonade / "AGENTS.md").write_text(
+        "# Agent Instructions\n\n"
+        "Fork-local authority requires origin/upstream-stable as default baseline.\n"
+    )
+    (lemonade / "node_modules").mkdir()
+    (lemonade / "node_modules" / "ignored.md").write_text(
+        "This dependency copy mentions upstream sync but must not be inventoried.\n"
+    )
+
+    codex_app = repo_base / "codex-app-linux"
+    (codex_app / "docs" / "maintainers").mkdir(parents=True)
+    (codex_app / "docs" / "maintainers" / "fork-sync-policy.md").write_text(
+        "# Fork Sync Policy\n\n"
+        "Policy: upstream sync planning must preserve carried divergence and review gates.\n"
+    )
+
+    agent_armory = repo_base / "agent-armory"
+    (agent_armory / "AGENTS.md").write_text(
+        "# Agent Instructions\n\n"
+        "Issue tracker migration and review policy are Repo Ops candidates.\n"
+    )
 
 
 def _run_git(repo_path: Path, *args: str) -> None:

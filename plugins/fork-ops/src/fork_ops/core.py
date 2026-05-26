@@ -61,7 +61,10 @@ _CANDIDATE_SCAN_SKIP_DIRS = {
     ".tox",
     ".venv",
     "__pycache__",
+    "build",
+    "dist",
     "node_modules",
+    "target",
 }
 _FORK_SIGNAL_NEEDLES = (
     "baseline",
@@ -161,6 +164,40 @@ EQUIPMENT_DECISION_STATUS_TYPES = (
     "reviewed",
     "superseded",
 )
+SCAN_PROFILES = ("custom", "full-breadth")
+ACCOUNTING_STATUS_TYPES = (
+    "implemented_workflow",
+    "diagnostic_only_workflow",
+    "planned_workflow",
+    "fork_local_config",
+    "retained_fork_local_authority",
+    "repo_ops_candidate",
+    "out_of_scope",
+    "unassessed",
+)
+FULL_BREADTH_USER_ROOTS = (
+    ".agents/skills",
+    ".agents/spec",
+    ".agents/plan",
+    ".codex/skills",
+    ".codex/plugins/cache/fork-ops",
+)
+FULL_BREADTH_MAINTAINED_REPOS = (
+    "fork-ops",
+    "lemonade",
+    "codex-app-linux",
+    "warp",
+    "utilyze",
+    "arch-pkgs",
+    "arch-strix-halo-pkgs",
+)
+FULL_BREADTH_ADJACENT_REPOS = (
+    "agent-armory",
+    "tuned-limine",
+)
+FULL_BREADTH_REPO_BASE_ENV = "FORK_OPS_FULL_BREADTH_REPO_BASE"
+FULL_BREADTH_MAINTAINED_REPOS_ENV = "FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS"
+FULL_BREADTH_ADJACENT_REPOS_ENV = "FORK_OPS_FULL_BREADTH_ADJACENT_REPOS"
 UNAVAILABLE_MIGRATION_WORK = (
     "source-material replacement/removal",
     "arbitrary migration edits",
@@ -1025,7 +1062,9 @@ def build_status_report(
             )
         )
         capability = capability_report({}, diagnostics)
-        capability["equipment_review"] = _equipment_review_record_report(repo)
+        equipment_review = _equipment_review_record_report(repo)
+        capability["equipment_review"] = equipment_review
+        capability["accounting"] = _capability_accounting_summary(equipment_review)
         return {
             "repo_path": str(repo),
             "config_path": str(config_file),
@@ -1046,7 +1085,9 @@ def build_status_report(
             )
         )
         capability = capability_report({}, diagnostics)
-        capability["equipment_review"] = _equipment_review_record_report(repo)
+        equipment_review = _equipment_review_record_report(repo)
+        capability["equipment_review"] = equipment_review
+        capability["accounting"] = _capability_accounting_summary(equipment_review)
         return {
             "repo_path": str(repo),
             "config_path": str(config_file),
@@ -1070,6 +1111,7 @@ def build_status_report(
         "diagnostics": [item.to_dict() for item in diagnostics],
     }
     payload["capability"]["equipment_review"] = equipment_review
+    payload["capability"]["accounting"] = _capability_accounting_summary(equipment_review)
     if include_config:
         payload["config"] = _json_safe(normalized)
     return payload
@@ -1295,8 +1337,10 @@ def propose_migration_config_patch(
 def generate_migration_plan(
     repo_path: str | Path = ".",
     candidates: list[dict[str, Any]] | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     repo = Path(repo_path).expanduser().resolve()
+    scan_profile = _normalize_scan_profile(scan_profile)
     migration_candidates = candidates if candidates is not None else _migration_candidates(repo)
     proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
     evidence = _migration_plan_evidence(migration_candidates)
@@ -1304,23 +1348,33 @@ def generate_migration_plan(
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     migration_review_artifact = _migration_review_artifact(migration_map)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
+    workflow_inventory = (
+        build_workflow_migration_inventory(scan_profile=scan_profile)
+        if scan_profile == "full-breadth"
+        else None
+    )
     equipment_preflight = _equipment_migration_preflight(
         repo,
         migration_candidates,
         migration_map,
         blockers,
         source_roots=None,
-        workflow_inventory=None,
+        workflow_inventory=workflow_inventory,
+        scan_profile=scan_profile,
     )
     equipment_review_record = _equipment_review_record(equipment_preflight)
+    accounting_records = copy.deepcopy(equipment_preflight["accounting_records"])
+    follow_up_candidates = copy.deepcopy(equipment_preflight["follow_up_candidates"])
     plan = {
         "repo_path": str(repo),
         "mode": "non-mutating",
         "operation": "migration-plan",
+        "scan_profile": scan_profile,
         "requires_review": True,
         "workflow_run_mode": _migration_workflow_run_mode(),
         "source_material_disposition_types": list(SOURCE_MATERIAL_DISPOSITION_TYPES),
         "equipment_disposition_types": list(EQUIPMENT_DISPOSITION_TYPES),
+        "accounting_status_types": list(ACCOUNTING_STATUS_TYPES),
         "summary": {
             "candidate_count": len(migration_candidates),
             "evidence_source_count": len(evidence),
@@ -1333,6 +1387,8 @@ def generate_migration_plan(
             "retained_source_material_count": len(retained_source_materials),
             "blocker_count": len(blockers),
             "semantic_coverage": _semantic_coverage_status(blockers),
+            "accounting_record_count": len(accounting_records),
+            "follow_up_candidate_count": len(follow_up_candidates),
         },
         "equipment_migration_preflight": equipment_preflight,
         "equipment_review_record": equipment_review_record,
@@ -1343,6 +1399,8 @@ def generate_migration_plan(
         ),
         "evidence": evidence,
         "migration_map": migration_map,
+        "accounting_records": accounting_records,
+        "follow_up_candidates": follow_up_candidates,
         "migration_review_artifact": migration_review_artifact,
         "proposed_config_patch": proposed_config_patch,
         "retained_source_materials": retained_source_materials,
@@ -1368,14 +1426,20 @@ def generate_migration_plan(
 def build_equipment_migration_preflight(
     repo_path: str | Path = ".",
     source_roots: Iterable[str | Path] | str | Path | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     repo = Path(repo_path).expanduser().resolve()
+    scan_profile = _normalize_scan_profile(scan_profile)
     migration_candidates = _migration_candidates(repo)
     proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
     roots = _normalize_equipment_source_roots(source_roots)
-    workflow_inventory = build_workflow_migration_inventory(roots) if roots else None
+    workflow_inventory = (
+        build_workflow_migration_inventory(roots, scan_profile=scan_profile)
+        if roots or scan_profile == "full-breadth"
+        else None
+    )
     preflight = _equipment_migration_preflight(
         repo,
         migration_candidates,
@@ -1383,6 +1447,7 @@ def build_equipment_migration_preflight(
         blockers,
         source_roots=roots,
         workflow_inventory=workflow_inventory,
+        scan_profile=scan_profile,
     )
     preflight["equipment_review_record"] = _equipment_review_record(preflight)
     preflight["activation_readiness"] = _activation_readiness_report(
@@ -1395,8 +1460,12 @@ def build_equipment_migration_preflight(
 
 def build_workflow_migration_inventory(
     source_roots: Iterable[str | Path] | str | Path | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
-    roots = _workflow_inventory_roots(source_roots)
+    scan_profile = _normalize_scan_profile(scan_profile)
+    roots = _workflow_inventory_roots(source_roots, scan_profile)
+    source_root_records = _workflow_source_root_records(roots, scan_profile)
+    scopes_by_root = {record["path"]: record["source_scope"] for record in source_root_records}
     contracts = {item.id: item for item in workflow_contracts()}
     unresolvable_roots = [str(root) for root in roots if not root.exists()]
     entries: list[dict[str, Any]] = []
@@ -1407,26 +1476,49 @@ def build_workflow_migration_inventory(
             if resolved_path in seen_paths:
                 continue
             seen_paths.add(resolved_path)
-            entry = _workflow_inventory_entry(root, path, contracts)
+            entry = _workflow_inventory_entry(
+                root,
+                path,
+                contracts,
+                source_scope=scopes_by_root.get(str(root), "operator-source-root"),
+            )
             if entry:
                 entries.append(entry)
     entries.sort(key=lambda item: (item["source_root"], item["source_path"]))
     catalog_evidence = _workflow_catalog_evidence(entries, contracts)
     backlog_candidates = _workflow_backlog_candidates(entries)
+    accounting_records = _workflow_inventory_accounting_records(
+        entries,
+        source_root_records,
+    )
+    follow_up_candidates = _accounting_follow_up_candidates(accounting_records)
+    _validate_workflow_accounting(
+        entries,
+        source_root_records,
+        accounting_records,
+        follow_up_candidates,
+    )
     return {
         "operation": "workflow-migration-inventory",
         "mode": "read-only",
+        "scan_profile": scan_profile,
+        "profile_notes": _scan_profile_notes(scan_profile, source_root_records),
         "source_roots": [str(root) for root in roots],
+        "source_root_records": source_root_records,
         "summary": {
             "source_root_count": len(roots),
             "entry_count": len(entries),
             "catalog_evidence_group_count": len(catalog_evidence),
             "backlog_candidate_count": len(backlog_candidates),
             "unresolvable_source_root_count": len(unresolvable_roots),
+            "accounting_record_count": len(accounting_records),
+            "follow_up_candidate_count": len(follow_up_candidates),
         },
         "entries": entries,
         "catalog_evidence": catalog_evidence,
         "backlog_candidates": backlog_candidates,
+        "accounting_records": accounting_records,
+        "follow_up_candidates": follow_up_candidates,
         "unresolvable_source_roots": unresolvable_roots,
         "mutation_policy": "no source roots are modified",
         "limitations": [
@@ -1440,8 +1532,11 @@ def build_workflow_migration_inventory(
 def dry_run_migration(
     repo_path: str | Path = ".",
     plan: dict[str, Any] | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
-    migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
+    migration_plan = (
+        plan if plan is not None else generate_migration_plan(repo_path, scan_profile=scan_profile)
+    )
     return dry_run_migration_plan(migration_plan)
 
 
@@ -1465,6 +1560,8 @@ def dry_run_migration_plan(
     migration_review_artifact = _require_migration_review_artifact(plan)
     equipment_review_record = _optional_plan_dict(plan, "equipment_review_record")
     equipment_preflight = _optional_plan_dict(plan, "equipment_migration_preflight")
+    accounting_records = copy.deepcopy(plan.get("accounting_records", []))
+    follow_up_candidates = copy.deepcopy(plan.get("follow_up_candidates", []))
     retained_materials = _require_plan_list(plan, "retained_source_materials")
     deferred_removals = _require_plan_list(plan, "deferred_removals")
     retained_authority = _retained_authority(
@@ -1523,10 +1620,14 @@ def dry_run_migration_plan(
             "retained_material_count": len(retained_materials),
             "blocked_step_count": len(blocked_steps),
             "verification_command_count": len(expected_verification_commands),
+            "accounting_record_count": len(accounting_records),
+            "follow_up_candidate_count": len(follow_up_candidates),
         },
         "file_edits": file_edits,
         "config_changes": config_changes,
         "migration_map": migration_map,
+        "accounting_records": accounting_records,
+        "follow_up_candidates": follow_up_candidates,
         "equipment_migration_preflight": equipment_preflight,
         "equipment_review_record": equipment_review_record,
         "activation_readiness": activation_readiness,
@@ -3206,6 +3307,7 @@ def _equipment_migration_preflight(
     *,
     source_roots: list[Path] | None,
     workflow_inventory: dict[str, Any] | None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     map_by_path = {entry["source_path"]: entry for entry in migration_map}
     groups = [
@@ -3233,10 +3335,21 @@ def _equipment_migration_preflight(
         source_roots or [],
         workflow_inventory,
         blockers,
+        scan_profile,
     )
+    accounting_records = _equipment_preflight_accounting_records(
+        repo,
+        migration_map,
+        workflow_inventory,
+        unassessed_areas,
+    )
+    follow_up_candidates = _accounting_follow_up_candidates(accounting_records)
+    _validate_accounting_follow_up_coverage(accounting_records, follow_up_candidates)
     return {
+        "repo_path": str(repo),
         "operation": "equipment-migration-preflight",
         "mode": "read-only",
+        "scan_profile": scan_profile,
         "default_onboarding_intent": "migrate_toward_fork_ops",
         "discovery_scopes": discovery_scopes,
         "unassessed_equipment_areas": unassessed_areas,
@@ -3245,10 +3358,14 @@ def _equipment_migration_preflight(
             "equipment_group_count": len(groups),
             "evidence_entry_count": len(evidence_entries),
             "unassessed_equipment_area_count": len(unassessed_areas),
+            "accounting_record_count": len(accounting_records),
+            "follow_up_candidate_count": len(follow_up_candidates),
             "default_onboarding_intent": "migrate_toward_fork_ops",
         },
         "equipment_groups": groups,
         "evidence": evidence_entries,
+        "accounting_records": accounting_records,
+        "follow_up_candidates": follow_up_candidates,
         "operator_prompts": _equipment_operator_prompts(groups, unassessed_areas),
         "limitations": [
             "Installed or checked-in equipment is not treated as current operator intent.",
@@ -3308,7 +3425,7 @@ def _workflow_inventory_equipment_groups(inventory: dict[str, Any]) -> list[dict
         source_path = str(entry.get("source_path", ""))
         if not source_root or not source_path:
             continue
-        scope = "operator-source-root"
+        scope = str(entry.get("source_scope", "operator-source-root"))
         evidence_id = _equipment_evidence_id(scope, f"{source_root}:{source_path}")
         coverage_status = str(entry.get("coverage_status", "unknown"))
         disposition = _equipment_disposition_from_workflow_coverage(coverage_status)
@@ -3383,11 +3500,27 @@ def _equipment_discovery_scopes(
         }
     ]
     inventory_entries = workflow_inventory.get("entries", []) if workflow_inventory else []
-    unresolvable = set(
-        workflow_inventory.get("unresolvable_source_roots", []) if workflow_inventory else []
+    source_root_records = (
+        workflow_inventory.get("source_root_records", []) if workflow_inventory else []
     )
-    for root in source_roots:
-        root_text = str(root)
+    if source_root_records:
+        roots_for_scope = [
+            record for record in source_root_records if isinstance(record, dict)
+        ]
+    else:
+        roots_for_scope = [
+            {
+                "path": str(root),
+                "source_scope": "operator-source-root",
+                "root_role": "operator-provided",
+                "status": "unresolvable" if not root.exists() else "scanned",
+            }
+            for root in source_roots
+        ]
+    for record in roots_for_scope:
+        root_text = str(record.get("path", ""))
+        if not root_text:
+            continue
         entry_count = len(
             [
                 entry
@@ -3398,9 +3531,10 @@ def _equipment_discovery_scopes(
         scopes.append(
             {
                 "id": _equipment_scope_id(root_text),
-                "kind": "operator-source-root",
+                "kind": str(record.get("source_scope", "operator-source-root")),
+                "root_role": str(record.get("root_role", "operator-provided")),
                 "path": root_text,
-                "status": "unresolvable" if root_text in unresolvable else "scanned",
+                "status": str(record.get("status", "scanned")),
                 "equipment_group_count": entry_count,
             }
         )
@@ -3411,9 +3545,10 @@ def _unassessed_equipment_areas(
     source_roots: list[Path],
     workflow_inventory: dict[str, Any] | None,
     blockers: list[dict[str, Any]],
+    scan_profile: str,
 ) -> list[dict[str, Any]]:
     areas: list[dict[str, Any]] = []
-    if not source_roots:
+    if not source_roots and scan_profile != "full-breadth":
         areas.append(
             {
                 "id": "unassessed:user-global-equipment",
@@ -3425,11 +3560,18 @@ def _unassessed_equipment_areas(
             }
         )
     if workflow_inventory:
+        root_records = {
+            str(record.get("path", "")): record
+            for record in workflow_inventory.get("source_root_records", [])
+            if isinstance(record, dict)
+        }
         for root in workflow_inventory.get("unresolvable_source_roots", []):
+            record = root_records.get(str(root), {})
             areas.append(
                 {
                     "id": f"unassessed:{_short_digest(str(root))}",
-                    "scope": "operator-source-root",
+                    "scope": str(record.get("source_scope", "operator-source-root")),
+                    "source_root": str(root),
                     "path": str(root),
                     "reason": "The operator-provided source root could not be resolved.",
                     "activation_impact": "Treat this source root as not reviewed.",
@@ -3500,12 +3642,15 @@ def _equipment_review_record(preflight: dict[str, Any]) -> dict[str, Any]:
         "default_onboarding_intent": preflight["default_onboarding_intent"],
         "equipment_disposition_types": list(EQUIPMENT_DISPOSITION_TYPES),
         "equipment_decision_status_types": list(EQUIPMENT_DECISION_STATUS_TYPES),
+        "accounting_status_types": list(ACCOUNTING_STATUS_TYPES),
         "review_freshness_policy": (
             "revalidate when source hashes, discovery scopes, or activation gates change"
         ),
         "discovery_scopes": copy.deepcopy(preflight["discovery_scopes"]),
         "unassessed_equipment_areas": copy.deepcopy(preflight["unassessed_equipment_areas"]),
         "evidence": copy.deepcopy(preflight["evidence"]),
+        "accounting_records": copy.deepcopy(preflight["accounting_records"]),
+        "follow_up_candidates": copy.deepcopy(preflight["follow_up_candidates"]),
         "equipment": entries,
     }
     record["toml"] = _equipment_review_record_toml(record)
@@ -3541,9 +3686,12 @@ def _equipment_review_record_toml(record: dict[str, Any]) -> str:
         "review_freshness_policy": record["review_freshness_policy"],
         "equipment_disposition_types": record["equipment_disposition_types"],
         "equipment_decision_status_types": record["equipment_decision_status_types"],
+        "accounting_status_types": record["accounting_status_types"],
         "discovery_scopes": record["discovery_scopes"],
         "unassessed_equipment_areas": record["unassessed_equipment_areas"],
         "evidence": record["evidence"],
+        "accounting_records": record["accounting_records"],
+        "follow_up_candidates": record["follow_up_candidates"],
         "equipment": record["equipment"],
     }
     return _toml_dumps(toml_payload)
@@ -3561,6 +3709,9 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
             "retained_authority_paths": [],
             "pending_decision_count": 0,
             "unassessed_equipment_area_count": 0,
+            "accounting_record_count": 0,
+            "follow_up_candidate_count": 0,
+            "accounting_status_counts": _empty_accounting_status_counts(),
         }
     try:
         parsed = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -3575,6 +3726,9 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
             "retained_authority_paths": [],
             "pending_decision_count": 0,
             "unassessed_equipment_area_count": 0,
+            "accounting_record_count": 0,
+            "follow_up_candidate_count": 0,
+            "accounting_status_counts": _empty_accounting_status_counts(),
         }
     if parsed.get("artifact_kind") != "equipment_review":
         return {
@@ -3587,10 +3741,20 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
             "retained_authority_paths": [],
             "pending_decision_count": 0,
             "unassessed_equipment_area_count": 0,
+            "accounting_record_count": 0,
+            "follow_up_candidate_count": 0,
+            "accounting_status_counts": _empty_accounting_status_counts(),
         }
-    malformed_section = _malformed_record_section(parsed, "equipment")
-    if malformed_section is None:
-        malformed_section = _malformed_record_section(parsed, "unassessed_equipment_areas")
+    malformed_section = None
+    for section in (
+        "equipment",
+        "unassessed_equipment_areas",
+        "accounting_records",
+        "follow_up_candidates",
+    ):
+        malformed_section = _malformed_record_section(parsed, section)
+        if malformed_section is not None:
+            break
     if malformed_section is not None:
         return {
             "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
@@ -3602,9 +3766,14 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
             "retained_authority_paths": [],
             "pending_decision_count": 0,
             "unassessed_equipment_area_count": 0,
+            "accounting_record_count": 0,
+            "follow_up_candidate_count": 0,
+            "accounting_status_counts": _empty_accounting_status_counts(),
         }
     equipment_entries = _record_table_list(parsed.get("equipment"))
     unassessed_areas = _record_table_list(parsed.get("unassessed_equipment_areas"))
+    accounting_records = _record_table_list(parsed.get("accounting_records"))
+    follow_up_candidates = _record_table_list(parsed.get("follow_up_candidates"))
     reviewed_retained = [
         entry["source_path"]
         for entry in equipment_entries
@@ -3639,6 +3808,9 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
         ),
         "pending_decision_count": pending_count,
         "unassessed_equipment_area_count": len(unassessed_areas),
+        "accounting_record_count": len(accounting_records),
+        "follow_up_candidate_count": len(follow_up_candidates),
+        "accounting_status_counts": _accounting_status_counts(accounting_records),
         "retained_authority_paths": reviewed_retained,
     }
 
@@ -3658,6 +3830,35 @@ def _malformed_record_section(record: dict[str, Any], key: str) -> str | None:
     if any(not isinstance(item, dict) for item in value):
         return key
     return None
+
+
+def _empty_accounting_status_counts() -> dict[str, int]:
+    return {status: 0 for status in ACCOUNTING_STATUS_TYPES}
+
+
+def _accounting_status_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts = _empty_accounting_status_counts()
+    for record in records:
+        status = record.get("accounting_status")
+        if not isinstance(status, str):
+            continue
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _capability_accounting_summary(equipment_review: dict[str, Any]) -> dict[str, Any]:
+    status_counts = _empty_accounting_status_counts()
+    raw_counts = equipment_review.get("accounting_status_counts")
+    if isinstance(raw_counts, dict):
+        for status, count in raw_counts.items():
+            if isinstance(status, str) and isinstance(count, int):
+                status_counts[status] = count
+    return {
+        "accounting_record_count": int(equipment_review.get("accounting_record_count", 0)),
+        "follow_up_candidate_count": int(equipment_review.get("follow_up_candidate_count", 0)),
+        "status_counts": copy.deepcopy(status_counts),
+        "replacement_coverage_ready": bool(equipment_review.get("replacement_coverage_ready")),
+    }
 
 
 def _activation_readiness_report(
@@ -4985,16 +5186,155 @@ def schema_artifact_report(plugin_root: str | Path = ".") -> dict[str, Any]:
 
 def _workflow_inventory_roots(
     source_roots: Iterable[str | Path] | str | Path | None,
+    scan_profile: str = "custom",
 ) -> list[Path]:
+    profile_roots = _scan_profile_roots(scan_profile)
     if source_roots is None:
-        raw_roots: list[str | Path] = ["."]
+        raw_roots: list[str | Path] = [] if scan_profile == "full-breadth" else ["."]
     elif isinstance(source_roots, (str, Path)):
         raw_roots = [source_roots]
     else:
         raw_roots = list(source_roots)
+    if scan_profile == "full-breadth":
+        raw_roots = [*profile_roots, *raw_roots]
     if not raw_roots:
         raw_roots = ["."]
-    return [Path(root).expanduser().resolve() for root in raw_roots]
+    roots = [Path(root).expanduser().resolve() for root in raw_roots]
+    return _dedupe_paths(roots)
+
+
+def _normalize_scan_profile(scan_profile: str | None) -> str:
+    profile = scan_profile or "custom"
+    if profile not in SCAN_PROFILES:
+        raise ForkOpsError(
+            f"Unknown scan profile: {profile}. Expected one of: {', '.join(SCAN_PROFILES)}."
+        )
+    return profile
+
+
+def _scan_profile_roots(scan_profile: str) -> list[Path]:
+    if scan_profile != "full-breadth":
+        return []
+    home = Path.home().resolve()
+    repo_base = _full_breadth_repo_base()
+    roots = [home / relative for relative in FULL_BREADTH_USER_ROOTS]
+    if repo_base is not None:
+        roots.extend(repo_base / name for name in _full_breadth_maintained_repos())
+        roots.extend(repo_base / name for name in _full_breadth_adjacent_repos())
+    return roots
+
+
+def _full_breadth_repo_base() -> Path | None:
+    configured = os.environ.get(FULL_BREADTH_REPO_BASE_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return None
+
+
+def _full_breadth_maintained_repos() -> tuple[str, ...]:
+    return _full_breadth_repo_names(
+        FULL_BREADTH_MAINTAINED_REPOS_ENV,
+        FULL_BREADTH_MAINTAINED_REPOS,
+    )
+
+
+def _full_breadth_adjacent_repos() -> tuple[str, ...]:
+    return _full_breadth_repo_names(
+        FULL_BREADTH_ADJACENT_REPOS_ENV,
+        FULL_BREADTH_ADJACENT_REPOS,
+    )
+
+
+def _full_breadth_repo_names(env_name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    configured = os.environ.get(env_name)
+    if configured is None:
+        return defaults
+    return tuple(name.strip() for name in configured.split(",") if name.strip())
+
+
+def _scan_profile_notes(
+    scan_profile: str,
+    source_root_records: list[dict[str, Any]],
+) -> list[str]:
+    if scan_profile != "full-breadth":
+        return []
+    repo_base = _full_breadth_repo_base()
+    notes = [
+        (
+            "full-breadth derives user-global roots from Path.home(). Set "
+            f"{FULL_BREADTH_REPO_BASE_ENV} to include maintained-fork and "
+            "adjacent repository roots."
+        ),
+        (
+            "Override maintained and adjacent repository directory names with "
+            f"{FULL_BREADTH_MAINTAINED_REPOS_ENV} and {FULL_BREADTH_ADJACENT_REPOS_ENV}."
+        ),
+    ]
+    if repo_base is None:
+        notes.append(
+            "No maintained-fork repository roots were added because "
+            f"{FULL_BREADTH_REPO_BASE_ENV} is unset."
+        )
+    if source_root_records and all(
+        record.get("status") == "unresolvable" for record in source_root_records
+    ):
+        notes.append(
+            "All full-breadth profile roots are unresolvable in this environment."
+        )
+    return notes
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _workflow_source_root_records(
+    roots: list[Path],
+    scan_profile: str,
+) -> list[dict[str, Any]]:
+    return [_workflow_source_root_record(root, scan_profile) for root in roots]
+
+
+def _workflow_source_root_record(root: Path, scan_profile: str) -> dict[str, Any]:
+    scope, role = _workflow_source_root_scope(root, scan_profile)
+    return {
+        "id": f"source-root:{_short_digest(str(root))}",
+        "path": str(root),
+        "source_scope": scope,
+        "root_role": role,
+        "status": "scanned" if root.exists() else "unresolvable",
+    }
+
+
+def _workflow_source_root_scope(root: Path, scan_profile: str) -> tuple[str, str]:
+    if scan_profile != "full-breadth":
+        return "operator-source-root", "operator-provided"
+    home = Path.home().resolve()
+    repo_base = _full_breadth_repo_base()
+    try:
+        relative_to_home = root.resolve().relative_to(home)
+    except ValueError:
+        relative_to_home = None
+    if relative_to_home is not None:
+        rel = relative_to_home.as_posix()
+        if rel in FULL_BREADTH_USER_ROOTS:
+            return "user-global", rel
+    if repo_base is not None:
+        for name in _full_breadth_maintained_repos():
+            if root.resolve() == (repo_base / name).resolve():
+                return "maintained-fork", name
+        for name in _full_breadth_adjacent_repos():
+            if root.resolve() == (repo_base / name).resolve():
+                return "adjacent-root", name
+    return "operator-source-root", "operator-provided"
 
 
 def _iter_workflow_inventory_paths(root: Path) -> Iterable[Path]:
@@ -5004,20 +5344,33 @@ def _iter_workflow_inventory_paths(root: Path) -> Iterable[Path]:
         return
     if not root.is_dir():
         return
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative_parts = path.relative_to(root).parts
-        if any(part in _CANDIDATE_SCAN_SKIP_DIRS for part in relative_parts[:-1]):
-            continue
-        if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
-            yield path
+    for current_root, dirnames, filenames in os.walk(root):
+        current_path = Path(current_root)
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not _workflow_inventory_skip_dir(current_path, dirname)
+        ]
+        for filename in filenames:
+            path = current_path / filename
+            if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
+                yield path
+
+
+def _workflow_inventory_skip_dir(parent: Path, dirname: str) -> bool:
+    if dirname in _CANDIDATE_SCAN_SKIP_DIRS:
+        return True
+    if dirname in {"pkg", "src"} and (parent / "PKGBUILD").exists():
+        return True
+    return False
 
 
 def _workflow_inventory_entry(
     root: Path,
     path: Path,
     contracts: dict[str, WorkflowContract],
+    *,
+    source_scope: str = "operator-source-root",
 ) -> dict[str, Any] | None:
     raw_bytes = _read_bytes(path)
     raw_text = raw_bytes.decode(errors="ignore")
@@ -5032,6 +5385,7 @@ def _workflow_inventory_entry(
     return {
         "id": entry_id,
         "source_root": str(root),
+        "source_scope": source_scope,
         "source_path": source_path,
         "source_kind": source_kind,
         "material_scope": _workflow_material_scope(source_kind, source_path, path, raw_text),
@@ -5093,7 +5447,14 @@ def _workflow_path_tokens(part: str) -> tuple[str, ...]:
 
 
 def _is_user_global_agents_path(path: Path) -> bool:
-    return path.resolve().is_relative_to((Path.home() / ".agents").resolve())
+    resolved = path.resolve()
+    home = Path.home().resolve()
+    user_global_roots = (
+        home / ".agents",
+        home / ".codex" / "skills",
+        home / ".codex" / "plugins" / "cache" / "fork-ops",
+    )
+    return any(resolved.is_relative_to(root.resolve()) for root in user_global_roots)
 
 
 def _workflow_inventory_signals(
@@ -5327,6 +5688,423 @@ def _workflow_backlog_candidates(entries: list[dict[str, Any]]) -> list[dict[str
             }
         )
     return sorted(candidates, key=lambda item: (item["candidate_target"], item["source_path"]))
+
+
+def _workflow_inventory_accounting_records(
+    entries: list[dict[str, Any]],
+    source_root_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records = [_accounting_record_from_workflow_entry(entry) for entry in entries]
+    for root in source_root_records:
+        if root.get("status") != "unresolvable":
+            continue
+        records.append(_accounting_record_from_unresolvable_root(root))
+    return sorted(
+        records,
+        key=lambda item: (item["source_scope"], item["source_root"], item["source_path"]),
+    )
+
+
+def _validate_workflow_accounting(
+    entries: list[dict[str, Any]],
+    source_root_records: list[dict[str, Any]],
+    accounting_records: list[dict[str, Any]],
+    follow_up_candidates: list[dict[str, Any]],
+) -> None:
+    expected_entry_ids = sorted(str(entry["id"]) for entry in entries)
+    actual_entry_ids = sorted(
+        str(record.get("source_entry_id", ""))
+        for record in accounting_records
+        if record.get("source_entry_id")
+    )
+    if actual_entry_ids != expected_entry_ids:
+        raise ForkOpsError(
+            "Workflow inventory accounting must map every scanned entry exactly once."
+        )
+    expected_unresolvable_roots = sorted(
+        str(root.get("path", ""))
+        for root in source_root_records
+        if root.get("status") == "unresolvable"
+    )
+    actual_unresolvable_roots = sorted(
+        str(record.get("source_root", ""))
+        for record in accounting_records
+        if record.get("source_kind") == "source-root"
+        and record.get("accounting_status") == "unassessed"
+    )
+    if actual_unresolvable_roots != expected_unresolvable_roots:
+        raise ForkOpsError(
+            "Workflow inventory accounting must map every unresolvable source root."
+        )
+    _validate_accounting_follow_up_coverage(accounting_records, follow_up_candidates)
+
+
+def _validate_accounting_follow_up_coverage(
+    accounting_records: list[dict[str, Any]],
+    follow_up_candidates: list[dict[str, Any]],
+) -> None:
+    candidate_record_ids = {
+        str(candidate.get("accounting_record_id", ""))
+        for candidate in follow_up_candidates
+        if candidate.get("accounting_record_id")
+    }
+    missing = [
+        str(record.get("id", ""))
+        for record in accounting_records
+        if _accounting_status_needs_follow_up(str(record.get("accounting_status", "")))
+        and str(record.get("id", "")) not in candidate_record_ids
+    ]
+    if missing:
+        raise ForkOpsError(
+            "Accounting follow-up candidates are required for planned, candidate, "
+            "and unassessed records."
+        )
+
+
+def _accounting_record_from_workflow_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    status = _accounting_status_for_workflow_entry(entry)
+    target = _accounting_target_for_workflow_entry(entry, status)
+    follow_up_id = _follow_up_id_for_accounting(
+        entry["source_scope"],
+        entry["source_root"],
+        entry["source_path"],
+        entry["likely_workflow_catalog_target"],
+    )
+    record: dict[str, Any] = {
+        "id": _accounting_record_id(
+            entry["source_scope"],
+            entry["source_root"],
+            entry["source_path"],
+        ),
+        "source_entry_id": entry["id"],
+        "source_scope": entry["source_scope"],
+        "source_root": entry["source_root"],
+        "source_path": entry["source_path"],
+        "source_kind": entry["source_kind"],
+        "material_scope": entry["material_scope"],
+        "accounting_status": status,
+        "coverage_status": entry["coverage_status"],
+        "target_surface_type": target["type"],
+        "target_workflow_id": target.get("workflow_id", ""),
+        "target_path": target.get("path", ""),
+        "reason": _accounting_reason(status, entry),
+        "next_action": _accounting_next_action(status, entry),
+    }
+    if _accounting_status_needs_follow_up(status):
+        record["follow_up_id"] = follow_up_id
+    else:
+        record["follow_up_id"] = ""
+    return record
+
+
+def _accounting_status_for_workflow_entry(entry: dict[str, Any]) -> str:
+    material_scope = str(entry.get("material_scope", ""))
+    source_kind = str(entry.get("source_kind", ""))
+    if material_scope == "fork-local-authority-material":
+        if source_kind == "config":
+            return "fork_local_config"
+        return "retained_fork_local_authority"
+    coverage_status = str(entry.get("coverage_status", ""))
+    if coverage_status == "covered-current":
+        return "implemented_workflow"
+    if coverage_status == "covered-diagnostic-only":
+        return "diagnostic_only_workflow"
+    if coverage_status == "cataloged-not-implemented":
+        return "planned_workflow"
+    return "repo_ops_candidate"
+
+
+def _accounting_target_for_workflow_entry(
+    entry: dict[str, Any],
+    status: str,
+) -> dict[str, str]:
+    if status in {"implemented_workflow", "diagnostic_only_workflow", "planned_workflow"}:
+        return {
+            "type": "workflow",
+            "workflow_id": str(entry.get("likely_workflow_catalog_target", "")),
+        }
+    if status == "fork_local_config":
+        return {"type": "fork_local_config", "path": str(entry.get("source_path", ""))}
+    if status == "retained_fork_local_authority":
+        return {"type": "fork_local_authority", "path": str(entry.get("source_path", ""))}
+    if status == "repo_ops_candidate":
+        return {
+            "type": "repo_ops_candidate",
+            "workflow_id": str(entry.get("likely_workflow_catalog_target", "")),
+        }
+    if status == "out_of_scope":
+        return {"type": "none"}
+    return {"type": "unassessed"}
+
+
+def _accounting_record_from_unresolvable_root(root: dict[str, Any]) -> dict[str, Any]:
+    source_root = str(root.get("path", ""))
+    record_id = _accounting_record_id(str(root.get("source_scope", "")), source_root, "")
+    return {
+        "id": record_id,
+        "source_entry_id": "",
+        "source_scope": str(root.get("source_scope", "operator-source-root")),
+        "source_root": source_root,
+        "source_path": "",
+        "source_kind": "source-root",
+        "material_scope": "unassessed-source-root",
+        "accounting_status": "unassessed",
+        "coverage_status": "unassessed",
+        "target_surface_type": "unassessed_area",
+        "target_workflow_id": "",
+        "target_path": "",
+        "reason": "The source root could not be resolved.",
+        "next_action": "Resolve or remove this source root.",
+        "follow_up_id": _follow_up_id_for_accounting(
+            str(root.get("source_scope", "operator-source-root")),
+            source_root,
+            "",
+            "unassessed-source-root",
+        ),
+    }
+
+
+def _equipment_preflight_accounting_records(
+    repo: Path,
+    migration_map: list[dict[str, Any]],
+    workflow_inventory: dict[str, Any] | None,
+    unassessed_areas: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records = [
+        _accounting_record_from_migration_entry(repo, entry) for entry in migration_map
+    ]
+    if workflow_inventory:
+        records.extend(copy.deepcopy(workflow_inventory.get("accounting_records", [])))
+    for area in unassessed_areas:
+        if area.get("path"):
+            continue
+        records.append(_accounting_record_from_unassessed_area(area))
+    return _dedupe_accounting_records(records)
+
+
+def _accounting_record_from_migration_entry(
+    repo: Path,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    disposition = str(entry.get("disposition", {}).get("type", ""))
+    status = _accounting_status_for_source_disposition(disposition)
+    source_path = str(entry.get("source_path", ""))
+    record: dict[str, Any] = {
+        "id": _accounting_record_id("repo-local", str(repo), source_path),
+        "source_entry_id": str(entry.get("id", "")),
+        "source_scope": "repo-local",
+        "source_root": str(repo),
+        "source_path": source_path,
+        "source_kind": str(entry.get("source_kind", "")),
+        "material_scope": "fork-local-source-material",
+        "accounting_status": status,
+        "coverage_status": disposition or "unknown",
+        "target_surface_type": str(entry.get("target_surface", {}).get("type", "")),
+        "target_workflow_id": str(entry.get("target_surface", {}).get("workflow_id", "")),
+        "target_path": str(entry.get("target_surface", {}).get("path", "")),
+        "reason": _accounting_reason_for_source_disposition(disposition),
+        "next_action": _accounting_next_action_for_source_disposition(disposition),
+    }
+    if _accounting_status_needs_follow_up(status):
+        record["follow_up_id"] = _follow_up_id_for_accounting(
+            "repo-local",
+            str(repo),
+            source_path,
+            disposition,
+        )
+    else:
+        record["follow_up_id"] = ""
+    return record
+
+
+def _accounting_status_for_source_disposition(disposition: str) -> str:
+    if disposition == "extracted_into_config":
+        return "fork_local_config"
+    if disposition == "retained_as_fork_local_authority":
+        return "retained_fork_local_authority"
+    if disposition == "mapped_to_workflow_backlog":
+        return "planned_workflow"
+    if disposition == "irrelevant_to_fork_ops":
+        return "out_of_scope"
+    return "unassessed"
+
+
+def _accounting_record_from_unassessed_area(area: dict[str, Any]) -> dict[str, Any]:
+    scope = str(area.get("scope", area.get("source_scope", "unassessed")))
+    path = str(area.get("path", ""))
+    record_id = _accounting_record_id(scope, str(area.get("source_root", "")), path)
+    return {
+        "id": record_id,
+        "source_entry_id": "",
+        "source_scope": scope,
+        "source_root": str(area.get("source_root", "")),
+        "source_path": path,
+        "source_kind": "unassessed-area",
+        "material_scope": "unassessed-area",
+        "accounting_status": "unassessed",
+        "coverage_status": "unassessed",
+        "target_surface_type": "unassessed_area",
+        "target_workflow_id": "",
+        "target_path": path,
+        "reason": str(area.get("reason", "Equipment area has not been assessed.")),
+        "next_action": str(area.get("next_action", "Scan, accept risk for, or keep limits.")),
+        "follow_up_id": _follow_up_id_for_accounting(
+            scope,
+            str(area.get("source_root", "")),
+            path,
+            "unassessed",
+        ),
+    }
+
+
+def _dedupe_accounting_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        record_id = str(record.get("id", ""))
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        deduped.append(record)
+    return sorted(
+        deduped,
+        key=lambda item: (item["source_scope"], item["source_root"], item["source_path"]),
+    )
+
+
+def _accounting_follow_up_candidates(
+    accounting_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in accounting_records:
+        if not _accounting_status_needs_follow_up(str(record.get("accounting_status", ""))):
+            continue
+        follow_up_id = str(record.get("follow_up_id", ""))
+        if not follow_up_id or follow_up_id in seen:
+            continue
+        seen.add(follow_up_id)
+        candidates.append(
+            {
+                "id": follow_up_id,
+                "accounting_record_id": str(record.get("id", "")),
+                "audience_scope": _follow_up_audience_scope(record),
+                "status": "candidate",
+                "target_tracker": _follow_up_target_tracker(record),
+                "title": _follow_up_title(record),
+                "reason": str(record.get("reason", "")),
+                "next_action": _follow_up_next_action(record),
+            }
+        )
+    return candidates
+
+
+def _accounting_status_needs_follow_up(status: str) -> bool:
+    return status in {"planned_workflow", "repo_ops_candidate", "unassessed"}
+
+
+def _follow_up_audience_scope(record: dict[str, Any]) -> str:
+    if str(record.get("source_scope")) == "user-global":
+        return "user-specific"
+    return "team-wide"
+
+
+def _follow_up_target_tracker(record: dict[str, Any]) -> str:
+    if _follow_up_audience_scope(record) == "user-specific":
+        return "user-follow-up-registry"
+    return "github-issues"
+
+
+def _follow_up_title(record: dict[str, Any]) -> str:
+    workflow_id = str(record.get("target_workflow_id", ""))
+    if workflow_id:
+        return f"Account for {workflow_id} behavior"
+    source_path = str(record.get("source_path", "")) or str(record.get("source_root", ""))
+    return f"Account for {source_path}"
+
+
+def _follow_up_next_action(record: dict[str, Any]) -> str:
+    if _follow_up_audience_scope(record) == "user-specific":
+        return "Record in the user follow-up registry or resolve the user-scoped equipment gap."
+    return "Create or link a durable GitHub issue for this follow-up candidate."
+
+
+def _accounting_record_id(source_scope: str, source_root: str, source_path: str) -> str:
+    return f"accounting:{_short_digest(f'{source_scope}:{source_root}:{source_path}')}"
+
+
+def _follow_up_id_for_accounting(
+    source_scope: str,
+    source_root: str,
+    source_path: str,
+    target: str,
+) -> str:
+    return f"follow-up:{_short_digest(f'{source_scope}:{source_root}:{source_path}:{target}')}"
+
+
+def _accounting_reason(status: str, entry: dict[str, Any]) -> str:
+    workflow_id = str(entry.get("likely_workflow_catalog_target", ""))
+    if status == "implemented_workflow":
+        return f"{workflow_id} is implemented in Fork Ops."
+    if status == "diagnostic_only_workflow":
+        return f"{workflow_id} is available only as diagnostic behavior."
+    if status == "planned_workflow":
+        return f"{workflow_id} is cataloged but not implemented."
+    if status == "fork_local_config":
+        return "This config remains fork-local authority."
+    if status == "retained_fork_local_authority":
+        return "This source remains retained fork-local authority."
+    if status == "repo_ops_candidate":
+        return "This reusable behavior is a future Repo Ops or workflow-catalog candidate."
+    if status == "out_of_scope":
+        return "This source is outside Fork Ops behavior."
+    return "This source has not been assessed enough for coverage claims."
+
+
+def _accounting_next_action(status: str, entry: dict[str, Any]) -> str:
+    if status in {"implemented_workflow", "diagnostic_only_workflow"}:
+        return "Keep coverage evidence visible in inventory output."
+    if status == "planned_workflow":
+        return "Create or link a durable follow-up issue for the planned workflow."
+    if status == "fork_local_config":
+        return "Retain as fork-local config authority."
+    if status == "retained_fork_local_authority":
+        return "Retain and read this fork-local authority until replacement coverage validates."
+    if status == "repo_ops_candidate":
+        return "Track as a future Repo Ops or workflow-catalog follow-up."
+    if status == "out_of_scope":
+        return "No Fork Ops action is required."
+    return "Resolve the unassessed area before making replacement coverage claims."
+
+
+def _accounting_reason_for_source_disposition(disposition: str) -> str:
+    return {
+        "extracted_into_config": "Machine-actionable facts are represented in proposed config.",
+        "retained_as_fork_local_authority": "The source remains retained fork-local authority.",
+        "mapped_to_workflow_backlog": "The source maps to planned workflow follow-up work.",
+        "irrelevant_to_fork_ops": "The source does not describe fork ops behavior.",
+        "unsupported_extractor_shape": "The source was relevant but not semantically extracted.",
+        "needs_human_decision": "The source requires an operator decision.",
+        "deferred_with_rationale": (
+            "The source requires migration work outside this execution slice."
+        ),
+    }.get(disposition, "The source has not been assessed enough for coverage claims.")
+
+
+def _accounting_next_action_for_source_disposition(disposition: str) -> str:
+    return {
+        "extracted_into_config": "Review proposed config before creating Fork Ops config.",
+        "retained_as_fork_local_authority": (
+            "Retain and read this authority until replacement coverage validates."
+        ),
+        "mapped_to_workflow_backlog": (
+            "Create or link a durable follow-up issue for the workflow gap."
+        ),
+        "irrelevant_to_fork_ops": "No Fork Ops action is required.",
+        "unsupported_extractor_shape": "Review, retain, or improve semantic extraction.",
+        "needs_human_decision": "Record the operator decision before proceeding.",
+        "deferred_with_rationale": "Keep as deferred migration work with rationale.",
+    }.get(disposition, "Resolve the unassessed area before making coverage claims.")
 
 
 def _missing_requirements(config: dict[str, Any], level: str) -> Iterable[str]:

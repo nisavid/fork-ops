@@ -126,24 +126,32 @@ def fork_ops_migration_assessment(
 def fork_ops_equipment_migration_preflight(
     repo_path: str = ".",
     source_roots: list[str] | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     """Build a read-only equipment migration preflight for onboarding."""
-    return build_equipment_migration_preflight(repo_path, source_roots)
+    return build_equipment_migration_preflight(
+        repo_path,
+        source_roots,
+        scan_profile=scan_profile,
+    )
 
 
 @_tool
-def fork_ops_migration_plan(repo_path: str = ".") -> dict[str, Any]:
+def fork_ops_migration_plan(repo_path: str = ".", scan_profile: str = "custom") -> dict[str, Any]:
     """Generate a non-mutating migration plan from fork-related materials."""
-    return generate_migration_plan(repo_path)
+    return generate_migration_plan(repo_path, scan_profile=scan_profile)
 
 
 @_tool
 def fork_ops_migration_dry_run(
     repo_path: str = ".",
     migration_plan: dict[str, Any] | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     """Preview a migration plan without mutating the repository."""
-    return dry_run_migration(repo_path, plan=migration_plan)
+    if migration_plan is not None and scan_profile != "custom":
+        raise ForkOpsError("scan_profile cannot be used with migration_plan.")
+    return dry_run_migration(repo_path, plan=migration_plan, scan_profile=scan_profile)
 
 
 @_tool
@@ -185,9 +193,10 @@ def fork_ops_workflow_catalog() -> dict[str, Any]:
 @_tool
 def fork_ops_workflow_migration_inventory(
     source_roots: list[str] | None = None,
+    scan_profile: str = "custom",
 ) -> dict[str, Any]:
     """Build a read-only workflow migration inventory from source roots."""
-    return build_workflow_migration_inventory(source_roots)
+    return build_workflow_migration_inventory(source_roots, scan_profile=scan_profile)
 
 
 def mcp_healthcheck() -> dict[str, Any]:
