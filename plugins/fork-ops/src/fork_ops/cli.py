@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from .core import (
     CONFIG_RELATIVE_PATH,
+    SCAN_PROFILES,
     ForkOpsError,
     assess_migration,
     build_equipment_migration_preflight,
@@ -114,12 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="source_roots",
         help="Additional global or local equipment root to scan. May be provided more than once.",
     )
+    _add_scan_profile_arg(preflight)
     preflight.set_defaults(func=cmd_migration_preflight)
     plan = migration_subcommands.add_parser(
         "plan",
         help="Generate a non-mutating migration plan.",
     )
     _add_repo_arg(plan)
+    _add_scan_profile_arg(plan)
     plan.set_defaults(func=cmd_migration_plan)
     dry_run = migration_subcommands.add_parser(
         "dry-run",
@@ -131,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan",
         help="Read an existing migration plan JSON file instead of generating one from --repo.",
     )
+    _add_scan_profile_arg(dry_run)
     dry_run.set_defaults(func=cmd_migration_dry_run)
     execute = migration_subcommands.add_parser(
         "execute",
@@ -181,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="source_roots",
         help="Source file or directory to scan. May be provided more than once.",
     )
+    _add_scan_profile_arg(workflow_inventory_parser)
     workflow_inventory_parser.set_defaults(func=cmd_workflow_inventory)
 
     plugin = subcommands.add_parser("plugin", help="Inspect Fork Ops plugin package state.")
@@ -231,6 +236,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_repo_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".", help="Repository root to inspect.")
+
+
+def _add_scan_profile_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--scan-profile",
+        choices=SCAN_PROFILES,
+        default="custom",
+        help="Source-root expansion profile to use for migration accounting.",
+    )
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
@@ -335,7 +349,11 @@ def cmd_migration_assess(args: argparse.Namespace) -> int:
 def cmd_migration_preflight(args: argparse.Namespace) -> int:
     print(
         json.dumps(
-            build_equipment_migration_preflight(args.repo, args.source_roots),
+            build_equipment_migration_preflight(
+                args.repo,
+                args.source_roots,
+                scan_profile=args.scan_profile,
+            ),
             indent=2,
             sort_keys=True,
         )
@@ -344,12 +362,20 @@ def cmd_migration_preflight(args: argparse.Namespace) -> int:
 
 
 def cmd_migration_plan(args: argparse.Namespace) -> int:
-    print(json.dumps(generate_migration_plan(args.repo), indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            generate_migration_plan(args.repo, scan_profile=args.scan_profile),
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
 def cmd_migration_dry_run(args: argparse.Namespace) -> int:
     if args.plan:
+        if args.scan_profile != "custom":
+            raise ForkOpsError("--scan-profile cannot be used with --plan.")
         print(
             json.dumps(
                 dry_run_migration_plan(_read_json_plan(args.plan)),
@@ -358,7 +384,13 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
             )
         )
     else:
-        print(json.dumps(dry_run_migration(args.repo), indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                dry_run_migration(args.repo, scan_profile=args.scan_profile),
+                indent=2,
+                sort_keys=True,
+            )
+        )
     return 0
 
 
@@ -404,7 +436,10 @@ def cmd_workflow_catalog(args: argparse.Namespace) -> int:
 def cmd_workflow_inventory(args: argparse.Namespace) -> int:
     print(
         json.dumps(
-            build_workflow_migration_inventory(args.source_roots),
+            build_workflow_migration_inventory(
+                args.source_roots,
+                scan_profile=args.scan_profile,
+            ),
             indent=2,
             sort_keys=True,
         )

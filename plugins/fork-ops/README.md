@@ -10,13 +10,13 @@ local development checks.
 > The foundation version targets `track-aware`. It supports config discovery,
 > schema validation, upstream release-channel and upstream track modeling, live
 > Git ref checks, CLI access, MCP access, workflow migration inventory,
-> read-only migration assessment, equipment migration preflight, migration plans
-> with disposition maps, proposed review artifacts, proposed equipment review
-> records, activation-readiness reports, dry-run, guarded execution, config
-> proposal generation, operator-readable migration narratives, and blocker
-> explanations. Broad sync mutations, publication closeout, arbitrary migration
-> edits, equipment edits, equipment disabling, and source-material removal are
-> designed but not enabled yet.
+> read-only migration assessment, equipment migration preflight, full-breadth
+> accounting records, migration plans with disposition maps, proposed review
+> artifacts, proposed equipment review records, activation-readiness reports,
+> dry-run, guarded execution, config proposal generation, operator-readable
+> migration narratives, and blocker explanations. Broad sync mutations,
+> publication closeout, arbitrary migration edits, equipment edits, equipment
+> disabling, and source-material removal are designed but not enabled yet.
 
 ## Surfaces
 
@@ -41,7 +41,13 @@ Inventory reusable workflow materials without editing source roots:
 
 ```bash
 uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
+uv run --package fork-ops fork-ops workflow inventory --scan-profile full-breadth
 ```
+
+`full-breadth` includes repository roots only when
+`FORK_OPS_FULL_BREADTH_REPO_BASE` is set. Override the repo-name sets with
+`FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS` and
+`FORK_OPS_FULL_BREADTH_ADJACENT_REPOS` when running against another layout.
 
 Validate the config before relying on track-aware operations:
 
@@ -54,6 +60,7 @@ Assess existing fork-related materials without editing the fork:
 ```bash
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --scan-profile full-breadth
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
 uv run --package fork-ops fork-ops migration propose-config --repo /path/to/fork --format toml
@@ -75,6 +82,7 @@ uv run --package fork-ops fork-ops plugin health
 uv run --package fork-ops fork-ops schema print
 uv run --package fork-ops fork-ops workflow catalog
 uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
+uv run --package fork-ops fork-ops workflow inventory --scan-profile full-breadth
 uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork
 uv run --package fork-ops fork-ops migration assess --repo /path/to/fork --with-proposed-config

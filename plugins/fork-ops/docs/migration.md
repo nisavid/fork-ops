@@ -27,6 +27,7 @@ equipment review record.
 ```bash
 uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork
 uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --source-root /path/to/global-skills
+uv run --package fork-ops fork-ops migration preflight --repo /path/to/fork --scan-profile full-breadth
 ```
 
 The proposed equipment review record targets
@@ -35,6 +36,55 @@ The proposed equipment review record targets
 dispositions such as `retain_authoritative_owner`, but activation, disable, and
 redirect effects still require projection into config or another explicit
 control surface before behavior changes.
+
+## Full-Breadth Accounting
+
+Use `--scan-profile full-breadth` when full-breadth accounting is required. The
+profile derives its user-global roots from the current user's home directory and
+adds repository roots only when `FORK_OPS_FULL_BREADTH_REPO_BASE` names a
+maintained-repository base directory. Set
+`FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS` and
+`FORK_OPS_FULL_BREADTH_ADJACENT_REPOS` to comma-separated repository directory
+names when the maintained-fork or adjacent-root sets differ from the defaults.
+
+The profile always visits these user-global roots:
+
+- `~/.agents/skills`
+- `~/.agents/spec`
+- `~/.agents/plan`
+- `~/.codex/skills`
+- `~/.codex/plugins/cache/fork-ops`
+
+When `FORK_OPS_FULL_BREADTH_REPO_BASE` is set, the default maintained-fork names
+are `fork-ops`, `lemonade`, `codex-app-linux`, `warp`, `utilyze`, `arch-pkgs`,
+and `arch-strix-halo-pkgs`. The default adjacent-root names are `agent-armory`
+and `tuned-limine`. The first five roots above are `user-global`; configured
+maintained-fork repository roots are `maintained-fork`; configured adjacent
+roots are `adjacent-root`. Discovered files inside adjacent roots can still be
+accounted as retained fork-local authority when path or content evidence marks
+that material as authoritative.
+
+Full-breadth workflow inventory reports `scan_profile`, `source_root_records`,
+`accounting_records`, and `follow_up_candidates`. Each discovered inventory
+entry maps to exactly one accounting record. Each unresolvable source root maps
+to an `unassessed` accounting record. Planned workflows, future Repo Ops
+candidates, and unassessed records map to follow-up candidates.
+
+Accounting statuses are:
+
+- `implemented_workflow`
+- `diagnostic_only_workflow`
+- `planned_workflow`
+- `fork_local_config`
+- `retained_fork_local_authority`
+- `repo_ops_candidate`
+- `out_of_scope`
+- `unassessed`
+
+Full-breadth preflight and migration plan output carry the same accounting
+records into the proposed equipment review record. Replacement coverage remains
+false until equivalent Fork Ops-owned behavior exists, validates, and is
+reported as covered behavior.
 
 The foundation also exposes a non-mutating proposed config patch. It converts
 migration assessment candidates into a draft `.agents/fork-ops.toml` payload for
@@ -61,6 +111,7 @@ reviewable non-mutating plan.
 
 ```bash
 uv run --package fork-ops fork-ops migration plan --repo /path/to/fork
+uv run --package fork-ops fork-ops migration plan --repo /path/to/fork --scan-profile full-breadth
 ```
 
 The plan output separates:
@@ -76,6 +127,7 @@ The plan output separates:
 - the proposed config patch
 - retained source materials that remain preserved
 - retained authority that agents still need to read after config creation
+- accounting records and follow-up candidates for scanned source material
 - deferred removals
 - blockers such as incomplete semantic coverage or config diagnostics
 - required review and validation requirements
@@ -123,6 +175,7 @@ When no plan file is supplied, the CLI generates the current plan internally.
 
 ```bash
 uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork
+uv run --package fork-ops fork-ops migration dry-run --repo /path/to/fork --scan-profile full-breadth
 uv run --package fork-ops fork-ops migration dry-run --plan /path/to/migration-plan.json
 ```
 
@@ -205,10 +258,11 @@ sources.
 
 ```bash
 uv run --package fork-ops fork-ops workflow inventory --source-root /path/to/source-root
+uv run --package fork-ops fork-ops workflow inventory --scan-profile full-breadth
 ```
 
 Inventory evidence uses references, source kinds, material scope, coverage
 status, and line numbers when in-file evidence exists. Path-only evidence uses a
-null line value. The report also lists source roots that cannot be resolved. It
-does not duplicate source text or make backlog candidates available as
-implemented workflows.
+null line value. The report also lists source roots that cannot be resolved and
+accounts for them as unassessed. It does not duplicate source text or make
+backlog candidates available as implemented workflows.
