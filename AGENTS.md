@@ -77,7 +77,7 @@ smallest relevant checks. For broad plugin changes, run:
 export UV_CACHE_DIR=/tmp/fork-ops-uv-cache
 uv run --package fork-ops ruff check --cache-dir .ruff_cache
 uv run --package fork-ops pytest plugins/fork-ops/tests -q
-uv run --package fork-ops mypy --cache-dir .mypy_cache
+uv run --package fork-ops pyrefly check
 uv run --package fork-ops fork-ops schema print | cmp -s - plugins/fork-ops/schema/fork-ops.schema.json
 git diff --check
 ```

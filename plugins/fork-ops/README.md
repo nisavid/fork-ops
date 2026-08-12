@@ -27,6 +27,11 @@ local development checks.
 - Schema: `schema/fork-ops.schema.json` and packaged runtime copy `src/fork_ops/fork-ops.schema.json`
 - Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
 
+Plugin health treats registration, skill, and MCP config files as observational
+inputs. The CLI probe always uses an isolated installed-package module. The MCP
+probe does the same, but runs only when registration exactly matches the reviewed
+plugin shape.
+
 ## Common Commands
 
 Inspect a configured fork's current Fork Ops capability:
@@ -95,5 +100,5 @@ uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/mi
 uv run --package fork-ops fork-ops capability report --repo /path/to/configured-fork
 uv run --package fork-ops ruff check --cache-dir .ruff_cache
 uv run --package fork-ops pytest plugins/fork-ops/tests -q
-uv run --package fork-ops mypy --cache-dir .mypy_cache
+uv run --package fork-ops pyrefly check
 ```

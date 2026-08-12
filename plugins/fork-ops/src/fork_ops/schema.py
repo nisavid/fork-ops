@@ -8,6 +8,7 @@ from importlib import resources
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 CAPABILITY_LEVELS = [
     "identified",
@@ -22,7 +23,7 @@ SCHEMA_RESOURCE = "fork-ops.schema.json"
 
 
 def _load_config_schema() -> dict[str, Any]:
-    schema_text = resources.files(__package__).joinpath(SCHEMA_RESOURCE).read_text()
+    schema_text = resources.files("fork_ops").joinpath(SCHEMA_RESOURCE).read_text()
     schema = json.loads(schema_text)
     if not isinstance(schema, dict):
         raise TypeError(f"{SCHEMA_RESOURCE} must contain a JSON object")
@@ -57,7 +58,7 @@ def schema_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
     """Return JSON Schema diagnostics for a parsed Fork Ops config."""
     validator = Draft202012Validator(CONFIG_SCHEMA)
     diagnostics: list[Diagnostic] = []
-    for error in sorted(validator.iter_errors(config), key=lambda item: list(item.path)):
+    for error in sorted(validator.iter_errors(config), key=_validation_error_path):
         path = _format_path(error.path)
         diagnostics.append(
             Diagnostic(
@@ -68,6 +69,10 @@ def schema_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
             )
         )
     return diagnostics
+
+
+def _validation_error_path(error: ValidationError) -> list[str | int]:
+    return list(error.path)
 
 
 def _format_path(parts: Any) -> str:

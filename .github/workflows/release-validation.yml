@@ -1,0 +1,189 @@
+name: Release Validation
+
+on:
+  workflow_call:
+    inputs:
+      candidate_commit:
+        description: Exact commit represented by the once-built candidate.
+        required: true
+        type: string
+      artifact_run_id:
+        description: Workflow run containing the candidate-dist artifact.
+        required: true
+        type: string
+      artifact_run_attempt:
+        description: Exact attempt of the validated main Validation workflow run.
+        required: true
+        type: string
+      artifact_name:
+        description: Name of the once-built candidate artifact.
+        required: false
+        default: candidate-dist
+        type: string
+  workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: Exact commit represented by the once-built candidate.
+        required: true
+        type: string
+      artifact_run_id:
+        description: Workflow run containing the candidate-dist artifact.
+        required: true
+        type: string
+      artifact_run_attempt:
+        description: Exact attempt of the validated main Validation workflow run.
+        required: true
+        type: string
+      artifact_name:
+        description: Name of the once-built candidate artifact.
+        required: false
+        default: candidate-dist
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  installed:
+    name: Release candidate (${{ matrix.python }})
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+    steps:
+      - name: Check out exact candidate source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          path: candidate
+          persist-credentials: false
+      - name: Check out immutable repository verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: validation-evidence-build
+          path: ${{ runner.temp }}/candidate-evidence
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify release provenance without executing candidate code
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_MAIN_RUN_ID: ${{ inputs.artifact_run_id }}
+          TRUSTED_MAIN_RUN_ATTEMPT: ${{ inputs.artifact_run_attempt }}
+          TRUSTED_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          TRUSTED_RELEASE_WORKFLOW_REF: ${{ job.workflow_ref }}
+          TRUSTED_RELEASE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          TRUSTED_RELEASE_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          TRUSTED_VERIFIER_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_VERIFIER_SHA: ${{ job.workflow_sha }}
+          RELEASE_PREFLIGHT_KEY_FILE: ${{ runner.temp }}/trusted-state/release-preflight-${{ matrix.python }}.key
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode release-preflight
+          --interpreter python
+          --repo candidate
+          --artifact-dir "${{ runner.temp }}/candidate"
+          --build-evidence "${{ runner.temp }}/candidate-evidence/validation-evidence-build.json"
+          --trusted-main-run-id "$TRUSTED_MAIN_RUN_ID"
+          --trusted-main-run-attempt "$TRUSTED_MAIN_RUN_ATTEMPT"
+          --trusted-workflow-path .github/workflows/validation.yml
+          --trusted-event push
+          --trusted-artifact-name "$TRUSTED_ARTIFACT_NAME"
+          --trusted-release-workflow-ref "$TRUSTED_RELEASE_WORKFLOW_REF"
+          --trusted-release-workflow-sha "$TRUSTED_RELEASE_WORKFLOW_SHA"
+          --trusted-release-workflow-path "$TRUSTED_RELEASE_WORKFLOW_PATH"
+          --trusted-verifier-repository "$TRUSTED_VERIFIER_REPOSITORY"
+          --trusted-verifier-sha "$TRUSTED_VERIFIER_SHA"
+          --release-preflight-key-file "$RELEASE_PREFLIGHT_KEY_FILE"
+          --overall-timeout-seconds 180
+          --output "${{ runner.temp }}/trusted-state/release-preflight-${{ matrix.python }}.json"
+      - name: Validate exact release candidate inside the isolated container
+        env:
+          TRUSTED_RELEASE_WORKFLOW_REF: ${{ job.workflow_ref }}
+          TRUSTED_RELEASE_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          TRUSTED_RELEASE_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          TRUSTED_VERIFIER_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_VERIFIER_SHA: ${{ job.workflow_sha }}
+          RELEASE_PREFLIGHT_KEY_FILE: ${{ runner.temp }}/trusted-state/release-preflight-${{ matrix.python }}.key
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode installed
+          --interpreter python
+          --repo candidate
+          --artifact-dir "${{ runner.temp }}/candidate"
+          --build-evidence "${{ runner.temp }}/candidate-evidence/validation-evidence-build.json"
+          --release-preflight-evidence "${{ runner.temp }}/trusted-state/release-preflight-${{ matrix.python }}.json"
+          --trusted-release-workflow-ref "$TRUSTED_RELEASE_WORKFLOW_REF"
+          --trusted-release-workflow-sha "$TRUSTED_RELEASE_WORKFLOW_SHA"
+          --trusted-release-workflow-path "$TRUSTED_RELEASE_WORKFLOW_PATH"
+          --trusted-verifier-repository "$TRUSTED_VERIFIER_REPOSITORY"
+          --trusted-verifier-sha "$TRUSTED_VERIFIER_SHA"
+          --release-preflight-key-file "$RELEASE_PREFLIGHT_KEY_FILE"
+          --execution-boundary container
+          --overall-timeout-seconds 780
+          --output "${{ runner.temp }}/validation-evidence-release-${{ matrix.python }}.json"
+      - name: Upload release evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-release-${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/trusted-state/release-preflight-${{ matrix.python }}.json
+            ${{ runner.temp }}/validation-evidence-release-${{ matrix.python }}.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  validation:
+    name: Release Validation
+    permissions: {}
+    if: ${{ always() }}
+    needs: installed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Emit terminal aggregate
+        env:
+          INSTALLED_RESULT: ${{ needs.installed.result }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          outcome = "passed" if os.environ["INSTALLED_RESULT"] == "success" else "failed"
+          print(json.dumps({
+              "artifact_kind": "validation_workflow_aggregate",
+              "schema_version": "1.0",
+              "outcome": outcome,
+              "required": {"installed": os.environ["INSTALLED_RESULT"]},
+          }, indent=2, sort_keys=True))
+          sys.exit(0 if outcome == "passed" else 1)
+          PY

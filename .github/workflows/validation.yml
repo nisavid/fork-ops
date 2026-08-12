@@ -1,0 +1,403 @@
+name: Validation
+
+on:
+  # PR orchestration is loaded from the base branch. The PR head is checked out
+  # only as candidate data and is never used as a host-side producer. This
+  # activates only after this workflow exists on the default branch.
+  pull_request_target:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Source (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(github.event_name == 'schedule' && '["3.11","3.12","3.13","3.14"]' || '["3.11","3.14"]') }}
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Produce source validation evidence
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || '' }}
+          VALIDATION_MODE: ${{ github.event_name == 'schedule' && 'fresh-source' || 'locked-source' }}
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode "$VALIDATION_MODE"
+          --interpreter python
+          --repo candidate
+          --diff-base "$DIFF_BASE"
+          --execution-boundary container
+          --overall-timeout-seconds 1500
+          --output "${{ runner.temp }}/validation-evidence-source-${{ matrix.python }}.json"
+      - name: Upload source evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-source-${{ matrix.python }}
+          path: ${{ runner.temp }}/validation-evidence-source-${{ matrix.python }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  build:
+    name: Build candidate once
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Build candidate distributions
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode build
+          --interpreter python
+          --repo candidate
+          --artifact-dir "${{ runner.temp }}/candidate"
+          --execution-boundary container
+          --overall-timeout-seconds 600
+          --output "${{ runner.temp }}/validation-evidence-build.json"
+      - name: Upload candidate distributions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: candidate-dist
+          path: |
+            ${{ runner.temp }}/candidate/*.whl
+            ${{ runner.temp }}/candidate/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-build
+          path: ${{ runner.temp }}/validation-evidence-build.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  installed:
+    name: Installed candidate (${{ matrix.python }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(github.event_name == 'schedule' && '["3.11","3.12","3.13","3.14"]' || '["3.11","3.14"]') }}
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: candidate-dist
+          path: ${{ runner.temp }}/candidate
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: validation-evidence-build
+          path: ${{ runner.temp }}/candidate-evidence
+      - name: Validate installed candidate
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode installed
+          --interpreter python
+          --repo candidate
+          --artifact-dir "${{ runner.temp }}/candidate"
+          --build-evidence "${{ runner.temp }}/candidate-evidence/validation-evidence-build.json"
+          --execution-boundary container
+          --overall-timeout-seconds 900
+          --output "${{ runner.temp }}/validation-evidence-installed-${{ matrix.python }}.json"
+      - name: Upload installed evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-installed-${{ matrix.python }}
+          path: ${{ runner.temp }}/validation-evidence-installed-${{ matrix.python }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  advisory_macos:
+    name: Advisory (macOS, 3.11)
+    if: ${{ github.event_name == 'schedule' }}
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    outputs:
+      outcome: ${{ steps.observe.outputs.outcome }}
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out scheduled candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Produce advisory fresh-resolution evidence
+        id: advisory_run
+        shell: bash
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode fresh-source
+          --interpreter python
+          --repo candidate
+          --execution-boundary local-observational
+          --overall-timeout-seconds 1500
+          --output "${{ runner.temp }}/validation-evidence-advisory-macos-3.11.json"
+      - name: Observe advisory outcome
+        id: observe
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ADVISORY_STEP_OUTCOME: ${{ steps.advisory_run.outcome }}
+        run: echo "outcome=$ADVISORY_STEP_OUTCOME" >> "$GITHUB_OUTPUT"
+      - name: Upload advisory evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-advisory-macos-3.11
+          path: ${{ runner.temp }}/validation-evidence-advisory-macos-3.11.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  advisory_windows:
+    name: Advisory (Windows, 3.11)
+    if: ${{ github.event_name == 'schedule' }}
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      outcome: ${{ steps.observe.outputs.outcome }}
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out scheduled candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Produce advisory fresh-resolution evidence
+        id: advisory_run
+        shell: bash
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode fresh-source
+          --interpreter python
+          --repo candidate
+          --execution-boundary local-observational
+          --overall-timeout-seconds 1500
+          --output "${{ runner.temp }}/validation-evidence-advisory-windows-3.11.json"
+      - name: Observe advisory outcome
+        id: observe
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ADVISORY_STEP_OUTCOME: ${{ steps.advisory_run.outcome }}
+        run: echo "outcome=$ADVISORY_STEP_OUTCOME" >> "$GITHUB_OUTPUT"
+      - name: Upload advisory evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-advisory-windows-3.11
+          path: ${{ runner.temp }}/validation-evidence-advisory-windows-3.11.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  advisory:
+    name: Advisory (Linux, 3.15)
+    if: ${{ github.event_name == 'schedule' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      outcome: ${{ steps.observe.outputs.outcome }}
+    steps:
+      - name: Check out immutable trusted verifier
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: trusted-verifier
+          persist-credentials: false
+      - name: Check out scheduled candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Produce advisory fresh-resolution evidence
+        id: advisory_run
+        shell: bash
+        run: >-
+          python trusted-verifier/scripts/produce_validation_evidence.py
+          --mode fresh-source
+          --interpreter python
+          --repo candidate
+          --execution-boundary local-observational
+          --overall-timeout-seconds 1500
+          --output "${{ runner.temp }}/validation-evidence-advisory-linux-3.15.json"
+      - name: Observe advisory outcome
+        id: observe
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ADVISORY_STEP_OUTCOME: ${{ steps.advisory_run.outcome }}
+        run: echo "outcome=$ADVISORY_STEP_OUTCOME" >> "$GITHUB_OUTPUT"
+      - name: Upload advisory evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: validation-evidence-advisory-linux-3.15
+          path: ${{ runner.temp }}/validation-evidence-advisory-linux-3.15.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  validation:
+    name: Validation
+    if: ${{ always() }}
+    needs:
+      - source
+      - build
+      - installed
+      - advisory
+      - advisory_macos
+      - advisory_windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Emit terminal aggregate
+        env:
+          SOURCE_RESULT: ${{ needs.source.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          INSTALLED_RESULT: ${{ needs.installed.result }}
+          ADVISORY_LINUX_RESULT: ${{ needs.advisory.outputs.outcome || 'not_observed' }}
+          ADVISORY_MACOS_RESULT: ${{ needs.advisory_macos.outputs.outcome || 'not_observed' }}
+          ADVISORY_WINDOWS_RESULT: ${{ needs.advisory_windows.outputs.outcome || 'not_observed' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          required = {
+              "source": os.environ["SOURCE_RESULT"],
+              "build": os.environ["BUILD_RESULT"],
+              "installed": os.environ["INSTALLED_RESULT"],
+          }
+          terminal = {
+              "artifact_kind": "validation_workflow_aggregate",
+              "schema_version": "1.0",
+              "outcome": "passed" if all(value == "success" for value in required.values()) else "failed",
+              "required": required,
+              "advisory": {
+                  "linux_3_15": os.environ["ADVISORY_LINUX_RESULT"],
+                  "macos_3_11": os.environ["ADVISORY_MACOS_RESULT"],
+                  "windows_3_11": os.environ["ADVISORY_WINDOWS_RESULT"],
+              },
+          }
+          print(json.dumps(terminal, indent=2, sort_keys=True))
+          sys.exit(0 if terminal["outcome"] == "passed" else 1)
+          PY
