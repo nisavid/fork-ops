@@ -8,16 +8,23 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-  "mypy>=1.18",
-  "pytest>=8.0",
+build = [
+  "setuptools==83.0.0",
+  "wheel==0.46.2"
+]
+test = [
+  "coverage>=7,<8",
+  "pytest>=8.0"
+]
+development = [
+  "pyrefly>=1.1.1,<2",
   "ruff>=0.14",
   "types-jsonschema>=4.25"
 ]
 
 [tool.uv]
 package = false
-default-groups = ["dev"]
+default-groups = ["test", "development"]
 
 [tool.uv.sources]
 fork-ops = { workspace = true }
@@ -34,9 +41,8 @@ cache-dir = ".ruff_cache"
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP"]
 
-[tool.mypy]
-python_version = "3.11"
-strict = true
-mypy_path = "plugins/fork-ops/src"
-files = ["plugins/fork-ops/src", "plugins/fork-ops/tests"]
-cache_dir = ".mypy_cache"
+[tool.pyrefly]
+project-includes = ["plugins/fork-ops/src", "plugins/fork-ops/tests"]
+search-path = ["plugins/fork-ops/src"]
+python-version = "3.11.0"
+preset = "strict"

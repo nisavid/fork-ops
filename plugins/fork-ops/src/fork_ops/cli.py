@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from .core import (
-    CONFIG_RELATIVE_PATH,
     SCAN_PROFILES,
     ForkOpsError,
     assess_migration,
@@ -24,6 +23,7 @@ from .core import (
     execute_migration,
     explain_migration_blocker,
     generate_migration_plan,
+    initialize_config,
     load_raw_config,
     propose_migration_config_patch,
     schema_artifact_report,
@@ -294,7 +294,18 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
-    text = create_initial_config_text(
+    if not args.write:
+        text = create_initial_config_text(
+            args.repo,
+            repository_owner=args.repository_owner,
+            repository_name=args.repository_name,
+            upstream_owner=args.upstream_owner,
+            upstream_name=args.upstream_name,
+            default_branch=args.default_branch,
+        )
+        print(text, end="")
+        return 0
+    result = initialize_config(
         args.repo,
         repository_owner=args.repository_owner,
         repository_name=args.repository_name,
@@ -302,17 +313,28 @@ def cmd_config_init(args: argparse.Namespace) -> int:
         upstream_name=args.upstream_name,
         default_branch=args.default_branch,
     )
-    if not args.write:
-        print(text, end="")
-        return 0
-    repo = Path(args.repo).expanduser().resolve()
-    path = repo / CONFIG_RELATIVE_PATH
-    if path.exists():
-        raise ForkOpsError(f"Refusing to overwrite existing config: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    print(str(path))
+    if result["status"] != "applied":
+        raise ForkOpsError(_config_initialization_failure_message(result))
+    print(result["target_path"])
     return 0
+
+
+def _config_initialization_failure_message(result: dict[str, Any]) -> str:
+    blockers = result.get("blockers", [])
+    detail = (
+        str(blockers[0].get("message", "Config initialization failed."))
+        if isinstance(blockers, list) and blockers and isinstance(blockers[0], dict)
+        else "Config initialization failed."
+    )
+    status = result.get("status")
+    if status == "rolled_back":
+        return f"Config initialization failed and the task-created config was rolled back: {detail}"
+    if status == "applied_unverified":
+        return (
+            f"Config initialization changed {result.get('target_path')}, but the target remains "
+            f"unverified and could not be safely rolled back: {detail}"
+        )
+    return detail
 
 
 def cmd_capability_report(args: argparse.Namespace) -> int:

@@ -1,0 +1,5 @@
+artifact_kind = "security_exception_ledger"
+schema_version = "1.0"
+
+# Security Exception contract 1.0 starts with no public records. Add records only
+# as flat [[exceptions]] tables after validation against the canonical contract.

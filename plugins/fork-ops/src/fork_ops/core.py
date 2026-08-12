@@ -8,11 +8,13 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tomllib
 import uuid
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,31 @@ PLUGIN_HEALTH_STATUS_VALUES = {
 }
 PLUGIN_HEALTH_CHECK_STATUSES = {"ready", "failed", "unavailable", "uninspectable"}
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class _CreatedFileIdentity:
+    device: int
+    inode: int
+    size: int
+    content_sha256: str
+
+
+_EXPECTED_MCP_REGISTRATION: dict[str, Any] = {
+    "mcpServers": {
+        "fork-ops": {
+            "command": "uv",
+            "args": ["run", "--project", ".", "--extra", "mcp", "fork-ops-mcp"],
+            "cwd": ".",
+        }
+    }
+}
+_JSON_SEQUENCE_TYPES: tuple[type[list[object]], type[tuple[object, ...]]] = (list, tuple)
+_EMPTY_REQUIREMENT_TYPES: tuple[
+    type[str],
+    type[list[object]],
+    type[dict[object, object]],
+] = (str, list, dict)
 _CANDIDATE_FILE_SUFFIXES = {".json", ".md", ".toml", ".yaml", ".yml"}
 _CANDIDATE_SCAN_SKIP_DIRS = {
     ".git",
@@ -271,7 +298,7 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
 def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
+    if isinstance(value, _JSON_SEQUENCE_TYPES):
         return [_json_safe(item) for item in value]
     if isinstance(value, datetime | date | time):
         return value.isoformat()
@@ -293,19 +320,17 @@ def build_plugin_health_report(
     checks: list[dict[str, Any]] = []
 
     checks.append(_plugin_registration_check(root, repo))
-    checks.append(_skill_discovery_check(root))
+    mcp_config_check = _mcp_config_resolution_check(root)
 
-    cli_check = _cli_execution_check(root, runner, timeout)
+    checks.append(_skill_discovery_check(root))
+    cli_check = _cli_execution_check(runner, timeout)
     checks.append(cli_check)
     cli_ready = cli_check["status"] == "ready"
 
-    mcp_config_check, mcp_server = _mcp_config_resolution_check(root)
     checks.append(mcp_config_check)
 
     mcp_startup_check, mcp_startup_payload = _mcp_process_startup_check(
-        root,
         mcp_config_check,
-        mcp_server,
         runner,
         timeout,
         cli_ready=cli_ready,
@@ -543,23 +568,14 @@ def _skill_discovery_check(plugin_root: Path) -> dict[str, Any]:
 
 
 def _cli_execution_check(
-    plugin_root: Path,
     command_runner: CommandRunner,
     timeout: float,
 ) -> dict[str, Any]:
-    cli_script = plugin_root / "scripts/fork_ops_cli.py"
-    command = [sys.executable, str(cli_script), "workflow", "catalog"]
-    if not cli_script.exists():
-        return _health_check(
-            "cli_execution",
-            "CLI execution",
-            "unavailable",
-            "Fork Ops CLI wrapper is not present in the plugin package.",
-            evidence={"command": command, "path": str(cli_script)},
-            next_steps=("Restore plugins/fork-ops/scripts/fork_ops_cli.py.",),
-        )
-    completed = command_runner(command, plugin_root, timeout)
+    command = [sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"]
+    completed = command_runner(command, _trusted_package_directory(), timeout)
     evidence = _command_evidence(command, completed)
+    evidence["launch_provenance"] = "current-interpreter-isolated-package-module"
+    evidence["repository_controlled_executable_used"] = False
     if completed.returncode != 0:
         return _health_check(
             "cli_execution",
@@ -626,111 +642,92 @@ def _cli_execution_check(
 
 def _mcp_config_resolution_check(
     plugin_root: Path,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> dict[str, Any]:
     mcp_config_path = plugin_root / ".mcp.json"
     if not mcp_config_path.exists():
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "unavailable",
-                "Fork Ops MCP config was not found in the plugin package.",
-                evidence={"path": str(mcp_config_path)},
-                next_steps=("Restore plugins/fork-ops/.mcp.json or configure the MCP server.",),
-            ),
-            None,
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "unavailable",
+            "Fork Ops MCP config was not found in the plugin package.",
+            evidence={"path": str(mcp_config_path)},
+            next_steps=("Restore plugins/fork-ops/.mcp.json or configure the MCP server.",),
         )
     try:
         mcp_config = json.loads(mcp_config_path.read_text())
     except UnicodeDecodeError as exc:
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "failed",
-                "Fork Ops MCP config is not valid UTF-8 text.",
-                evidence={"path": str(mcp_config_path), "error": str(exc)},
-                next_steps=("Repair plugins/fork-ops/.mcp.json text encoding.",),
-            ),
-            None,
-        )
-    except OSError as exc:
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "uninspectable",
-                "Fork Ops MCP config could not be read.",
-                evidence={"path": str(mcp_config_path), "error": str(exc)},
-                next_steps=("Check file permissions for plugins/fork-ops/.mcp.json.",),
-            ),
-            None,
-        )
-    except json.JSONDecodeError as exc:
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "failed",
-                "Fork Ops MCP config is not valid JSON.",
-                evidence={"path": str(mcp_config_path), "error": str(exc)},
-                next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
-            ),
-            None,
-        )
-    if not isinstance(mcp_config, dict):
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "failed",
-                "Fork Ops MCP config must be a JSON object.",
-                evidence={"path": str(mcp_config_path), "json_type": type(mcp_config).__name__},
-                next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
-            ),
-            None,
-        )
-    servers = mcp_config.get("mcpServers")
-    server = servers.get("fork-ops") if isinstance(servers, dict) else None
-    if not isinstance(server, dict):
-        return (
-            _health_check(
-                "mcp_config_resolution",
-                "MCP config resolution",
-                "failed",
-                "Fork Ops MCP config does not define mcpServers.fork-ops.",
-                evidence={"path": str(mcp_config_path)},
-                next_steps=("Add an mcpServers.fork-ops entry to plugins/fork-ops/.mcp.json.",),
-            ),
-            None,
-        )
-    return (
-        _health_check(
+        return _health_check(
             "mcp_config_resolution",
             "MCP config resolution",
-            "ready",
-            "Fork Ops MCP config resolves the fork-ops server entry.",
+            "failed",
+            "Fork Ops MCP config is not valid UTF-8 text.",
+            evidence={"path": str(mcp_config_path), "error": str(exc)},
+            next_steps=("Repair plugins/fork-ops/.mcp.json text encoding.",),
+        )
+    except OSError as exc:
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "uninspectable",
+            "Fork Ops MCP config could not be read.",
+            evidence={"path": str(mcp_config_path), "error": str(exc)},
+            next_steps=("Check file permissions for plugins/fork-ops/.mcp.json.",),
+        )
+    except json.JSONDecodeError as exc:
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "failed",
+            "Fork Ops MCP config is not valid JSON.",
+            evidence={"path": str(mcp_config_path), "error": str(exc)},
+            next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
+        )
+    if not isinstance(mcp_config, dict):
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "failed",
+            "Fork Ops MCP config must be a JSON object.",
+            evidence={"path": str(mcp_config_path), "json_type": type(mcp_config).__name__},
+            next_steps=("Repair plugins/fork-ops/.mcp.json before starting MCP.",),
+        )
+    if mcp_config != _EXPECTED_MCP_REGISTRATION:
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "failed",
+            "Fork Ops MCP config does not match the reviewed registration shape.",
             evidence={
                 "path": str(mcp_config_path),
-                "command": server.get("command"),
-                "args": server.get("args", []),
-                "cwd": server.get("cwd", "."),
+                "registration_matches_reviewed_shape": False,
             },
-        ),
-        server,
+            next_steps=("Restore the reviewed plugins/fork-ops/.mcp.json registration.",),
+        )
+    server = _EXPECTED_MCP_REGISTRATION["mcpServers"]["fork-ops"]
+    return _health_check(
+        "mcp_config_resolution",
+        "MCP config resolution",
+        "ready",
+        "Fork Ops MCP config exactly matches the reviewed registration shape.",
+        evidence={
+            "path": str(mcp_config_path),
+            "registration_matches_reviewed_shape": True,
+            "command": server["command"],
+            "args": server["args"],
+            "cwd": server["cwd"],
+            "registration_effect": "observational-only",
+        },
     )
 
 
 def _mcp_process_startup_check(
-    plugin_root: Path,
     config_check: dict[str, Any],
-    server: dict[str, Any] | None,
     command_runner: CommandRunner,
     timeout: float,
     *,
     cli_ready: bool,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    if config_check["status"] != "ready" or server is None:
+    if config_check["status"] != "ready":
         return (
             _health_check(
                 "mcp_process_startup",
@@ -743,30 +740,13 @@ def _mcp_process_startup_check(
             None,
         )
 
-    command_value = server.get("command")
-    args_value = server.get("args", [])
-    if not isinstance(command_value, str) or not isinstance(args_value, (list, tuple)) or not all(
-        isinstance(item, str) for item in args_value
-    ):
-        return (
-            _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
-                "failed",
-                "MCP server command is not a string command with string args.",
-                evidence={"command": command_value, "args": args_value},
-                next_steps=_mcp_failure_next_steps(cli_ready),
-            ),
-            None,
-        )
-    cwd_value = server.get("cwd", ".")
-    if not isinstance(cwd_value, str):
-        cwd_value = "."
-    cwd = _resolve_health_path(plugin_root, cwd_value)
-    command = [command_value, *args_value, "--health-check"]
+    cwd = _trusted_package_directory()
+    command = [sys.executable, "-I", "-m", "fork_ops.mcp_server", "--health-check"]
     completed = command_runner(command, cwd, timeout)
     evidence = _command_evidence(command, completed)
     evidence["cwd"] = str(cwd)
+    evidence["launch_provenance"] = "current-interpreter-isolated-package-module"
+    evidence["repository_controlled_executable_used"] = False
     if completed.returncode != 0:
         return (
             _health_check(
@@ -1005,6 +985,10 @@ def _short_output(value: str | bytes | None, limit: int = 4000) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "...<truncated>"
+
+
+def _trusted_package_directory() -> Path:
+    return Path(__file__).resolve().parent
 
 
 def _resolve_health_path(root: Path, value: str) -> Path:
@@ -1484,7 +1468,7 @@ def build_workflow_migration_inventory(
             )
             if entry:
                 entries.append(entry)
-    entries.sort(key=lambda item: (item["source_root"], item["source_path"]))
+    entries.sort(key=_source_root_and_path_sort_key)
     catalog_evidence = _workflow_catalog_evidence(entries, contracts)
     backlog_candidates = _workflow_backlog_candidates(entries)
     accounting_records = _workflow_inventory_accounting_records(
@@ -1949,7 +1933,9 @@ def _execution_narrative_sections(
 def _blocker_resolution_narrative_sections(workflow_output: dict[str, Any]) -> list[dict[str, Any]]:
     blocker = workflow_output.get("blocker", {})
     evidence = workflow_output.get("evidence", {})
-    path_items = _string_list(evidence.get("paths")) if isinstance(evidence, dict) else []
+    path_items: list[str] = (
+        _string_list(evidence.get("paths")) if isinstance(evidence, dict) else []
+    )
     map_entries = (
         _optional_dict_list(evidence, "migration_map_entries")
         if isinstance(evidence, dict)
@@ -2097,7 +2083,7 @@ def _blocker_evidence(
     paths = _string_list(blocker.get("paths"))
     if not paths:
         path = blocker.get("path")
-        paths = [path] if isinstance(path, str) and path else []
+        paths: list[str] = [path] if isinstance(path, str) and path else []
     migration_map_entries = []
     for entry in _optional_dict_list(workflow_output, "migration_map"):
         source_path = entry.get("source_path")
@@ -2816,63 +2802,61 @@ def _apply_migration_file_edits(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     applied = []
     blockers = []
-    repo_root = repo.resolve()
     for edit in file_edits:
-        path, blocker = _migration_edit_target(repo, edit.get("path"))
-        if blocker:
+        applied_edit, blocker, _ = _apply_migration_file_edit(repo, edit)
+        if blocker is not None:
             blockers.append(blocker)
-            continue
-        content = edit["content"]
-        parent_existed = path.parent.exists()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            blockers.append(
-                {
-                    "code": "migration_execution.target_parent_unavailable",
-                    "path": edit.get("path"),
-                    "message": f"Migration execution target parent is unavailable: {exc}",
-                }
-            )
-            continue
-        parent_blocker = _migration_target_parent_blocker(repo_root, path.parent, edit.get("path"))
-        if parent_blocker:
-            _remove_created_parent(path.parent, parent_existed)
-            blockers.append(parent_blocker)
-            continue
-        try:
-            _write_new_file_atomically(path, content)
-        except FileExistsError:
-            _remove_created_parent(path.parent, parent_existed)
-            blockers.append(
-                {
-                    "code": "migration_execution.target_exists",
-                    "path": edit.get("path"),
-                    "message": "Refusing to overwrite a target created before config write.",
-                }
-            )
-            continue
-        except OSError as exc:
-            _remove_created_parent(path.parent, parent_existed)
-            blockers.append(
-                {
-                    "code": "migration_execution.write_failed",
-                    "path": edit.get("path"),
-                    "message": f"Migration execution config write failed: {exc}",
-                }
-            )
-            continue
-        applied.append(
-            {
-                "path": edit["path"],
-                "action": edit["action"],
-                "status": "applied",
-                "content_kind": edit.get("content_kind"),
-                "bytes": len(_config_content_bytes(content)),
-                "content_sha256": hashlib.sha256(_config_content_bytes(content)).hexdigest(),
-            }
-        )
+        elif applied_edit is not None:
+            applied.append(applied_edit)
     return applied, blockers
+
+
+def _apply_migration_file_edit(
+    repo: Path,
+    edit: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _CreatedFileIdentity | None]:
+    path, blocker = _migration_edit_target(repo, edit.get("path"))
+    if blocker:
+        return None, blocker, None
+    content = edit["content"]
+    parent_existed = path.parent.exists()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, {
+            "code": "migration_execution.target_parent_unavailable",
+            "path": edit.get("path"),
+            "message": f"Migration execution target parent is unavailable: {exc}",
+        }, None
+    parent_blocker = _migration_target_parent_blocker(repo.resolve(), path.parent, edit.get("path"))
+    if parent_blocker:
+        _remove_created_parent(path.parent, parent_existed)
+        return None, parent_blocker, None
+    try:
+        identity = _write_new_file_atomically(path, content)
+    except FileExistsError:
+        _remove_created_parent(path.parent, parent_existed)
+        return None, {
+            "code": "migration_execution.target_exists",
+            "path": edit.get("path"),
+            "message": "Refusing to overwrite a target created before config write.",
+        }, None
+    except OSError as exc:
+        _remove_created_parent(path.parent, parent_existed)
+        return None, {
+            "code": "migration_execution.write_failed",
+            "path": edit.get("path"),
+            "message": f"Migration execution config write failed: {exc}",
+        }, None
+    content_bytes = _config_content_bytes(content)
+    return {
+        "path": edit["path"],
+        "action": edit["action"],
+        "status": "applied",
+        "content_kind": edit.get("content_kind"),
+        "bytes": len(content_bytes),
+        "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+    }, None, identity
 
 
 def _migration_target_parent_blocker(
@@ -2896,7 +2880,7 @@ def _migration_target_parent_blocker(
     return None
 
 
-def _write_new_file_atomically(path: Path, content: str) -> None:
+def _write_new_file_atomically(path: Path, content: str) -> _CreatedFileIdentity:
     temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     content_bytes = _config_content_bytes(content)
     try:
@@ -2904,7 +2888,14 @@ def _write_new_file_atomically(path: Path, content: str) -> None:
             handle.write(content_bytes)
             handle.flush()
             os.fsync(handle.fileno())
+            created_stat = os.fstat(handle.fileno())
         os.link(temp_path, path)
+        return _CreatedFileIdentity(
+            device=created_stat.st_dev,
+            inode=created_stat.st_ino,
+            size=len(content_bytes),
+            content_sha256=hashlib.sha256(content_bytes).hexdigest(),
+        )
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -2983,7 +2974,7 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
                 "portability_hint": _portability_hint(rel, signals),
             }
         )
-    return sorted(candidates, key=lambda item: item["path"])
+    return sorted(candidates, key=_path_sort_key)
 
 
 def _migration_plan_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3012,7 +3003,7 @@ def _migration_map(
 ) -> list[dict[str, Any]]:
     return [
         _migration_map_entry(candidate, proposed_config_patch)
-        for candidate in sorted(candidates, key=lambda item: item["path"])
+        for candidate in sorted(candidates, key=_path_sort_key)
     ]
 
 
@@ -3316,14 +3307,7 @@ def _equipment_migration_preflight(
     ]
     if workflow_inventory:
         groups.extend(_workflow_inventory_equipment_groups(workflow_inventory))
-    groups.sort(
-        key=lambda item: (
-            item["source_scope"],
-            item["source_root"],
-            item["source_path"],
-            item["id"],
-        )
-    )
+    groups.sort(key=_equipment_group_sort_key)
     evidence_entries = _equipment_evidence_entries(groups)
     discovery_scopes = _equipment_discovery_scopes(
         repo,
@@ -3499,8 +3483,10 @@ def _equipment_discovery_scopes(
             "equipment_group_count": len(candidates),
         }
     ]
-    inventory_entries = workflow_inventory.get("entries", []) if workflow_inventory else []
-    source_root_records = (
+    inventory_entries: list[object] = (
+        workflow_inventory.get("entries", []) if workflow_inventory else []
+    )
+    source_root_records: list[object] = (
         workflow_inventory.get("source_root_records", []) if workflow_inventory else []
     )
     if source_root_records:
@@ -5125,6 +5111,394 @@ def create_initial_config_text(
     )
 
 
+def initialize_config(
+    repo_path: str | Path = ".",
+    repository_owner: str = "OWNER",
+    repository_name: str = "REPO",
+    upstream_owner: str = "UPSTREAM_OWNER",
+    upstream_name: str = "UPSTREAM_REPO",
+    default_branch: str = "main",
+) -> dict[str, Any]:
+    repo = Path(repo_path).expanduser().resolve()
+    content = create_initial_config_text(
+        repo,
+        repository_owner=repository_owner,
+        repository_name=repository_name,
+        upstream_owner=upstream_owner,
+        upstream_name=upstream_name,
+        default_branch=default_branch,
+    )
+    edit = {
+        "path": CONFIG_RELATIVE_PATH.as_posix(),
+        "action": "create",
+        "content_kind": "fork-ops-config",
+        "content": content,
+    }
+    blockers = _migration_execution_blockers(repo, {"file_edits": [edit]})
+    if blockers:
+        return _config_initialization_result(
+            repo,
+            status="blocked",
+            applied_edits=[],
+            blockers=blockers,
+            verification=None,
+            mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
+        )
+
+    applied_edit, apply_blocker, created_identity = _apply_migration_file_edit(repo, edit)
+    if apply_blocker is not None or applied_edit is None or created_identity is None:
+        return _config_initialization_result(
+            repo,
+            status="blocked",
+            applied_edits=[],
+            blockers=[apply_blocker] if apply_blocker is not None else [],
+            verification=None,
+            mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
+        )
+
+    target_path = repo / CONFIG_RELATIVE_PATH
+    content_bytes = _config_content_bytes(content)
+    target_verification, target_blocker = _verify_created_target(
+        target_path,
+        created_identity,
+        content_bytes,
+    )
+    if target_blocker is not None:
+        return _config_initialization_post_create_failure(
+            repo,
+            applied_edit,
+            created_identity,
+            content_bytes,
+            blockers=[target_blocker],
+            verification={"status": "failed", "target": target_verification},
+        )
+
+    required_level = "track-aware"
+    try:
+        report = build_status_report(repo, include_config=False)
+        required_available = bool(report["capability"]["levels"][required_level]["available"])
+    except Exception as exc:
+        verification = {
+            "status": "failed",
+            "target": target_verification,
+            "capability": {
+                "status": "failed",
+                "required_level": required_level,
+                "error": str(exc),
+            },
+        }
+        return _config_initialization_post_create_failure(
+            repo,
+            applied_edit,
+            created_identity,
+            content_bytes,
+            blockers=[
+                {
+                    "code": "config_initialization.verification_error",
+                    "message": f"Fork Ops config verification failed: {exc}",
+                }
+            ],
+            verification=verification,
+        )
+
+    verification = {
+        "status": "passed" if required_available else "failed",
+        "target": target_verification,
+        "capability": {
+            "status": "passed" if required_available else "failed",
+            "required_level": required_level,
+            "required_level_available": required_available,
+            "highest_available": report["capability"]["highest_available"],
+            "diagnostics": report.get("diagnostics", []),
+        },
+        "required_level": required_level,
+        "required_level_available": required_available,
+        "highest_available": report["capability"]["highest_available"],
+        "diagnostics": report.get("diagnostics", []),
+    }
+    if not required_available:
+        return _config_initialization_post_create_failure(
+            repo,
+            applied_edit,
+            created_identity,
+            content_bytes,
+            blockers=[
+                {
+                    "code": "migration_execution.verification_failed",
+                    "message": "Fork Ops config verification failed after config initialization.",
+                    "diagnostics": report.get("diagnostics", []),
+                }
+            ],
+            verification=verification,
+        )
+
+    final_target_verification, final_target_blocker = _verify_created_target(
+        target_path,
+        created_identity,
+        content_bytes,
+    )
+    verification["target"] = final_target_verification
+    if final_target_blocker is not None:
+        verification["status"] = "failed"
+        return _config_initialization_post_create_failure(
+            repo,
+            applied_edit,
+            created_identity,
+            content_bytes,
+            blockers=[final_target_blocker],
+            verification=verification,
+        )
+
+    return _config_initialization_result(
+        repo,
+        status="applied",
+        applied_edits=[applied_edit],
+        blockers=[],
+        verification=verification,
+        mutation=_config_initialization_mutation(True, "verified", "not-needed"),
+    )
+
+
+def _config_initialization_post_create_failure(
+    repo: Path,
+    applied_edit: dict[str, Any],
+    created_identity: _CreatedFileIdentity,
+    expected_content: bytes,
+    *,
+    blockers: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    rollback = _rollback_created_target(
+        repo / CONFIG_RELATIVE_PATH,
+        created_identity,
+        expected_content,
+    )
+    edit = copy.deepcopy(applied_edit)
+    if rollback["status"] == "rolled_back":
+        status = "rolled_back"
+        target_state = "rolled_back"
+        rollback_status = "rolled_back"
+        edit["status"] = "rolled_back"
+    else:
+        status = "applied_unverified"
+        target_state = "unverified"
+        rollback_status = str(rollback["status"])
+        edit["status"] = "applied_unverified"
+        rollback_blocker = rollback.get("blocker")
+        if isinstance(rollback_blocker, dict):
+            blockers = [*blockers, rollback_blocker]
+    return _config_initialization_result(
+        repo,
+        status=status,
+        applied_edits=[edit],
+        blockers=blockers,
+        verification=verification,
+        mutation=_config_initialization_mutation(True, target_state, rollback_status),
+    )
+
+
+def _verify_created_target(
+    path: Path,
+    identity: _CreatedFileIdentity,
+    expected_content: bytes,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        verification = {
+            "status": "failed",
+            "path": str(path),
+            "expected_sha256": identity.content_sha256,
+            "error": str(exc),
+        }
+        return verification, {
+            "code": "config_initialization.target_unreadable",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "message": "Created config target is missing, unreadable, or a symlink.",
+            "error": str(exc),
+        }
+    try:
+        target_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(target_stat.st_mode):
+            verification = {
+                "status": "failed",
+                "path": str(path),
+                "expected_sha256": identity.content_sha256,
+                "file_type": "not-regular",
+            }
+            return verification, {
+                "code": "config_initialization.target_not_regular",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "Created config target is not a regular file.",
+            }
+        if (target_stat.st_dev, target_stat.st_ino) != (identity.device, identity.inode):
+            verification = {
+                "status": "failed",
+                "path": str(path),
+                "expected_sha256": identity.content_sha256,
+                "identity_matches": False,
+            }
+            return verification, {
+                "code": "config_initialization.target_identity_changed",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "Created config target identity changed after creation.",
+            }
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            actual_content = handle.read()
+    except OSError as exc:
+        verification = {
+            "status": "failed",
+            "path": str(path),
+            "expected_sha256": identity.content_sha256,
+            "error": str(exc),
+        }
+        return verification, {
+            "code": "config_initialization.target_unreadable",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "message": "Created config target could not be read for exact verification.",
+            "error": str(exc),
+        }
+    finally:
+        os.close(descriptor)
+
+    actual_sha256 = hashlib.sha256(actual_content).hexdigest()
+    if (
+        actual_content != expected_content
+        or target_stat.st_size != identity.size
+        or actual_sha256 != identity.content_sha256
+    ):
+        verification = {
+            "status": "failed",
+            "path": str(path),
+            "identity_matches": True,
+            "expected_bytes": identity.size,
+            "actual_bytes": len(actual_content),
+            "expected_sha256": identity.content_sha256,
+            "actual_sha256": actual_sha256,
+        }
+        return verification, {
+            "code": "config_initialization.target_content_changed",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "message": "Created config target bytes changed after creation.",
+            "expected_sha256": identity.content_sha256,
+            "actual_sha256": actual_sha256,
+        }
+    return {
+        "status": "passed",
+        "path": str(path),
+        "regular_file": True,
+        "identity_matches": True,
+        "bytes": len(actual_content),
+        "content_sha256": actual_sha256,
+    }, None
+
+
+def _rollback_created_target(
+    path: Path,
+    identity: _CreatedFileIdentity,
+    expected_content: bytes,
+) -> dict[str, Any]:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {"status": "rolled_back", "detail": "target_already_absent"}
+    except OSError as exc:
+        return {
+            "status": "unsafe",
+            "blocker": {
+                "code": "config_initialization.rollback_unsafe",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "Safe rollback could not inspect the created config target.",
+                "error": str(exc),
+            },
+        }
+    _, match_blocker = _verify_created_target(path, identity, expected_content)
+    if match_blocker is not None:
+        return {
+            "status": "unsafe",
+            "blocker": {
+                "code": "config_initialization.rollback_unsafe",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": (
+                    "Safe rollback refused because the target no longer has the "
+                    "task-created identity and exact content."
+                ),
+                "reason_code": match_blocker.get("code"),
+            },
+        }
+    try:
+        path.unlink()
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "blocker": {
+                "code": "config_initialization.rollback_failed",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "The exact task-created config could not be rolled back.",
+                "error": str(exc),
+            },
+        }
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {"status": "rolled_back", "detail": "exact_task_created_target_removed"}
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "blocker": {
+                "code": "config_initialization.rollback_unverified",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "Rollback ran, but target absence could not be verified.",
+                "error": str(exc),
+            },
+        }
+    return {
+        "status": "failed",
+        "blocker": {
+            "code": "config_initialization.rollback_replaced",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "message": "A config target exists after rollback; its state is unverified.",
+        },
+    }
+
+
+def _config_initialization_mutation(
+    occurred: bool,
+    target_state: str,
+    rollback_status: str,
+) -> dict[str, Any]:
+    return {
+        "occurred": occurred,
+        "target_state": target_state,
+        "rollback_status": rollback_status,
+    }
+
+
+def _config_initialization_result(
+    repo: Path,
+    *,
+    status: str,
+    applied_edits: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    verification: dict[str, Any] | None,
+    mutation: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "repo_path": str(repo),
+        "mode": "mutating",
+        "operation": "config-initialization",
+        "status": status,
+        "target_path": str(repo / CONFIG_RELATIVE_PATH),
+        "applied_edits": applied_edits,
+        "blockers": blockers,
+        "verification": verification,
+        "mutation": mutation,
+    }
+
+
 def schema_json() -> str:
     return json.dumps(CONFIG_SCHEMA, indent=2, sort_keys=True) + "\n"
 
@@ -5687,7 +6061,7 @@ def _workflow_backlog_candidates(entries: list[dict[str, Any]]) -> list[dict[str
                 "evidence_ids": [item["id"] for item in entry["evidence"]],
             }
         )
-    return sorted(candidates, key=lambda item: (item["candidate_target"], item["source_path"]))
+    return sorted(candidates, key=_candidate_target_and_source_path_sort_key)
 
 
 def _workflow_inventory_accounting_records(
@@ -5701,7 +6075,7 @@ def _workflow_inventory_accounting_records(
         records.append(_accounting_record_from_unresolvable_root(root))
     return sorted(
         records,
-        key=lambda item: (item["source_scope"], item["source_root"], item["source_path"]),
+        key=_accounting_record_sort_key,
     )
 
 
@@ -5968,7 +6342,7 @@ def _dedupe_accounting_records(records: list[dict[str, Any]]) -> list[dict[str, 
         deduped.append(record)
     return sorted(
         deduped,
-        key=lambda item: (item["source_scope"], item["source_root"], item["source_path"]),
+        key=_accounting_record_sort_key,
     )
 
 
@@ -6176,7 +6550,7 @@ def _requirement_satisfied(config: dict[str, Any], dotted_path: str) -> bool:
         "sync_policy.forbid_history_rewrites",
     }:
         return current is True
-    if isinstance(current, str | list | dict) and not current:
+    if isinstance(current, _EMPTY_REQUIREMENT_TYPES) and not current:
         return False
     return True
 
@@ -6188,6 +6562,26 @@ def _path_value(config: dict[str, Any], dotted_path: str) -> tuple[bool, Any]:
             return False, None
         current = current[part]
     return True, current
+
+
+def _source_root_and_path_sort_key(item: dict[str, Any]) -> tuple[str, str]:
+    return item["source_root"], item["source_path"]
+
+
+def _path_sort_key(item: dict[str, Any]) -> str:
+    return item["path"]
+
+
+def _equipment_group_sort_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    return item["source_scope"], item["source_root"], item["source_path"], item["id"]
+
+
+def _candidate_target_and_source_path_sort_key(item: dict[str, Any]) -> tuple[str, str]:
+    return item["candidate_target"], item["source_path"]
+
+
+def _accounting_record_sort_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    return item["source_scope"], item["source_root"], item["source_path"]
 
 
 def _section_items(config: dict[str, Any], key: str) -> list[Any]:

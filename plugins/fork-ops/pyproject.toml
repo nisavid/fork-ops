@@ -18,13 +18,20 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = [
-  "mcp>=1.23.0"
+  "mcp>=1.29,<2"
 ]
 
 [dependency-groups]
-dev = [
-  "mypy>=1.18",
-  "pytest>=9.0.3",
+build = [
+  "setuptools==83.0.0",
+  "wheel==0.46.2"
+]
+test = [
+  "coverage>=7,<8",
+  "pytest>=9.0.3"
+]
+development = [
+  "pyrefly>=1.1.1,<2",
   "ruff>=0.14",
   "types-jsonschema>=4.25"
 ]
@@ -37,7 +44,7 @@ fork-ops-mcp = "fork_ops.mcp_server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-fork_ops = ["fork-ops.schema.json"]
+fork_ops = ["fork-ops.schema.json", "security-exception-contract-1.0.json"]
 
 [tool.ruff]
 line-length = 100
@@ -48,9 +55,9 @@ cache-dir = ".ruff_cache"
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP"]
 
-[tool.mypy]
-python_version = "3.11"
-strict = true
-mypy_path = "src"
-files = ["src", "tests"]
-cache_dir = ".mypy_cache"
+[tool.pyrefly]
+disable-project-excludes-heuristics = true
+project-includes = ["src", "tests"]
+search-path = ["src"]
+python-version = "3.11.0"
+preset = "strict"

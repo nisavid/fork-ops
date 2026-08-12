@@ -36,6 +36,7 @@ from fork_ops.core import (
     execute_migration_plan,
     explain_migration_blocker,
     generate_migration_plan,
+    initialize_config,
     normalize_config,
     parse_config_text,
     propose_migration_config_patch,
@@ -405,8 +406,237 @@ class ForkOpsCoreTests(unittest.TestCase):
             )
 
         checks = {check["id"]: check for check in report["checks"]}
-        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
-        self.assertIn("string args", checks["mcp_process_startup"]["summary"])
+        self.assertEqual(checks["mcp_config_resolution"]["status"], "failed")
+        self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+        self.assertIn("reviewed registration shape", checks["mcp_config_resolution"]["summary"])
+
+    def test_plugin_health_report_refuses_changed_mcp_registration_without_mcp_launching(
+        self,
+    ) -> None:
+        launches: list[list[str]] = []
+
+        def recording_runner(
+            command: list[str],
+            cwd: Path,
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, timeout
+            launches.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"operation": "workflow-catalog", "workflows": []}),
+                "",
+            )
+
+        changed_registrations = {
+            "command": {
+                "command": "/attacker-controlled",
+                "args": ["run", "--project", ".", "--extra", "mcp", "fork-ops-mcp"],
+                "cwd": ".",
+            },
+            "args": {
+                "command": "uv",
+                "args": ["run", "--project", ".", "payload"],
+                "cwd": ".",
+            },
+            "cwd": {
+                "command": "uv",
+                "args": ["run", "--project", ".", "--extra", "mcp", "fork-ops-mcp"],
+                "cwd": "/attacker-controlled",
+            },
+            "extra-key": {
+                "command": "uv",
+                "args": ["run", "--project", ".", "--extra", "mcp", "fork-ops-mcp"],
+                "cwd": ".",
+                "environment": {"PYTHONPATH": "/attacker-controlled"},
+            },
+        }
+        for label, registration in changed_registrations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as workspace:
+                launches.clear()
+                repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+                (plugin_root / ".mcp.json").write_text(
+                    json.dumps({"mcpServers": {"fork-ops": registration}})
+                )
+
+                report = build_plugin_health_report(
+                    plugin_root,
+                    repo_root=repo_root,
+                    command_runner=recording_runner,
+                )
+
+                checks = {check["id"]: check for check in report["checks"]}
+                self.assertEqual(checks["mcp_config_resolution"]["status"], "failed")
+                self.assertEqual(checks["cli_execution"]["status"], "ready")
+                self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+                self.assertEqual(
+                    launches,
+                    [[sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"]],
+                )
+
+    def test_plugin_health_report_evidence_cannot_change_the_reviewed_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+            report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=_plugin_health_runner(),
+            )
+            checks = {check["id"]: check for check in report["checks"]}
+            checks["mcp_config_resolution"]["evidence"]["args"][0] = "/attacker-controlled"
+            (plugin_root / ".mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "fork-ops": {
+                                "command": "uv",
+                                "args": [
+                                    "/attacker-controlled",
+                                    "--project",
+                                    ".",
+                                    "--extra",
+                                    "mcp",
+                                    "fork-ops-mcp",
+                                ],
+                                "cwd": ".",
+                            }
+                        }
+                    }
+                )
+            )
+
+            next_report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=_plugin_health_runner(),
+            )
+
+        next_checks = {check["id"]: check for check in next_report["checks"]}
+        self.assertEqual(next_checks["mcp_config_resolution"]["status"], "failed")
+        self.assertEqual(next_checks["mcp_process_startup"]["status"], "unavailable")
+
+    def test_plugin_health_report_uses_isolated_package_modules_instead_of_plugin_scripts(
+        self,
+    ) -> None:
+        launches: list[tuple[list[str], Path]] = []
+
+        def recording_runner(
+            command: list[str],
+            cwd: Path,
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout
+            launches.append((command, cwd))
+            payload: dict[str, Any]
+            if command[-2:] == ["workflow", "catalog"]:
+                payload = {"operation": "workflow-catalog", "workflows": []}
+            else:
+                payload = {
+                    "mcp_dependency_available": True,
+                    "missing_dependency": None,
+                    "server": "Fork Ops",
+                    "tools": list(MCP_TOOL_IDS),
+                }
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+        with tempfile.TemporaryDirectory() as workspace:
+            repo_root, plugin_root = _write_plugin_health_fixture(Path(workspace))
+            (plugin_root / ".mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "fork-ops": {
+                                "command": "uv",
+                                "args": [
+                                    "run",
+                                    "--project",
+                                    ".",
+                                    "--extra",
+                                    "mcp",
+                                    "fork-ops-mcp",
+                                ],
+                                "cwd": ".",
+                            }
+                        }
+                    }
+                )
+            )
+            (plugin_root / "scripts/fork_ops_cli.py").write_text(
+                "raise RuntimeError('repository-controlled wrapper executed')\n"
+            )
+            (plugin_root / "scripts/fork_ops_mcp.py").write_text(
+                "raise RuntimeError('repository-controlled wrapper executed')\n"
+            )
+
+            report = build_plugin_health_report(
+                plugin_root,
+                repo_root=repo_root,
+                command_runner=recording_runner,
+            )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        trusted_cwd = Path(mcp_server.__file__).resolve().parent
+        self.assertEqual(checks["cli_execution"]["status"], "ready")
+        self.assertEqual(checks["mcp_process_startup"]["status"], "ready")
+        self.assertEqual(
+            launches,
+            [
+                (
+                    [sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"],
+                    trusted_cwd,
+                ),
+                (
+                    [sys.executable, "-I", "-m", "fork_ops.mcp_server", "--health-check"],
+                    trusted_cwd,
+                ),
+            ],
+        )
+
+    def test_plugin_health_report_does_not_launch_from_a_caller_selected_symlink_root(
+        self,
+    ) -> None:
+        launches: list[tuple[list[str], Path]] = []
+
+        def recording_runner(
+            command: list[str],
+            cwd: Path,
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout
+            launches.append((command, cwd))
+            payload: dict[str, Any]
+            if command[-2:] == ["workflow", "catalog"]:
+                payload = {"operation": "workflow-catalog", "workflows": []}
+            else:
+                payload = {
+                    "mcp_dependency_available": True,
+                    "missing_dependency": None,
+                    "server": "Fork Ops",
+                    "tools": list(MCP_TOOL_IDS),
+                }
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo_root, plugin_root = _write_plugin_health_fixture(workspace_path)
+            linked_root = workspace_path / "caller-selected-plugin"
+            linked_root.symlink_to(plugin_root, target_is_directory=True)
+
+            report = build_plugin_health_report(
+                linked_root,
+                repo_root=repo_root,
+                command_runner=recording_runner,
+            )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        trusted_cwd = Path(mcp_server.__file__).resolve().parent
+        self.assertEqual(checks["cli_execution"]["status"], "ready")
+        self.assertEqual(checks["mcp_process_startup"]["status"], "ready")
+        self.assertEqual([cwd for _, cwd in launches], [trusted_cwd, trusted_cwd])
+        self.assertTrue(
+            all(str(plugin_root) not in argument for command, _ in launches for argument in command)
+        )
 
     def test_plugin_health_report_quotes_fallback_paths(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fork ops ") as workspace:
@@ -624,6 +854,35 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(cli_payload, mcp_payload)
         self.assertEqual(cli_payload["summary"]["status"], "ready")
+
+    def test_source_plugin_root_is_probed_through_installed_package_modules(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+        repo_root = plugin_root.parents[1]
+
+        report = build_plugin_health_report(
+            plugin_root,
+            repo_root=repo_root,
+            ui_visible=True,
+        )
+
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(report["summary"]["status"], "ready")
+        self.assertEqual(
+            checks["cli_execution"]["evidence"]["command"],
+            [sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"],
+        )
+        self.assertEqual(
+            checks["mcp_process_startup"]["evidence"]["command"],
+            [sys.executable, "-I", "-m", "fork_ops.mcp_server", "--health-check"],
+        )
+        self.assertEqual(
+            checks["cli_execution"]["evidence"]["launch_provenance"],
+            "current-interpreter-isolated-package-module",
+        )
+        self.assertEqual(
+            checks["mcp_process_startup"]["evidence"]["launch_provenance"],
+            "current-interpreter-isolated-package-module",
+        )
 
     def test_cli_plugin_health_fails_when_report_has_failed_checks(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -2711,6 +2970,342 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(shown["repository"]["owner"], "nisavid")
         self.assertTrue(validated["required_level"]["available"])
 
+    def test_cli_config_init_write_refuses_a_target_parent_symlink_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            repo_path = Path(repo)
+            outside_path = Path(outside)
+            (repo_path / ".agents").symlink_to(outside_path, target_is_directory=True)
+            error = io.StringIO()
+
+            with redirect_stderr(error):
+                exit_code = cli_main(
+                    [
+                        "config",
+                        "init",
+                        "--repo",
+                        str(repo_path),
+                        "--repository-owner",
+                        "nisavid",
+                        "--repository-name",
+                        "demo",
+                        "--upstream-owner",
+                        "upstream",
+                        "--upstream-name",
+                        "demo",
+                        "--write",
+                    ]
+                )
+
+            self.assertFalse((outside_path / "fork-ops.toml").exists())
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("outside the repository", error.getvalue())
+
+    def test_config_initialization_reports_guarded_mutation_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+
+            result = initialize_config(
+                repo_path,
+                repository_owner="nisavid",
+                repository_name="demo",
+                upstream_owner="upstream",
+                upstream_name="demo",
+            )
+
+            config_text = (repo_path / CONFIG_RELATIVE_PATH).read_text()
+
+        self.assertEqual(result["operation"], "config-initialization")
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["applied_edits"][0]["path"], ".agents/fork-ops.toml")
+        self.assertEqual(
+            result["applied_edits"][0]["content_sha256"],
+            hashlib.sha256(config_text.encode()).hexdigest(),
+        )
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["verification"]["status"], "passed")
+        self.assertTrue(result["verification"]["required_level_available"])
+
+    def test_config_initialization_rolls_back_its_exact_file_after_verification_failure(
+        self,
+    ) -> None:
+        failed_report = {
+            "capability": {
+                "highest_available": "scoutable",
+                "levels": {"track-aware": {"available": False}},
+            },
+            "diagnostics": [{"severity": "error", "code": "test.verification_failed"}],
+        }
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            unrelated_path = repo_path / "keep.txt"
+            unrelated_path.write_text("unrelated\n")
+
+            with patch("fork_ops.core.build_status_report", return_value=failed_report):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "rolled_back")
+        self.assertEqual(result["mutation"]["rollback_status"], "rolled_back")
+        self.assertEqual(result["applied_edits"][0]["status"], "rolled_back")
+
+    def test_config_initialization_reports_applied_unverified_after_target_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+
+            def tamper_then_fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                del args, kwargs
+                target_path.write_text("tampered after create\n")
+                return {
+                    "capability": {
+                        "highest_available": None,
+                        "levels": {"track-aware": {"available": False}},
+                    },
+                    "diagnostics": [{"severity": "error", "code": "test.tampered"}],
+                }
+
+            with patch("fork_ops.core.build_status_report", side_effect=tamper_then_fail):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertEqual(target_path.read_text(), "tampered after create\n")
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_config_initialization_reports_applied_unverified_after_target_symlink_swap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            unrelated_path = repo_path / "keep.txt"
+            unrelated_path.write_text("unrelated\n")
+
+            def swap_then_fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                del args, kwargs
+                target_path.unlink()
+                target_path.symlink_to(unrelated_path)
+                return {
+                    "capability": {
+                        "highest_available": None,
+                        "levels": {"track-aware": {"available": False}},
+                    },
+                    "diagnostics": [{"severity": "error", "code": "test.symlink_swap"}],
+                }
+
+            with patch("fork_ops.core.build_status_report", side_effect=swap_then_fail):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue(target_path.is_symlink())
+            self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+
+    def test_config_initialization_reports_applied_unverified_when_target_is_unreadable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            unrelated_path = repo_path / "keep.txt"
+            unrelated_path.write_text("unrelated\n")
+
+            with patch(
+                "fork_ops.core.os.open",
+                side_effect=PermissionError("injected verification denial"),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue(target_path.is_file())
+            self.assertIn('owner = "nisavid"', target_path.read_text())
+            self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+
+    def test_config_initialization_rolls_back_after_capability_verification_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            unrelated_path = repo_path / "keep.txt"
+            unrelated_path.write_text("unrelated\n")
+
+            with patch(
+                "fork_ops.core.build_status_report",
+                side_effect=RuntimeError("injected capability failure"),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["rollback_status"], "rolled_back")
+        self.assertEqual(
+            result["verification"]["capability"]["error"],
+            "injected capability failure",
+        )
+
+    def test_config_initialization_preserves_a_concurrently_created_target(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            unrelated_path = repo_path / "keep.txt"
+            unrelated_path.write_text("unrelated\n")
+
+            def concurrent_create_then_conflict(source: Any, destination: Any) -> None:
+                del source
+                Path(destination).write_text("concurrent writer\n")
+                raise FileExistsError("injected create race")
+
+            with patch("fork_ops.core.os.link", side_effect=concurrent_create_then_conflict):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertEqual(target_path.read_text(), "concurrent writer\n")
+            self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "not-created")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+
+    def test_config_initialization_refuses_existing_file_and_symlink_targets(self) -> None:
+        target_kinds = ("file", "symlink")
+        for target_kind in target_kinds:
+            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                target_path = repo_path / CONFIG_RELATIVE_PATH
+                target_path.parent.mkdir(parents=True)
+                unrelated_path = repo_path / "keep.txt"
+                unrelated_path.write_text("unrelated\n")
+                if target_kind == "file":
+                    target_path.write_text("existing\n")
+                else:
+                    target_path.symlink_to(unrelated_path)
+
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+                self.assertEqual(result["status"], "blocked")
+                self.assertFalse(result["mutation"]["occurred"])
+                self.assertEqual(unrelated_path.read_text(), "unrelated\n")
+                if target_kind == "file":
+                    self.assertEqual(target_path.read_text(), "existing\n")
+                else:
+                    self.assertTrue(target_path.is_symlink())
+
+    def test_cli_config_init_write_reports_rollback_and_persisting_unverified_mutation(
+        self,
+    ) -> None:
+        scenarios = ("rolled_back", "applied_unverified")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                target_path = repo_path / CONFIG_RELATIVE_PATH
+                error = io.StringIO()
+
+                def fail_verification(
+                    *args: Any,
+                    _scenario: str = scenario,
+                    _target_path: Path = target_path,
+                    **kwargs: Any,
+                ) -> dict[str, Any]:
+                    del args, kwargs
+                    if _scenario == "applied_unverified":
+                        _target_path.write_text("changed after create\n")
+                    return {
+                        "capability": {
+                            "highest_available": None,
+                            "levels": {"track-aware": {"available": False}},
+                        },
+                        "diagnostics": [{"severity": "error", "code": "test.failed"}],
+                    }
+
+                with (
+                    patch("fork_ops.core.build_status_report", side_effect=fail_verification),
+                    redirect_stderr(error),
+                ):
+                    exit_code = cli_main(
+                        [
+                            "config",
+                            "init",
+                            "--repo",
+                            str(repo_path),
+                            "--repository-owner",
+                            "nisavid",
+                            "--repository-name",
+                            "demo",
+                            "--upstream-owner",
+                            "upstream",
+                            "--upstream-name",
+                            "demo",
+                            "--write",
+                        ]
+                    )
+
+                self.assertEqual(exit_code, 2)
+                if scenario == "rolled_back":
+                    self.assertIn("rolled back", error.getvalue())
+                    self.assertFalse(target_path.exists())
+                else:
+                    self.assertIn("remains unverified", error.getvalue())
+                    self.assertIn(str(target_path), error.getvalue())
+                    self.assertEqual(target_path.read_text(), "changed after create\n")
+
     def test_cli_schema_check_reports_drift(self) -> None:
         with tempfile.TemporaryDirectory() as plugin:
             plugin_root = Path(plugin)
@@ -3222,7 +3817,8 @@ equipment = "not-a-table"
             config_path.write_text(TRACK_AWARE_CONFIG)
             plan = generate_migration_plan(repo_path)
             plan["proposed_config_patch"]["operation"] = "create"
-            plan["blockers"] = []
+            empty_blockers: list[dict[str, Any]] = []
+            plan["blockers"] = empty_blockers
             original_config = config_path.read_text()
 
             result = execute_migration_plan(plan)
@@ -3389,7 +3985,8 @@ equipment = "not-a-table"
             source_path.parent.mkdir(parents=True)
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
-            plan["validation_requirements"] = []
+            no_validation_requirements: list[dict[str, Any]] = []
+            plan["validation_requirements"] = no_validation_requirements
 
             dry_run = dry_run_migration_plan(plan)
             result = execute_migration_plan(plan)
@@ -3832,8 +4429,15 @@ def _write_plugin_health_fixture(
             {
                 "mcpServers": {
                     "fork-ops": {
-                        "command": sys.executable,
-                        "args": [str(mcp_script)],
+                        "command": "uv",
+                        "args": [
+                            "run",
+                            "--project",
+                            ".",
+                            "--extra",
+                            "mcp",
+                            "fork-ops-mcp",
+                        ],
                         "cwd": ".",
                     }
                 }

@@ -1,0 +1,1990 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "artifact_kind": "security_exception_contract",
+  "contract_version": "1.0",
+  "supported_contract_versions": [
+    "1.0"
+  ],
+  "authority": {
+    "provider": "github",
+    "repository": {
+      "full_name": "nisavid/fork-ops",
+      "database_id": 1241799725,
+      "node_id": "R_kgDOSgRcLQ"
+    },
+    "risk_authority": {
+      "login": "nisavid",
+      "database_id": 576874,
+      "node_id": "MDQ6VXNlcjU3Njg3NA=="
+    },
+    "migration": {
+      "artifact_kind": "security_exception_authority_migration",
+      "schema_version": "1.0",
+      "supported_contract_version": "1.0",
+      "mismatch_behavior": "refuse"
+    }
+  },
+  "authority_observation": {
+    "maximum_age_seconds": 900,
+    "authentication_status": "unverified_projection"
+  },
+  "transition_observation": {
+    "maximum_persistence_delay_seconds": 900,
+    "maximum_age_seconds": 900,
+    "time_window": "observed_at <= persisted_at <= evaluated_at < persisted_at+15m"
+  },
+  "lineage_issuance": {
+    "maximum_future_skew_seconds": 0,
+    "time_window": "issued_at <= evaluated_at"
+  },
+  "enums": {
+    "exception_kinds": [
+      "finding_exception",
+      "control_bypass",
+      "control_unavailability",
+      "policy_deviation"
+    ],
+    "subject_kinds": [
+      "dependency_advisory",
+      "first_party_finding",
+      "repository_control",
+      "assurance_gate",
+      "security_invariant",
+      "package_source"
+    ],
+    "visibility": [
+      "public",
+      "private"
+    ],
+    "severity": [
+      "critical",
+      "high",
+      "medium",
+      "low"
+    ],
+    "record_states": [
+      "approved",
+      "renewed",
+      "revocation_pending",
+      "recomputation_required",
+      "revoked",
+      "resolved"
+    ],
+    "dependency_scopes": [
+      "runtime",
+      "optional",
+      "build",
+      "test",
+      "development"
+    ],
+    "python_versions": [
+      "3.11",
+      "3.12",
+      "3.13",
+      "3.14"
+    ],
+    "platforms": [
+      "linux"
+    ],
+    "source_time_status": [
+      "authoritative",
+      "first_observed_upper_bound"
+    ],
+    "fix_availability": [
+      "available",
+      "unavailable",
+      "unknown"
+    ]
+  },
+  "dependency_subject": {
+    "package_normalization": "pep503-lowercase-hyphen",
+    "key_template": "dependency:{lineage_id}:{package}@{locked_version}|scopes={scopes}|python={python_versions}|platform=linux",
+    "python_subset_nonempty": true,
+    "platform_exact": "linux"
+  },
+  "subject_identity": {
+    "subject_key_normalization": "ascii-exact",
+    "aliases_participate": false,
+    "cross_lineage_uniqueness": true,
+    "prefixes": {
+      "dependency_advisory": "dependency",
+      "first_party_finding": "first_party_finding",
+      "repository_control": "repository_control",
+      "assurance_gate": "assurance_gate",
+      "security_invariant": "security_invariant",
+      "package_source": "package_source"
+    }
+  },
+  "provider_observation": {
+    "required_passes": 2,
+    "passes_must_be_semantic_identical": true,
+    "maximum_validity_seconds": 900,
+    "maximum_trusted_time_skew_seconds": 120,
+    "time_window": "observation_completed_at <= evaluated_at < valid_until",
+    "validity_bounded_by_provider_and_auth": true,
+    "edited_public_comments_accepted": false,
+    "ordered_page_manifests": true,
+    "stable_identities": {
+      "repository": {
+        "full_name": "nisavid/fork-ops",
+        "database_id": 1241799725,
+        "node_id": "R_kgDOSgRcLQ"
+      },
+      "governance_issue": {
+        "number": 59,
+        "database_id": 5126688352,
+        "node_id": "I_kwDOSgRcLc8AAAABMZMOYA"
+      },
+      "account": {
+        "login": "nisavid",
+        "database_id": 576874,
+        "node_id": "MDQ6VXNlcjU3Njg3NA=="
+      }
+    }
+  },
+  "response_clock": {
+    "sources": [
+      "github_dependabot",
+      "osv",
+      "github_private_advisory",
+      "first_party_validation"
+    ],
+    "query_ids": [
+      "repository-vulnerability-alerts",
+      "osv-locked-dependencies",
+      "private-security-advisories",
+      "validated-first-party-findings"
+    ],
+    "dependency_scopes": [
+      "runtime",
+      "optional",
+      "build",
+      "test",
+      "development"
+    ],
+    "python_versions": [
+      "3.11",
+      "3.12",
+      "3.13",
+      "3.14"
+    ],
+    "platforms": [
+      "linux"
+    ],
+    "positive_zero_requires_complete_available_reconciled_pagination": true,
+    "source_time": {
+      "authoritative": "earliest authenticated source publication or private validation time",
+      "missing": "retained first-observed upper bound",
+      "missing_sla_state": "uncertain"
+    },
+    "triage": {
+      "critical": {
+        "kind": "elapsed_hours",
+        "value": 24
+      },
+      "high": {
+        "kind": "mon_fri_utc_weekdays_no_holidays",
+        "value": 2
+      },
+      "medium": null,
+      "low": null
+    },
+    "disposition": {
+      "critical": {
+        "kind": "elapsed_hours",
+        "value": 72
+      },
+      "high": {
+        "kind": "calendar_days",
+        "value": 14
+      },
+      "medium": {
+        "kind": "calendar_days",
+        "value": 30
+      },
+      "low": {
+        "kind": "calendar_days",
+        "value": 90
+      }
+    },
+    "severity_reconciliation": "highest_credible_only_tightens"
+  },
+  "lifecycle": {
+    "review_max_days": 30,
+    "expiry_max_days": 90,
+    "control_bypass_or_unavailability_max_days": 7,
+    "critical_cap": "response_started_at+72h",
+    "high_cap": "response_started_at+14d",
+    "review_formula": "last_approval_or_renewal < review_after <= min(last_approval_or_renewal+30d, expires_at)",
+    "expiry_formula": "review_after <= expires_at <= absolute_cap",
+    "equality_inactive": true,
+    "revoked_terminal": true,
+    "resolved_terminal": true,
+    "anchors_never_reset": true,
+    "effect_scope": "record_lifecycle_validity_only",
+    "trust_status": "structural_unverified",
+    "active_requires_authenticated_authority": true
+  },
+  "canonicalization": {
+    "encoding": "utf-8",
+    "unicode_normalization": "NFC",
+    "object_keys": "lexicographic-by-unicode-code-point",
+    "numbers": "integers-only",
+    "arrays": "preserve-order; set-valued fields must already use contract order",
+    "json_separators": [
+      ",",
+      ":"
+    ],
+    "digest_algorithm": "sha256",
+    "digest_domains": {
+      "proposal": "fork-ops/security-exception/proposal/1.0\u0000",
+      "evidence": "fork-ops/security-exception/evidence/1.0\u0000",
+      "event": "fork-ops/security-exception/event/1.0\u0000",
+      "record": "fork-ops/security-exception/record/1.0\u0000",
+      "result": "fork-ops/security-exception/result/1.0\u0000",
+      "provider_request": "fork-ops/security-exception/provider-request/1.0\u0000",
+      "provider_semantic": "fork-ops/security-exception/provider-semantic/1.0\u0000",
+      "provider_response": "fork-ops/security-exception/provider-response/1.0\u0000",
+      "provider_receipt": "fork-ops/security-exception/provider-receipt/1.0\u0000",
+      "provider_aggregate": "fork-ops/security-exception/provider-aggregate/1.0\u0000"
+    },
+    "golden_vectors": [
+      {
+        "projection": {
+          "action": "approve",
+          "exception_id": "22222222-2222-4222-8222-222222222222",
+          "sequence": 1
+        },
+        "canonical_utf8": "{\"action\":\"approve\",\"exception_id\":\"22222222-2222-4222-8222-222222222222\",\"sequence\":1}",
+        "digests": {
+          "proposal": "aff2929302e1925f95e29787cdd598283dcbcea853cdec8a049ed7352f34650c",
+          "event": "a73af83e681a554c9ebcfed7a16282801fbe3c715600af779d37d87b85e14b83",
+          "record": "8501ddb0ba945fb6da90508625784153b7322254918a6dc9ce37737ebe3445c2",
+          "result": "8eca3297b427ce0a71ef5e56ddf39752f12f6484a17423df54e2f3fe782799d4"
+        }
+      }
+    ]
+  },
+  "kind_subject_matrix": {
+    "finding_exception": [
+      "dependency_advisory",
+      "first_party_finding"
+    ],
+    "control_bypass": [
+      "repository_control",
+      "assurance_gate"
+    ],
+    "control_unavailability": [
+      "repository_control",
+      "assurance_gate"
+    ],
+    "policy_deviation": [
+      "security_invariant",
+      "repository_control",
+      "package_source",
+      "assurance_gate"
+    ]
+  },
+  "public_reference_policy": {
+    "scheme": "https",
+    "approved_hosts": [
+      "api.github.com",
+      "github.com",
+      "osv.dev",
+      "pypi.org"
+    ],
+    "approved_ports": [
+      443
+    ],
+    "path_patterns": {
+      "api.github.com": [
+        "^/advisories/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$",
+        "^/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/security-advisories/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$"
+      ],
+      "github.com": [
+        "^/advisories/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$",
+        "^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/security/advisories/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$"
+      ],
+      "osv.dev": [
+        "^/vulnerability/(?:CVE-[0-9]{4}-[0-9]{4,}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|PYSEC-[0-9]{4}-[0-9]+)$"
+      ],
+      "pypi.org": [
+        "^/project/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.!+-]+)?$"
+      ]
+    },
+    "forbidden_credential_patterns": [
+      "gh[pousr]_[A-Za-z0-9_]{20,}",
+      "github_pat_[A-Za-z0-9_]{20,}",
+      "pypi-[A-Za-z0-9_-]{85,}",
+      "(?:AKIA|ASIA)[0-9A-Z]{16}",
+      "xox[baprs]-[A-Za-z0-9-]{10,}"
+    ],
+    "userinfo": "forbidden",
+    "query": "forbidden",
+    "fragment": "forbidden"
+  },
+  "v1_total_effects": {
+    "inventory_recorded": true,
+    "decision_recorded": true,
+    "lifecycle_recorded": true,
+    "security_posture_green": false,
+    "admission_or_merge_authorized": false,
+    "repository_control_relaxed_disabled_or_mutated": false,
+    "assurance_validated": false,
+    "baseline_or_release_eligible": false,
+    "product_or_dogfood_authorized": false,
+    "underlying_failure_cleared": false,
+    "underlying_failure_remains_blocking": true
+  },
+  "confidentiality": {
+    "public_projection": "bounded structured confidentiality-safe metadata and reviewed HTTPS references only",
+    "private_source": "private advisory adapter",
+    "accepted_private_input": "versioned sanitized private projection only",
+    "raw_confidential_data_accepted": false,
+    "free_form_confidential_evidence_accepted": false,
+    "private_projection_unavailability": "fail_whole_ledger_validation",
+    "public_commands_govern_private_records": false
+  },
+  "lineage": {
+    "identifier": "coordinator-issued random UUIDv4",
+    "initial_state": "approved",
+    "exception_id_policy": {
+      "initial": "fresh_globally_history_unique",
+      "renewal": "rotate_fresh_globally_history_unique",
+      "other_transitions": "retain",
+      "current_record": "equals_head"
+    },
+    "index": "append-only across active inactive revoked and resolved states",
+    "forbidden": [
+      "unlinked_reuse",
+      "branch",
+      "overlap",
+      "split",
+      "merge",
+      "cross_visibility",
+      "anchor_reset"
+    ],
+    "alias_revision_separate_from_evidence_revision": true,
+    "current_record_requires_exact_head_and_revision_equality": true,
+    "collection_and_persistence_owned_by_adapter": true,
+    "pure_projection_validation_only": true
+  },
+  "version_boundary": {
+    "supported_contract_version": "1.0",
+    "future_effects_require_contract_version": "2.0",
+    "future_contract_supported": false,
+    "live_admission_proof_available": false
+  },
+  "state_machine": {
+    "record_states": [
+      "approved",
+      "renewed",
+      "revocation_pending",
+      "recomputation_required",
+      "revoked",
+      "resolved"
+    ],
+    "terminal_states": [
+      "revoked",
+      "resolved"
+    ],
+    "actions": {
+      "approve": {
+        "from": [
+          "proposal"
+        ],
+        "to": "approved"
+      },
+      "renew": {
+        "from": [
+          "approved",
+          "renewed"
+        ],
+        "to": "renewed"
+      },
+      "revoke": {
+        "from": [
+          "approved",
+          "renewed",
+          "recomputation_required"
+        ],
+        "to": "revoked"
+      },
+      "malformed_revoke": {
+        "from": [
+          "approved",
+          "renewed"
+        ],
+        "to": "revocation_pending"
+      },
+      "withdraw_invalid": {
+        "from": [
+          "revocation_pending"
+        ],
+        "to": "recomputation_required",
+        "clears": "pending_transition_only",
+        "restores_snapshot": false,
+        "forces_fresh_recomputation": true
+      },
+      "resolve": {
+        "from": [
+          "approved",
+          "renewed",
+          "recomputation_required"
+        ],
+        "to": "resolved"
+      }
+    }
+  },
+  "public_command_grammars": {
+    "encoding": "utf-8",
+    "tokenization": "exactly six or eight ASCII-whitespace-separated tokens; lowercase literals; no extra text",
+    "public_records_only": true,
+    "commands_are_requests": true,
+    "authoritative_effect_requires_future_authenticated_adapter": true,
+    "approve": [
+      "/security-exception",
+      "approve",
+      "1.0",
+      "{exception_id}",
+      "{proposal_sha256}",
+      "none"
+    ],
+    "renew": [
+      "/security-exception",
+      "renew",
+      "1.0",
+      "{successor_exception_id}",
+      "{successor_proposal_sha256}",
+      "{predecessor_effective_event_sha256}"
+    ],
+    "revoke": [
+      "/security-exception",
+      "revoke",
+      "1.0",
+      "{exception_id}",
+      "{current_proposal_sha256}",
+      "{predecessor_effective_event_sha256}"
+    ],
+    "withdraw_invalid": [
+      "/security-exception",
+      "withdraw-invalid",
+      "1.0",
+      "{exception_id}",
+      "{pending_transition_sha256}",
+      "{predecessor_effective_event_sha256}",
+      "{malformed_comment_node_id}",
+      "{malformed_raw_sha256}"
+    ],
+    "malformed_revoke": {
+      "exact_prefix": [
+        "/security-exception",
+        "revoke",
+        "1.0",
+        "{known_exception_id}"
+      ],
+      "only_transition": "revocation_pending"
+    }
+  },
+  "artifact_schemas": {
+    "public_ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_ledger"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "exceptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/public_record"
+          }
+        }
+      }
+    },
+    "private_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "status",
+        "records",
+        "lineage_index"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_private_projection"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "status": {
+          "const": "available"
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sanitized_private_record"
+          }
+        },
+        "lineage_index": {
+          "$ref": "#/$defs/lineage_index"
+        }
+      }
+    },
+    "authority_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "status",
+        "provider",
+        "authentication_status",
+        "observed_at",
+        "repository_full_name",
+        "repository_database_id",
+        "repository_node_id",
+        "login",
+        "account_database_id",
+        "account_node_id"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_authority_observation"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "status": {
+          "const": "available"
+        },
+        "provider": {
+          "const": "github"
+        },
+        "authentication_status": {
+          "const": "unverified_projection"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "repository_full_name": {
+          "type": "string"
+        },
+        "repository_database_id": {
+          "type": "integer"
+        },
+        "repository_node_id": {
+          "type": "string"
+        },
+        "login": {
+          "type": "string"
+        },
+        "account_database_id": {
+          "type": "integer"
+        },
+        "account_node_id": {
+          "type": "string"
+        }
+      }
+    },
+    "transition_projection": {
+      "$ref": "#/$defs/transition_projection"
+    },
+    "provider_observation": {
+      "$ref": "#/$defs/provider_observation"
+    },
+    "response_clock_inventory": {
+      "$ref": "#/$defs/response_clock_inventory"
+    },
+    "lineage_issuance_projection": {
+      "$ref": "#/$defs/lineage_issuance_projection"
+    },
+    "advisory_reconciliation_projection": {
+      "$ref": "#/$defs/advisory_reconciliation_projection"
+    },
+    "authority_migration_projection": {
+      "$ref": "#/$defs/authority_migration_projection"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "effective_event_predecessor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "const": "none"
+        }
+      ]
+    },
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+\\-]*$"
+    },
+    "effects": {
+      "const": {
+        "inventory_recorded": true,
+        "decision_recorded": true,
+        "lifecycle_recorded": true,
+        "security_posture_green": false,
+        "admission_or_merge_authorized": false,
+        "repository_control_relaxed_disabled_or_mutated": false,
+        "assurance_validated": false,
+        "baseline_or_release_eligible": false,
+        "product_or_dogfood_authorized": false,
+        "underlying_failure_cleared": false,
+        "underlying_failure_remains_blocking": true
+      }
+    },
+    "record_base": {
+      "type": "object",
+      "required": [
+        "exception_id",
+        "lineage_id",
+        "lineage_sequence",
+        "visibility",
+        "kind",
+        "subject_kind",
+        "subject_key",
+        "severity",
+        "state",
+        "owner",
+        "authority_login",
+        "authority_database_id",
+        "authority_node_id",
+        "alias_revision",
+        "evidence_revision",
+        "evidence_digest",
+        "compensating_control_ids",
+        "response_started_at",
+        "source_time_status",
+        "last_approval_or_renewal",
+        "review_after",
+        "expires_at",
+        "absolute_cap",
+        "removal_condition_code",
+        "fix_availability",
+        "proposal_digest",
+        "event_digest",
+        "record_digest",
+        "result_digest",
+        "predecessor_record_digest",
+        "effects"
+      ],
+      "properties": {
+        "exception_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "lineage_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "lineage_sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "visibility": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "finding_exception",
+            "control_bypass",
+            "control_unavailability",
+            "policy_deviation"
+          ]
+        },
+        "subject_kind": {
+          "enum": [
+            "dependency_advisory",
+            "first_party_finding",
+            "repository_control",
+            "assurance_gate",
+            "security_invariant",
+            "package_source"
+          ]
+        },
+        "subject_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@+|=,\\-]*$"
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "state": {
+          "enum": [
+            "approved",
+            "renewed",
+            "revocation_pending",
+            "recomputation_required",
+            "revoked",
+            "resolved"
+          ]
+        },
+        "owner": {
+          "$ref": "#/$defs/identifier"
+        },
+        "authority_login": {
+          "const": "nisavid"
+        },
+        "authority_database_id": {
+          "const": 576874
+        },
+        "authority_node_id": {
+          "const": "MDQ6VXNlcjU3Njg3NA=="
+        },
+        "alias_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "compensating_control_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "response_started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_time_status": {
+          "enum": [
+            "authoritative",
+            "first_observed_upper_bound"
+          ]
+        },
+        "last_approval_or_renewal": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "review_after": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "absolute_cap": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "removal_condition_code": {
+          "$ref": "#/$defs/identifier"
+        },
+        "fix_availability": {
+          "enum": [
+            "available",
+            "unavailable",
+            "unknown"
+          ]
+        },
+        "proposal_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "event_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "record_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "predecessor_record_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "effects": {
+          "$ref": "#/$defs/effects"
+        }
+      }
+    },
+    "record_subject_projection": {
+      "type": "object",
+      "required": [
+        "aliases"
+      ],
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "locked_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^\\S+$"
+        },
+        "dependency_scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "runtime",
+              "optional",
+              "build",
+              "test",
+              "development"
+            ]
+          }
+        },
+        "python_versions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "3.11",
+              "3.12",
+              "3.13",
+              "3.14"
+            ]
+          }
+        },
+        "platforms": {
+          "const": [
+            "linux"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "subject_kind": {
+                "const": "dependency_advisory"
+              }
+            },
+            "required": [
+              "subject_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "package",
+              "locked_version",
+              "dependency_scopes",
+              "python_versions",
+              "platforms"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "package"
+                  ]
+                },
+                {
+                  "required": [
+                    "locked_version"
+                  ]
+                },
+                {
+                  "required": [
+                    "dependency_scopes"
+                  ]
+                },
+                {
+                  "required": [
+                    "python_versions"
+                  ]
+                },
+                {
+                  "required": [
+                    "platforms"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "public_record": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/record_base"
+        },
+        {
+          "$ref": "#/$defs/record_subject_projection"
+        },
+        {
+          "type": "object",
+          "required": [
+            "public_references"
+          ],
+          "properties": {
+            "visibility": {
+              "const": "public"
+            },
+            "public_references": {
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "format": "uri",
+                "maxLength": 2048,
+                "pattern": "^https://"
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "sanitized_private_record": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/record_base"
+        },
+        {
+          "$ref": "#/$defs/record_subject_projection"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "visibility": {
+              "const": "private"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "lineage_index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "entries"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_lineage_index_projection"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/lineage_entry"
+          }
+        }
+      }
+    },
+    "lineage_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lineage_id",
+        "exception_id",
+        "visibility",
+        "sequence",
+        "state",
+        "subject_key",
+        "subject_identity",
+        "alias_revision",
+        "evidence_revision",
+        "response_started_at",
+        "absolute_cap",
+        "effective_at",
+        "expires_at",
+        "predecessor_event_digest",
+        "event_digest",
+        "result_digest",
+        "record_digest"
+      ],
+      "properties": {
+        "lineage_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "exception_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "visibility": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "enum": [
+            "approved",
+            "renewed",
+            "revocation_pending",
+            "recomputation_required",
+            "revoked",
+            "resolved"
+          ]
+        },
+        "subject_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "subject_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "alias_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "response_started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "absolute_cap": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "effective_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "predecessor_event_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "event_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "record_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "transition_projection": {
+      "type": "object",
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "visibility",
+        "action",
+        "from_state",
+        "to_state",
+        "exception_id",
+        "predecessor_effective_event_digest",
+        "current_head_effective_event_digest",
+        "request_comment_node_id",
+        "request_raw_comment_digest",
+        "authority_observation_digest",
+        "command_provider_receipt_digest",
+        "producer_attestation_digest",
+        "persistence_receipt_digest",
+        "observed_at",
+        "persisted_at",
+        "authority_login",
+        "authority_database_id",
+        "authority_node_id",
+        "persistence_status",
+        "persisted_result_digest"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_transition_projection"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "visibility": {
+          "const": "public"
+        },
+        "action": {
+          "enum": [
+            "approve",
+            "renew",
+            "revoke",
+            "withdraw_invalid",
+            "malformed_revoke"
+          ]
+        },
+        "from_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exception_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "predecessor_effective_event_digest": {
+          "$ref": "#/$defs/effective_event_predecessor"
+        },
+        "current_head_effective_event_digest": {
+          "$ref": "#/$defs/effective_event_predecessor"
+        },
+        "proposal_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "pending_transition_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "malformed_comment_node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_=-]+$"
+        },
+        "malformed_raw_comment_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "request_comment_node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_=-]+$"
+        },
+        "request_raw_comment_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "authority_observation_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "command_provider_receipt_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "producer_attestation_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "persistence_receipt_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "persisted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "authority_login": {
+          "const": "nisavid"
+        },
+        "authority_database_id": {
+          "const": 576874
+        },
+        "authority_node_id": {
+          "const": "MDQ6VXNlcjU3Njg3NA=="
+        },
+        "persistence_status": {
+          "const": "unverified_projection"
+        },
+        "persisted_result_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "clears": {
+          "const": "pending_transition_only"
+        },
+        "restores_snapshot": {
+          "const": false
+        },
+        "forces_fresh_recomputation": {
+          "const": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "withdraw_invalid"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          },
+          "then": {
+            "required": [
+              "pending_transition_digest",
+              "malformed_comment_node_id",
+              "malformed_raw_comment_digest",
+              "clears",
+              "restores_snapshot",
+              "forces_fresh_recomputation"
+            ]
+          },
+          "else": {
+            "if": {
+              "properties": {
+                "action": {
+                  "enum": [
+                    "approve",
+                    "renew",
+                    "revoke"
+                  ]
+                }
+              },
+              "required": [
+                "action"
+              ]
+            },
+            "then": {
+              "required": [
+                "proposal_digest"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "provider_page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "page_number",
+        "source",
+        "query_id",
+        "request_digest",
+        "cursor_in",
+        "response_digest",
+        "semantic_digest",
+        "item_digests",
+        "provider_date",
+        "next_cursor",
+        "next_fact",
+        "status",
+        "receipt_digest"
+      ],
+      "properties": {
+        "page_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source": {
+          "enum": [
+            "github_dependabot",
+            "osv",
+            "github_private_advisory",
+            "first_party_validation"
+          ]
+        },
+        "query_id": {
+          "enum": [
+            "repository-vulnerability-alerts",
+            "osv-locked-dependencies",
+            "private-security-advisories",
+            "validated-first-party-findings"
+          ]
+        },
+        "request_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "cursor_in": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "response_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "semantic_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "item_digests": {
+          "type": "array",
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "provider_date": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "validator": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "next_cursor": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "next_fact": {
+          "enum": [
+            "continues",
+            "terminal"
+          ]
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 200,
+          "maximum": 299
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "provider_pass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pass_number",
+        "authentication_status",
+        "complete",
+        "semantic_digest",
+        "pages"
+      ],
+      "properties": {
+        "pass_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2
+        },
+        "authentication_status": {
+          "const": "unverified_projection"
+        },
+        "complete": {
+          "const": true
+        },
+        "semantic_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/provider_page"
+          }
+        }
+      }
+    },
+    "provider_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "provider",
+        "authentication_status",
+        "repository_full_name",
+        "repository_database_id",
+        "repository_node_id",
+        "issue_number",
+        "issue_database_id",
+        "issue_node_id",
+        "account_login",
+        "account_database_id",
+        "account_node_id",
+        "observation_completed_at",
+        "valid_until",
+        "provider_valid_until",
+        "provider_auth_valid_until",
+        "semantic_digest",
+        "epoch_id",
+        "sources",
+        "producer_provenance",
+        "passes"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_provider_observation"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "provider": {
+          "const": "github"
+        },
+        "authentication_status": {
+          "const": "unverified_projection"
+        },
+        "repository_full_name": {
+          "const": "nisavid/fork-ops"
+        },
+        "repository_database_id": {
+          "const": 1241799725
+        },
+        "repository_node_id": {
+          "const": "R_kgDOSgRcLQ"
+        },
+        "issue_number": {
+          "const": 59
+        },
+        "issue_database_id": {
+          "const": 5126688352
+        },
+        "issue_node_id": {
+          "const": "I_kwDOSgRcLc8AAAABMZMOYA"
+        },
+        "account_login": {
+          "const": "nisavid"
+        },
+        "account_database_id": {
+          "const": 576874
+        },
+        "account_node_id": {
+          "const": "MDQ6VXNlcjU3Njg3NA=="
+        },
+        "observation_completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "valid_until": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "provider_valid_until": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "provider_auth_valid_until": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "semantic_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "epoch_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sources": {
+          "const": [
+            "github_dependabot",
+            "osv",
+            "github_private_advisory",
+            "first_party_validation"
+          ]
+        },
+        "producer_provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "adapter_id",
+            "adapter_version",
+            "executable_digest",
+            "configuration_digest",
+            "authenticated_session_digest",
+            "authentication_status"
+          ],
+          "properties": {
+            "adapter_id": {
+              "const": "fork-ops-security-exception-provider"
+            },
+            "adapter_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "executable_digest": {
+              "$ref": "#/$defs/sha256"
+            },
+            "configuration_digest": {
+              "$ref": "#/$defs/sha256"
+            },
+            "authenticated_session_digest": {
+              "$ref": "#/$defs/sha256"
+            },
+            "authentication_status": {
+              "const": "unverified_projection"
+            }
+          }
+        },
+        "passes": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/provider_pass"
+          }
+        }
+      }
+    },
+    "response_clock_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lineage_id",
+        "exception_id",
+        "lineage_sequence",
+        "exact_lineage_head_record_digest",
+        "source",
+        "query_id",
+        "scope",
+        "python_versions",
+        "platforms",
+        "source_item_identity",
+        "severity",
+        "credible_severities",
+        "authoritative_source_published_at",
+        "first_observed_at"
+      ],
+      "properties": {
+        "lineage_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "exception_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "lineage_sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "exact_lineage_head_record_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source": {
+          "enum": [
+            "github_dependabot",
+            "osv",
+            "github_private_advisory",
+            "first_party_validation"
+          ]
+        },
+        "query_id": {
+          "enum": [
+            "repository-vulnerability-alerts",
+            "osv-locked-dependencies",
+            "private-security-advisories",
+            "validated-first-party-findings"
+          ]
+        },
+        "scope": {
+          "enum": [
+            "runtime",
+            "optional",
+            "build",
+            "test",
+            "development"
+          ]
+        },
+        "python_versions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "3.11",
+              "3.12",
+              "3.13",
+              "3.14"
+            ]
+          }
+        },
+        "platforms": {
+          "const": [
+            "linux"
+          ]
+        },
+        "source_item_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "credible_severities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        },
+        "authoritative_source_published_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "first_observed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "response_clock_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "sources",
+        "query_ids",
+        "dependency_scopes",
+        "python_versions",
+        "platforms",
+        "source_available",
+        "pagination_complete",
+        "reconciliation_complete",
+        "positive_zero",
+        "observation_semantic_digests",
+        "entries"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_response_clock_inventory"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "sources": {
+          "const": [
+            "github_dependabot",
+            "osv",
+            "github_private_advisory",
+            "first_party_validation"
+          ]
+        },
+        "query_ids": {
+          "const": [
+            "repository-vulnerability-alerts",
+            "osv-locked-dependencies",
+            "private-security-advisories",
+            "validated-first-party-findings"
+          ]
+        },
+        "dependency_scopes": {
+          "const": [
+            "runtime",
+            "optional",
+            "build",
+            "test",
+            "development"
+          ]
+        },
+        "python_versions": {
+          "const": [
+            "3.11",
+            "3.12",
+            "3.13",
+            "3.14"
+          ]
+        },
+        "platforms": {
+          "const": [
+            "linux"
+          ]
+        },
+        "source_available": {
+          "type": "boolean"
+        },
+        "pagination_complete": {
+          "type": "boolean"
+        },
+        "reconciliation_complete": {
+          "type": "boolean"
+        },
+        "positive_zero": {
+          "type": "boolean"
+        },
+        "observation_semantic_digests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/response_clock_entry"
+          }
+        }
+      }
+    },
+    "lineage_issuance_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "coordinator_id",
+        "lineage_id",
+        "exception_id",
+        "visibility",
+        "subject_identity",
+        "issued_at",
+        "random_nonce_digest",
+        "network_collected",
+        "persisted"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_lineage_issuance_projection"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "coordinator_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "lineage_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "exception_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "visibility": {
+          "enum": [
+            "public",
+            "private"
+          ]
+        },
+        "subject_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "random_nonce_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "network_collected": {
+          "const": false
+        },
+        "persisted": {
+          "const": false
+        }
+      }
+    },
+    "advisory_reconciliation_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "contract_version",
+        "lineage_id",
+        "current_record_digest",
+        "prior_alias_revision",
+        "alias_revision",
+        "aliases",
+        "prior_evidence_revision",
+        "evidence_revision",
+        "evidence_digest",
+        "network_collected",
+        "persisted"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_advisory_reconciliation_projection"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "contract_version": {
+          "const": "1.0"
+        },
+        "lineage_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "current_record_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "prior_alias_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "alias_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "aliases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "prior_evidence_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "network_collected": {
+          "const": false
+        },
+        "persisted": {
+          "const": false
+        }
+      }
+    },
+    "authority_migration_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "schema_version",
+        "from_contract_version",
+        "target_contract_version",
+        "from_login",
+        "from_database_id",
+        "from_node_id",
+        "to_login",
+        "to_database_id",
+        "to_node_id",
+        "status"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "const": "security_exception_authority_migration"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "from_contract_version": {
+          "const": "1.0"
+        },
+        "target_contract_version": {
+          "const": "2.0"
+        },
+        "from_login": {
+          "const": "nisavid"
+        },
+        "from_database_id": {
+          "const": 576874
+        },
+        "from_node_id": {
+          "const": "MDQ6VXNlcjU3Njg3NA=="
+        },
+        "to_login": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to_database_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "to_node_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "const": "unsupported_by_contract_1.0"
+        }
+      }
+    }
+  }
+}

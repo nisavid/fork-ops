@@ -36,6 +36,14 @@ and upstream repository:
 uv run --package fork-ops fork-ops config init --repo /path/to/fork --repository-owner OWNER --repository-name REPO --upstream-owner UPSTREAM_OWNER --upstream-name UPSTREAM_REPO --write
 ```
 
+`--write` uses the same guarded config-creation mechanics as migration
+execution. It validates track-aware content, refuses existing or unsafe targets,
+writes without overwriting a concurrent target, and verifies the resulting
+file identity, exact bytes, and capability. If post-create verification fails,
+it removes only the unchanged task-created file. The command reports whether
+that rollback completed or whether a changed or unreadable target remains
+unverified.
+
 MCP tools expose the same surface for agents:
 
 - `fork_ops_plugin_health`
@@ -63,6 +71,13 @@ UI visibility when inspectable.
 ```bash
 uv run --package fork-ops fork-ops plugin health
 ```
+
+Registration, skill, and MCP config checks are observational. MCP config must
+exactly match the reviewed plugin registration before the MCP runtime probe
+starts. The independent CLI probe still runs when MCP config is absent, malformed,
+or changed. Both runtime probes use the current Python interpreter in isolated
+mode to run the installed `fork_ops.cli` and `fork_ops.mcp_server` modules; they
+never run a wrapper script or command metadata from the inspected plugin root.
 
 Each readiness path reports one status: `ready`, `failed`, `unavailable`, or
 `uninspectable`. MCP failures include next paths, and the report provides CLI
