@@ -26,13 +26,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 ARTIFACT_KIND = "validation_evidence_result"
 SCHEMA_VERSION = "1.0"
 TEST_CONTRACT = "fork-ops-validation-1.1"
 MODES = ("locked-source", "fresh-source", "build", "release-preflight", "installed")
 EXECUTION_BOUNDARIES = ("local-observational", "container")
+SourcePolicy = Literal["closed-workspace", "registry-only"]
 SUPPORTED_PYTHON_MINORS = ("3.11", "3.12", "3.13", "3.14")
 PYTHON_CONTAINER_IMAGES = {
     "3.11": "python:3.11-slim@sha256:"
@@ -987,6 +988,33 @@ def _minimal_subprocess_environment(root: Path) -> Iterator[dict[str, str]]:
     yield environment
 
 
+@contextlib.contextmanager
+def _workspace_locked_subprocess_environment(
+    repo: Path,
+    root: Path,
+) -> Iterator[dict[str, str]]:
+    _validate_closed_workspace_project(repo)
+    with _minimal_subprocess_environment(root) as environment:
+        environment.pop("UV_NO_SOURCES")
+        yield environment
+
+
+@contextlib.contextmanager
+def _source_policy_subprocess_environment(
+    repo: Path,
+    root: Path,
+    source_policy: SourcePolicy,
+) -> Iterator[dict[str, str]]:
+    if source_policy == "closed-workspace":
+        environment_context = _workspace_locked_subprocess_environment(repo, root)
+    elif source_policy == "registry-only":
+        environment_context = _minimal_subprocess_environment(root)
+    else:
+        raise ValueError(f"Unsupported validation source policy: {source_policy}")
+    with environment_context as environment:
+        yield environment
+
+
 def _host_group_container_user() -> str:
     if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
         raise ValueError("Hosted candidate containers require a POSIX host user")
@@ -1092,12 +1120,18 @@ def _prepare_source_candidate_container(
     repo: Path,
     interpreter: str,
     root: Path,
+    *,
+    source_policy: SourcePolicy,
 ) -> tuple[dict[str, Any], CandidateContainerBoundary | None]:
     python_minor = _python_minor(interpreter)
     image = PYTHON_CONTAINER_IMAGES.get(python_minor)
     environment = root / "environment"
     requirements = root / "source-requirements.txt"
-    with _minimal_subprocess_environment(root) as subprocess_env:
+    with _source_policy_subprocess_environment(
+        repo,
+        root,
+        source_policy,
+    ) as subprocess_env:
         parts = [
             _run_command(
                 "candidate_isolation_venv",
@@ -1532,10 +1566,15 @@ def _source_checks(
     ]
     | None = None,
     candidate_container: bool = False,
+    source_policy: SourcePolicy,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not candidate_container:
         with tempfile.TemporaryDirectory(prefix="fork-ops-source-local-") as temp_dir:
-            with _minimal_subprocess_environment(Path(temp_dir)) as environment:
+            with _source_policy_subprocess_environment(
+                repo,
+                Path(temp_dir),
+                source_policy,
+            ) as environment:
                 return _source_checks_in_boundary(
                     repo,
                     interpreter,
@@ -1549,6 +1588,7 @@ def _source_checks(
             repo,
             interpreter,
             Path(temp_dir),
+            source_policy=source_policy,
         )
         if boundary is None:
             return [isolation_check], {}
@@ -2011,72 +2051,64 @@ def _normalized_advisory_sort_key(item: dict[str, object]) -> tuple[str, str, st
     )
 
 
-def _validate_fresh_resolution_project(repo: Path) -> dict[str, object]:
+def _validate_closed_workspace_project(repo: Path) -> dict[str, object]:
     root = tomllib.loads(_read_text(repo / "pyproject.toml"))
     package = tomllib.loads(_read_text(repo / "plugins" / "fork-ops" / "pyproject.toml"))
     if set(root) - {"project", "dependency-groups", "tool"}:
-        raise ValueError("Fresh resolution root project has unsupported top-level tables")
+        raise ValueError("Closed workspace root project has unsupported top-level tables")
     root_tool = root.get("tool")
     if not isinstance(root_tool, dict):
-        raise ValueError("Fresh resolution requires the workspace tool table")
+        raise ValueError("Closed workspace requires the workspace tool table")
     uv = root_tool.get("uv")
     if not isinstance(uv, dict) or set(uv) != {"package", "default-groups", "sources", "workspace"}:
-        raise ValueError("Fresh resolution requires the closed workspace uv contract")
+        raise ValueError("Closed workspace requires the closed uv contract")
     if uv.get("sources") != {"fork-ops": {"workspace": True}}:
-        raise ValueError("Fresh resolution permits only the fork-ops workspace source")
+        raise ValueError("Closed workspace permits only the fork-ops workspace source")
     if uv.get("workspace") != {"members": ["plugins/fork-ops"]}:
-        raise ValueError("Fresh resolution workspace membership is unsupported")
+        raise ValueError("Closed workspace membership is unsupported")
     if set(package) - {"build-system", "project", "dependency-groups", "tool"}:
-        raise ValueError("Fresh resolution package has unsupported top-level tables")
+        raise ValueError("Closed workspace package has unsupported top-level tables")
     if package.get("build-system") != {
         "requires": ["setuptools==83.0.0", "wheel==0.46.2"],
         "build-backend": "setuptools.build_meta",
     }:
-        raise ValueError("Fresh resolution package build contract is unsupported")
+        raise ValueError("Closed workspace package build contract is unsupported")
     package_tool = package.get("tool")
     if not isinstance(package_tool, dict) or "uv" in package_tool:
-        raise ValueError("Fresh resolution package tool configuration is unsupported")
+        raise ValueError("Closed workspace package tool configuration is unsupported")
     for relative in ("uv.toml", ".uv.toml"):
         if (repo / relative).exists():
-            raise ValueError(f"Fresh resolution rejects candidate uv config {relative}")
+            raise ValueError(f"Closed workspace rejects candidate uv config {relative}")
     dependencies: list[str] = []
     for project in (root.get("project"), package.get("project")):
         if not isinstance(project, dict):
-            raise ValueError("Fresh resolution project metadata is malformed")
+            raise ValueError("Closed workspace project metadata is malformed")
         if "dynamic" in project:
-            raise ValueError("Fresh resolution rejects dynamic project metadata")
+            raise ValueError("Closed workspace rejects dynamic project metadata")
         raw_dependencies = project.get("dependencies", [])
         if not isinstance(raw_dependencies, list):
-            raise ValueError("Fresh resolution dependencies must be arrays")
+            raise ValueError("Closed workspace dependencies must be arrays")
         dependencies.extend(raw_dependencies)
         optional = project.get("optional-dependencies", {})
         if not isinstance(optional, dict):
-            raise ValueError("Fresh resolution optional dependencies must be a table")
+            raise ValueError("Closed workspace optional dependencies must be a table")
         for values in optional.values():
             if not isinstance(values, list):
-                raise ValueError("Fresh resolution optional dependency groups must be arrays")
+                raise ValueError("Closed workspace optional dependency groups must be arrays")
             dependencies.extend(values)
     for project in (root, package):
         groups = project.get("dependency-groups", {})
         if not isinstance(groups, dict):
-            raise ValueError("Fresh resolution dependency groups must be a table")
+            raise ValueError("Closed workspace dependency groups must be a table")
         for values in groups.values():
             if not isinstance(values, list):
-                raise ValueError("Fresh resolution dependency groups must be arrays")
+                raise ValueError("Closed workspace dependency groups must be arrays")
             dependencies.extend(values)
     for dependency in dependencies:
         if not isinstance(dependency, str) or not dependency.strip():
-            raise ValueError("Fresh resolution dependencies must be nonempty strings")
-        lowered = dependency.lower()
-        if (
-            " @ " in dependency
-            or "git+" in lowered
-            or "http://" in lowered
-            or "https://" in lowered
-            or "file:" in lowered
-            or "ssh:" in lowered
-        ):
-            raise ValueError("Fresh resolution rejects URL, VCS, path, and direct sources")
+            raise ValueError("Closed workspace dependencies must be nonempty strings")
+        if "@" in dependency:
+            raise ValueError("Closed workspace rejects URL, VCS, path, and direct sources")
     policy: dict[str, object] = {
         "index": "https://pypi.org/simple",
         "sources": "registry-only-plus-exact-workspace-member",
@@ -2326,7 +2358,7 @@ def _fresh_resolution_check(
     candidate_container: bool,
 ) -> dict[str, Any]:
     try:
-        policy = _validate_fresh_resolution_project(snapshot)
+        policy = _validate_closed_workspace_project(snapshot)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError) as exc:
         return _blocked_check(
             "fresh_resolution",
@@ -2568,6 +2600,7 @@ def _fresh_source_checks(
             diff_base=diff_base,
             scope_inventory=scope_inventory,
             candidate_container=candidate_container,
+            source_policy="registry-only",
         )
         checks.extend(source_checks)
         return checks, lock_digest, scope_provenance
@@ -2902,24 +2935,18 @@ def _build_checks(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="fork-ops-build-constraints-") as temp_dir:
         temp_root = Path(temp_dir)
-        if candidate_container:
-            with _minimal_subprocess_environment(temp_root / "host") as subprocess_env:
-                return _build_checks_in_environment(
-                    repo,
-                    interpreter,
-                    artifact_dir,
-                    temp_root,
-                    subprocess_env,
-                    candidate_container=True,
-                )
-        return _build_checks_in_environment(
+        with _workspace_locked_subprocess_environment(
             repo,
-            interpreter,
-            artifact_dir,
-            temp_root,
-            None,
-            candidate_container=False,
-        )
+            temp_root / "host",
+        ) as subprocess_env:
+            return _build_checks_in_environment(
+                repo,
+                interpreter,
+                artifact_dir,
+                temp_root,
+                subprocess_env,
+                candidate_container=candidate_container,
+            )
 
 
 def _build_checks_in_environment(
@@ -2996,6 +3023,8 @@ def _build_checks_in_environment(
                 subprocess_env or {},
             )
         else:
+            build_environment = dict(subprocess_env or {})
+            build_environment.pop("UV_NO_BUILD", None)
             build_check = _run_command(
                 "build_distributions",
                 ["candidate_packaging"],
@@ -3015,6 +3044,7 @@ def _build_checks_in_environment(
                     "--no-create-gitignore",
                 ],
                 cwd=repo,
+                env=build_environment,
             )
     else:
         build_check = _blocked_check(
@@ -3244,7 +3274,10 @@ def _installed_checks(
     with tempfile.TemporaryDirectory(prefix="fork-ops-installed-") as temp_dir:
         temp_root = Path(temp_dir)
         environment = temp_root / "environment"
-        with _minimal_subprocess_environment(temp_root) as subprocess_env:
+        with _workspace_locked_subprocess_environment(
+            repo,
+            temp_root,
+        ) as subprocess_env:
             return _installed_checks_in_environment(
                 repo,
                 interpreter,
@@ -4754,6 +4787,7 @@ def main(argv: list[str] | None = None) -> int:
                 diff_repo=candidate_repo,
                 diff_base=args.diff_base or None,
                 candidate_container=args.execution_boundary == "container",
+                source_policy="closed-workspace",
             )
             dependency_provenance.update(scope_provenance)
         elif args.mode == "fresh-source":

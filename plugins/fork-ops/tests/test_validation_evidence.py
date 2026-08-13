@@ -313,6 +313,116 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self.assertFalse(any("GITHUB" in argument for argument in command))
                 self.assertFalse(any("ACTIONS" in argument for argument in command))
 
+    def test_hosted_locked_workspace_modes_keep_the_closed_source_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            fake_bin = self._create_fake_uv(
+                fixture_root,
+                reject_disabled_locked_workspace_sources=True,
+            )
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+            artifact_dir = fixture_root / "candidate"
+            for mode in ("locked-source", "build", "installed"):
+                with self.subTest(mode=mode):
+                    output = fixture_root / f"{mode}.json"
+                    arguments = [
+                        sys.executable,
+                        str(VALIDATION_ENTRYPOINT),
+                        "--mode",
+                        mode,
+                        "--interpreter",
+                        sys.executable,
+                        "--repo",
+                        str(repo),
+                        "--execution-boundary",
+                        "container",
+                        "--output",
+                        str(output),
+                    ]
+                    if mode in {"build", "installed"}:
+                        arguments.extend(("--artifact-dir", str(artifact_dir)))
+                    completed = subprocess.run(
+                        arguments,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        completed.stderr + output.read_text(encoding="utf-8"),
+                    )
+
+    def test_locked_workspace_modes_reject_unsafe_sources_before_uv(self) -> None:
+        unsafe_project_replacements = {
+            "tool-source": (
+                'fork-ops = { workspace = true }',
+                'fork-ops = { git = "https://example.invalid/fork-ops" }',
+            ),
+            "direct-path": ('"fork-ops[mcp]"', '"fork-ops[mcp]@../fork-ops"'),
+        }
+        for source_kind, replacement in unsafe_project_replacements.items():
+            for mode in ("locked-source", "build", "installed"):
+                with (
+                    self.subTest(source_kind=source_kind, mode=mode),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    fixture_root = Path(temp_dir)
+                    repo = self._create_fixture_repository(fixture_root)
+                    project = repo / "pyproject.toml"
+                    project.write_text(
+                        project.read_text(encoding="utf-8").replace(*replacement),
+                        encoding="utf-8",
+                    )
+                    sentinel = fixture_root / "uv-executed"
+                    fake_bin = self._create_fake_uv(
+                        fixture_root,
+                        operation_sentinel=sentinel,
+                    )
+                    output = fixture_root / f"{mode}.json"
+                    artifact_dir = fixture_root / "candidate"
+                    arguments = [
+                        sys.executable,
+                        str(VALIDATION_ENTRYPOINT),
+                        "--mode",
+                        mode,
+                        "--interpreter",
+                        sys.executable,
+                        "--repo",
+                        str(repo),
+                        "--execution-boundary",
+                        "container",
+                        "--output",
+                        str(output),
+                    ]
+                    if mode in {"build", "installed"}:
+                        artifact_dir.mkdir()
+                        arguments.extend(("--artifact-dir", str(artifact_dir)))
+                    if mode == "installed":
+                        (artifact_dir / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
+                        (artifact_dir / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+                    env = os.environ.copy()
+                    env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+
+                    completed = subprocess.run(
+                        arguments,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                    )
+
+                    self.assertEqual(completed.returncode, 1)
+                    evidence = json.loads(output.read_text(encoding="utf-8"))
+                    self.assertIn(
+                        "closed workspace",
+                        evidence["checks"][-1]["stderr_tail"].lower(),
+                    )
+                    self.assertFalse(sentinel.exists(), "uv executed after unsafe source policy")
+
     def test_locked_source_emits_reusable_terminal_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
@@ -1107,7 +1217,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
-            fake_bin = self._create_fake_uv(fixture_root)
+            fake_bin = self._create_fake_uv(
+                fixture_root,
+                reject_disabled_candidate_build=True,
+            )
             artifact_dir = fixture_root / "candidate"
             output_path = fixture_root / "validation-evidence.json"
             env = os.environ.copy()
@@ -2607,6 +2720,8 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         delay_when: str = "",
         extra_artifact: bool = False,
         assert_clean_environment: bool = False,
+        reject_disabled_locked_workspace_sources: bool = False,
+        reject_disabled_candidate_build: bool = False,
         reject_candidate_repo_cwd: bool = False,
         operation_sentinel: Path | None = None,
     ) -> Path:
@@ -2620,6 +2735,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             textwrap.dedent(
                 f"""\
                 #!{sys.executable}
+                import os
                 import sys
                 import time
 
@@ -2665,6 +2781,35 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                             file=sys.stderr,
                         )
                         raise SystemExit(98)
+
+                if {reject_disabled_locked_workspace_sources!r}:
+                    import os
+
+                    locked_workspace_command = (
+                        len(sys.argv) > 1
+                        and (
+                            sys.argv[1] in {{"export", "run"}}
+                            or sys.argv[1:3] == ["lock", "--check"]
+                            or (
+                                sys.argv[1] == "audit"
+                                and "--no-sources" not in sys.argv
+                            )
+                        )
+                    )
+                    if locked_workspace_command and os.environ.get("UV_NO_SOURCES"):
+                        print(
+                            "closed workspace source was disabled for a locked command",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(99)
+
+                if (
+                    {reject_disabled_candidate_build!r}
+                    and sys.argv[1:2] == ["build"]
+                    and os.environ.get("UV_NO_BUILD")
+                ):
+                    print("candidate package build was disabled", file=sys.stderr)
+                    raise SystemExit(100)
 
                 if {fail_when!r} and {fail_when!r} in sys.argv:
                     print("simulated validation failure", file=sys.stderr)
