@@ -238,7 +238,12 @@ private size-bounded tmpfs paths, and an explicit environment. Installed
 validation mounts only the prepared site-packages tree and expected schema
 read-only. Source validation additionally mounts the verified candidate source
 read-only, mounts pinned Ruff and Pyrefly binaries read-only, and exposes an
-explicit coverage scratch directory. Source lanes use digest-pinned full
+explicit coverage scratch directory. A verifier-authored, read-only standard
+site projection exposes only the locked dependencies and exact candidate source
+to isolated child Python processes. Its verifier-owned bootstrap shadows
+`sitecustomize` before either path is visible, and the producer verifies the
+resulting child import origins without installing or executing candidate build
+metadata. Source lanes use digest-pinned full
 official Python images whose immutable image history includes Git; build and
 installed lanes retain the smaller digest-pinned slim images. Build validation mounts verified source
 and build dependencies read-only, copies source into private container tmpfs,
@@ -252,11 +257,13 @@ Containers with writable bind mounts use UID 65532 and the runner's numeric
 non-root primary group. The producer first verifies each private mount tree is
 symlink-free and runner-owned, then grants that group access without granting
 world access. Read-only source mounts are likewise verified and made
-group-readable and traversable without becoming group-writable. Candidate
-Python disables automatic site hooks, omits the current
-working directory from module search, and searches trusted tool dependencies
-before candidate source. Host-side reads of candidate outputs retain no-follow
-semantics after the container exits.
+group-readable and traversable without becoming group-writable. Parent candidate
+Python disables automatic site hooks and omits the current working directory
+from module search. Isolated child Python processes only the verifier-owned
+projection, whose harmless `sitecustomize` placeholder prevents candidate or
+dependency hooks from running before it searches locked dependencies and then
+candidate source. Host-side reads of candidate outputs retain no-follow semantics
+after the container exits.
 
 Each result ends in `passed`, `failed`, or `cancelled`. Subprocesses have
 individual bounds, and long source hashing and snapshot-copy operations check
