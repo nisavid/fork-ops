@@ -1145,6 +1145,7 @@ def _source_candidate_container_command(
     boundary: CandidateContainerBoundary,
     python_args: list[str],
     *,
+    executable_test_temp: bool = False,
     scratch: Path | None = None,
 ) -> list[str]:
     command = [
@@ -1157,6 +1158,13 @@ def _source_candidate_container_command(
         f"dst={boundary.container_site_packages},readonly",
         f"--mount=type=bind,src={boundary.tools_bin},dst=/opt/fork-ops/bin,readonly",
     ]
+    if executable_test_temp:
+        command.extend(
+            (
+                "--tmpfs=/test-tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
+                "--env=TMPDIR=/test-tmp",
+            )
+        )
     if scratch is not None:
         command.append(f"--mount=type=bind,src={scratch},dst=/scratch")
     return [
@@ -1909,6 +1917,7 @@ def _source_checks_in_boundary(
                         "plugins/fork-ops/tests",
                         "-q",
                     ],
+                    executable_test_temp=True,
                     scratch=coverage_dir,
                 )
                 if candidate_boundary is not None

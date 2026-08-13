@@ -243,7 +243,9 @@ site projection exposes only the locked dependencies and exact candidate source
 to isolated child Python processes. Its verifier-owned bootstrap shadows
 `sitecustomize` before either path is visible, and the producer verifies the
 resulting child import origins without installing or executing candidate build
-metadata. Source lanes use digest-pinned full
+metadata. The shared container `/tmp` remains `noexec`; only the pytest command
+receives a separate size-bounded, container-private executable temporary path
+for the suite's fake CLI programs. Source lanes use digest-pinned full
 official Python images whose immutable image history includes Git; build and
 installed lanes retain the smaller digest-pinned slim images. Build validation mounts verified source
 and build dependencies read-only, copies source into private container tmpfs,

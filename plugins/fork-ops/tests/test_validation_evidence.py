@@ -459,6 +459,20 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 if "dst=/opt/fork-ops/site-packages" in argument
             )
             self.assertTrue(pyrefly_site_packages.endswith(",readonly"))
+            pytest_command = source_commands["pytest"]
+            self.assertIn(
+                "--tmpfs=/test-tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
+                pytest_command,
+            )
+            self.assertIn("--env=TMPDIR=/test-tmp", pytest_command)
+            self.assertIn(
+                "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777",
+                pytest_command,
+            )
+            for check_id, command in source_container_commands.items():
+                if check_id == "pytest":
+                    continue
+                self.assertFalse(any("/test-tmp" in argument for argument in command))
 
     def test_hosted_locked_workspace_modes_keep_the_closed_source_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
