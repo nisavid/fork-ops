@@ -39,10 +39,13 @@ uv run --package fork-ops fork-ops config init --repo /path/to/fork --repository
 `--write` uses the same guarded config-creation mechanics as migration
 execution. It validates track-aware content, refuses existing or unsafe targets,
 writes without overwriting a concurrent target, and verifies the resulting
-file identity, exact bytes, and capability. If post-create verification fails,
-it removes only the unchanged task-created file. The command reports whether
-that rollback completed or whether a changed or unreadable target remains
-unverified.
+file identity, exact bytes, and capability. If `.agents` does not exist, the
+first invocation creates only that directory and reports `applied_unverified`;
+run the command again to bind the existing directory and create the config.
+If post-create verification fails,
+the command preserves any extant target because portable filesystems do not
+provide an atomic identity-conditioned delete. It reports `applied_unverified`
+for operator review and never infers rollback from pathname absence.
 
 MCP tools expose the same surface for agents:
 

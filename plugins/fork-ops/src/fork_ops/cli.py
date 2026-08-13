@@ -330,6 +330,24 @@ def _config_initialization_failure_message(result: dict[str, Any]) -> str:
     if status == "rolled_back":
         return f"Config initialization failed and the task-created config was rolled back: {detail}"
     if status == "applied_unverified":
+        mutation = result.get("mutation")
+        applied_edits = result.get("applied_edits")
+        parent_only = (
+            isinstance(mutation, dict)
+            and mutation.get("target_state") == "not-created"
+            and isinstance(applied_edits, list)
+            and any(
+                isinstance(edit, dict)
+                and edit.get("target_created") is False
+                and isinstance(edit.get("created_parent"), str)
+                for edit in applied_edits
+            )
+        )
+        if parent_only:
+            return (
+                "Config initialization created the .agents directory without creating "
+                f"the config; rerun the command to bind that directory safely: {detail}"
+            )
         return (
             f"Config initialization changed {result.get('target_path')}, but the target remains "
             f"unverified and could not be safely rolled back: {detail}"

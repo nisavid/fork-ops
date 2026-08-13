@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -12,7 +13,6 @@ import stat
 import subprocess
 import sys
 import tomllib
-import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -63,6 +63,36 @@ class _CreatedFileIdentity:
     inode: int
     size: int
     content_sha256: str
+    modified_time_ns: int
+    change_time_ns: int
+    parent_device: int
+    parent_inode: int
+    root_device: int
+    root_inode: int
+
+
+@dataclass
+class _BoundRepository:
+    path: Path
+    canonical_path: Path
+    descriptor: int
+    device: int
+    inode: int
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+class _IndeterminateCreatedFileError(OSError):
+    """A target may exist, but its exact post-create state cannot be proven."""
+
+
+class _TargetAlreadyExistsError(FileExistsError):
+    """The descriptor-relative final target existed before this mutation."""
+
+
+class _CreatedParentUnavailableError(OSError):
+    """The parent was created, but its exact post-create state cannot be proven."""
 
 
 _EXPECTED_MCP_REGISTRATION: dict[str, Any] = {
@@ -1649,59 +1679,95 @@ def execute_migration(
     migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
     if plan is None:
         return execute_migration_plan(migration_plan)
-    mismatch_result = _repo_path_mismatch_result(migration_plan, repo_path)
-    if mismatch_result is not None:
-        return mismatch_result
-    return execute_migration_plan(migration_plan)
+    selected_repo_path: str | Path | None = repo_path if str(repo_path) else None
+    return execute_migration_plan(migration_plan, selected_repo_path)
 
 
 def execute_migration_plan(
     plan: dict[str, Any],
     repo_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    mismatch_result = _repo_path_mismatch_result(plan, repo_path)
-    if mismatch_result is not None:
-        return mismatch_result
-    preview = dry_run_migration_plan(plan, repo_path)
-    repo = Path(preview["repo_path"]).expanduser().resolve()
-    preview_blockers = _require_preview_list(preview, "blocked_steps")
-    if preview_blockers:
+    raw_repo = repo_path if repo_path is not None and str(repo_path) else plan.get("repo_path")
+    if not isinstance(raw_repo, str | Path) or not str(raw_repo):
+        raise ForkOpsError("Migration execution input has malformed repo_path.")
+    repo = Path(os.path.abspath(os.path.expanduser(str(raw_repo))))
+    try:
+        bound_repo = _bind_repository(repo)
+    except OSError as exc:
         return _migration_execution_result(
             repo=repo,
-            preview=preview,
+            preview={"repo_path": str(repo), "plan_operation": plan.get("operation")},
             status="blocked",
             applied_edits=[],
-            skipped_edits=_skipped_preview_edits(preview, "blocked_steps_present"),
-            blockers=preview_blockers,
+            skipped_edits=[],
+            blockers=[_repository_identity_blocker(exc)],
             verification_results=[],
         )
+    try:
+        mismatch_result = _bound_repo_path_mismatch_result(plan, repo_path, bound_repo)
+        if mismatch_result is not None:
+            return mismatch_result
+        preview = dry_run_migration_plan(plan, repo_path)
+        if preview.get("repo_path") != str(bound_repo.path) or not _repository_path_has_identity(
+            bound_repo
+        ):
+            return _migration_execution_result(
+                repo=repo,
+                preview=preview,
+                status="blocked",
+                applied_edits=[],
+                skipped_edits=_skipped_preview_edits(preview, "repository_identity_changed"),
+                blockers=[
+                    _repository_identity_blocker(
+                        OSError("repository root path changed during migration preflight")
+                    )
+                ],
+                verification_results=[],
+            )
+        preview_blockers = _require_preview_list(preview, "blocked_steps")
+        if preview_blockers:
+            return _migration_execution_result(
+                repo=repo,
+                preview=preview,
+                status="blocked",
+                applied_edits=[],
+                skipped_edits=_skipped_preview_edits(preview, "blocked_steps_present"),
+                blockers=preview_blockers,
+                verification_results=[],
+            )
 
-    applied_edits, apply_blockers = _apply_migration_file_edits(
-        repo,
-        _require_preview_list(preview, "file_edits"),
-    )
-    if apply_blockers:
+        applied_edits, apply_blockers, created_targets = _apply_migration_file_edits(
+            bound_repo,
+            _require_preview_list(preview, "file_edits"),
+        )
+        if apply_blockers:
+            return _migration_execution_result(
+                repo=repo,
+                preview=preview,
+                status="applied_unverified" if applied_edits else "blocked",
+                applied_edits=applied_edits,
+                skipped_edits=_skipped_preview_edits(preview, "write_guard_blocked"),
+                blockers=apply_blockers,
+                verification_results=[],
+            )
+        skipped_edits = _preserved_source_materials(preview)
+        verification_results, verification_blockers = _verify_migration_execution(
+            bound_repo,
+            preview,
+            created_targets,
+        )
+        status = "applied" if not verification_blockers else "verification_failed"
         return _migration_execution_result(
             repo=repo,
             preview=preview,
-            status="blocked",
+            status=status,
             applied_edits=applied_edits,
-            skipped_edits=_skipped_preview_edits(preview, "write_guard_blocked"),
-            blockers=apply_blockers,
-            verification_results=[],
+            skipped_edits=skipped_edits,
+            blockers=verification_blockers,
+            verification_results=verification_results,
         )
-    skipped_edits = _preserved_source_materials(preview)
-    verification_results, verification_blockers = _verify_migration_execution(repo, preview)
-    status = "applied" if not verification_blockers else "verification_failed"
-    return _migration_execution_result(
-        repo=repo,
-        preview=preview,
-        status=status,
-        applied_edits=applied_edits,
-        skipped_edits=skipped_edits,
-        blockers=verification_blockers,
-        verification_results=verification_results,
-    )
+    finally:
+        bound_repo.close()
 
 
 def explain_migration_blocker(
@@ -2279,20 +2345,24 @@ def _string_list(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
-def _repo_path_mismatch_result(
+def _bound_repo_path_mismatch_result(
     migration_plan: dict[str, Any],
     repo_path: str | Path | None,
+    bound_repo: _BoundRepository,
 ) -> dict[str, Any] | None:
     if migration_plan.get("operation") != "migration-plan":
         return None
     if repo_path is None or str(repo_path) == "":
         return None
-    plan_repo_path = _dry_run_repo_path(migration_plan, None)
-    requested_repo_path = str(Path(repo_path).expanduser().resolve())
+    raw_plan_path = migration_plan.get("repo_path")
+    if not isinstance(raw_plan_path, str | Path) or not str(raw_plan_path):
+        raise ForkOpsError("Migration execution plan has malformed repo_path.")
+    plan_repo_path = os.path.abspath(os.path.expanduser(str(raw_plan_path)))
+    requested_repo_path = os.path.abspath(os.path.expanduser(str(repo_path)))
     if requested_repo_path == plan_repo_path:
         return None
     return _migration_execution_result(
-        repo=Path(requested_repo_path),
+        repo=bound_repo.path,
         preview={"plan_operation": migration_plan.get("operation")},
         status="blocked",
         applied_edits=[],
@@ -2797,57 +2867,95 @@ def _retained_source_material_blockers(
 
 
 def _apply_migration_file_edits(
-    repo: Path,
+    repo: _BoundRepository,
     file_edits: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[tuple[Path, _CreatedFileIdentity, bytes]],
+]:
     applied = []
     blockers = []
+    created_targets = []
     for edit in file_edits:
-        applied_edit, blocker, _ = _apply_migration_file_edit(repo, edit)
+        applied_edit, blocker, identity = _apply_migration_file_edit(repo, edit)
         if blocker is not None:
             blockers.append(blocker)
-        elif applied_edit is not None:
+            if applied_edit is not None:
+                applied.append(applied_edit)
+        elif applied_edit is not None and identity is not None:
             applied.append(applied_edit)
-    return applied, blockers
+            created_targets.append(
+                (
+                    repo.path / str(edit["path"]),
+                    identity,
+                    _config_content_bytes(str(edit["content"])),
+                )
+            )
+    return applied, blockers, created_targets
 
 
 def _apply_migration_file_edit(
-    repo: Path,
+    repo: _BoundRepository,
     edit: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _CreatedFileIdentity | None]:
-    path, blocker = _migration_edit_target(repo, edit.get("path"))
+    path, blocker = _migration_edit_target(repo.path, edit.get("path"))
     if blocker:
         return None, blocker, None
     content = edit["content"]
-    parent_existed = path.parent.exists()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        parent_descriptor, parent_identity, parent_created = _open_or_create_agents_parent(repo)
+    except _CreatedParentUnavailableError as exc:
+        return _parent_only_applied_edit(edit, True), {
+            "code": "migration_execution.target_parent_unverified",
+            "path": edit.get("path"),
+            "message": (
+                "Migration execution created the target parent, but its exact "
+                f"state could not be verified: {exc}"
+            ),
+        }, None
     except OSError as exc:
         return None, {
             "code": "migration_execution.target_parent_unavailable",
             "path": edit.get("path"),
             "message": f"Migration execution target parent is unavailable: {exc}",
         }, None
-    parent_blocker = _migration_target_parent_blocker(repo.resolve(), path.parent, edit.get("path"))
-    if parent_blocker:
-        _remove_created_parent(path.parent, parent_existed)
-        return None, parent_blocker, None
     try:
-        identity = _write_new_file_atomically(path, content)
-    except FileExistsError:
-        _remove_created_parent(path.parent, parent_existed)
-        return None, {
+        identity = _write_new_file_atomically(
+            repo,
+            parent_descriptor,
+            path,
+            content,
+            parent_identity=parent_identity,
+        )
+    except _TargetAlreadyExistsError:
+        return _parent_only_applied_edit(edit, parent_created), {
             "code": "migration_execution.target_exists",
             "path": edit.get("path"),
             "message": "Refusing to overwrite a target created before config write.",
         }, None
+    except _IndeterminateCreatedFileError as exc:
+        return {
+            "path": edit["path"],
+            "action": edit["action"],
+            "status": "applied_unverified",
+            "content_kind": edit.get("content_kind"),
+        }, {
+            "code": "migration_execution.write_unverified",
+            "path": edit.get("path"),
+            "message": (
+                "Migration execution may have created the config, but the exact "
+                f"result could not be verified: {exc}"
+            ),
+        }, None
     except OSError as exc:
-        _remove_created_parent(path.parent, parent_existed)
-        return None, {
+        return _parent_only_applied_edit(edit, parent_created), {
             "code": "migration_execution.write_failed",
             "path": edit.get("path"),
             "message": f"Migration execution config write failed: {exc}",
         }, None
+    finally:
+        os.close(parent_descriptor)
     content_bytes = _config_content_bytes(content)
     return {
         "path": edit["path"],
@@ -2859,65 +2967,248 @@ def _apply_migration_file_edit(
     }, None, identity
 
 
-def _migration_target_parent_blocker(
-    repo_root: Path,
-    parent: Path,
-    raw_path: Any,
+def _parent_only_applied_edit(
+    edit: dict[str, Any],
+    parent_created: bool,
 ) -> dict[str, Any] | None:
-    resolved_parent = parent.resolve(strict=False)
-    if not resolved_parent.is_relative_to(repo_root):
-        return {
-            "code": "migration_execution.unsafe_target_path",
-            "path": raw_path,
-            "message": "Migration execution refuses target paths outside the repository.",
-        }
-    if not resolved_parent.is_dir():
-        return {
-            "code": "migration_execution.target_parent_not_directory",
-            "path": raw_path,
-            "message": "Migration execution target parent is not a directory.",
-        }
-    return None
+    if not parent_created:
+        return None
+    return {
+        "path": edit["path"],
+        "action": edit["action"],
+        "status": "applied_unverified",
+        "content_kind": edit.get("content_kind"),
+        "created_parent": CONFIG_RELATIVE_PATH.parent.as_posix(),
+        "target_created": False,
+    }
 
 
-def _write_new_file_atomically(path: Path, content: str) -> _CreatedFileIdentity:
-    temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+def _write_new_file_atomically(
+    repo: _BoundRepository,
+    parent_descriptor: int,
+    path: Path,
+    content: str,
+    *,
+    parent_identity: tuple[int, int],
+) -> _CreatedFileIdentity:
+    _require_descriptor_relative_operations("open")
     content_bytes = _config_content_bytes(content)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with temp_path.open("xb") as handle:
+        target_descriptor = os.open(
+            path.name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except FileExistsError as exc:
+        raise _TargetAlreadyExistsError(str(exc)) from exc
+    try:
+        with os.fdopen(target_descriptor, "wb", closefd=False) as handle:
             handle.write(content_bytes)
             handle.flush()
             os.fsync(handle.fileno())
-            created_stat = os.fstat(handle.fileno())
-        os.link(temp_path, path)
-        return _CreatedFileIdentity(
-            device=created_stat.st_dev,
-            inode=created_stat.st_ino,
-            size=len(content_bytes),
-            content_sha256=hashlib.sha256(content_bytes).hexdigest(),
-        )
+        created_stat = os.fstat(target_descriptor)
+    except Exception as exc:
+        raise _IndeterminateCreatedFileError(
+            "writing or synchronizing the descriptor-relative target failed"
+        ) from exc
     finally:
-        temp_path.unlink(missing_ok=True)
+        os.close(target_descriptor)
+    if not _repository_path_has_identity(repo):
+        raise _IndeterminateCreatedFileError(
+            "the repository path changed after config creation"
+        )
+    return _CreatedFileIdentity(
+        device=created_stat.st_dev,
+        inode=created_stat.st_ino,
+        size=len(content_bytes),
+        content_sha256=hashlib.sha256(content_bytes).hexdigest(),
+        modified_time_ns=created_stat.st_mtime_ns,
+        change_time_ns=created_stat.st_ctime_ns,
+        parent_device=parent_identity[0],
+        parent_inode=parent_identity[1],
+        root_device=repo.device,
+        root_inode=repo.inode,
+    )
+
+
+def _bind_repository(repo: Path) -> _BoundRepository:
+    _require_descriptor_relative_operations("open")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(repo, flags)
+    try:
+        repo_stat = os.fstat(descriptor)
+        if not stat.S_ISDIR(repo_stat.st_mode):
+            raise OSError(errno.ENOTDIR, "repository root is not a directory")
+        bound_path = _bound_repository_display_path(descriptor, repo)
+        bound = _BoundRepository(
+            repo,
+            bound_path,
+            descriptor,
+            repo_stat.st_dev,
+            repo_stat.st_ino,
+        )
+        if not _repository_path_has_identity(bound):
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "repository root path changed while binding",
+            )
+        return bound
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _bound_repository_display_path(descriptor: int, lexical_path: Path) -> Path:
+    proc_path = Path(f"/proc/self/fd/{descriptor}")
+    try:
+        target = os.readlink(proc_path)
+    except OSError:
+        return lexical_path
+    if target.endswith(" (deleted)"):
+        raise OSError(getattr(errno, "ESTALE", errno.EIO), "repository root was unlinked")
+    display_path = Path(target)
+    if not display_path.is_absolute():
+        raise OSError(errno.EIO, f"repository descriptor path is not absolute: {lexical_path}")
+    return display_path
+
+
+def _duplicate_bound_repository(repo: _BoundRepository) -> _BoundRepository:
+    descriptor = os.dup(repo.descriptor)
+    return _BoundRepository(
+        repo.path,
+        repo.canonical_path,
+        descriptor,
+        repo.device,
+        repo.inode,
+    )
+
+
+def _repository_path_has_identity(repo: _BoundRepository) -> bool:
+    try:
+        repo_stat = os.stat(repo.path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(repo_stat.st_mode) and (
+        repo_stat.st_dev,
+        repo_stat.st_ino,
+    ) == (repo.device, repo.inode)
+
+
+def _open_or_create_agents_parent(
+    repo: _BoundRepository,
+) -> tuple[int, tuple[int, int], bool]:
+    _require_descriptor_relative_operations("mkdir", "open", "stat")
+    created = False
+    try:
+        os.mkdir(CONFIG_RELATIVE_PATH.parent.name, 0o755, dir_fd=repo.descriptor)
+        created = True
+    except FileExistsError:
+        pass
+    if created:
+        raise _CreatedParentUnavailableError(
+            "the target parent was created and must be rebound on a subsequent invocation"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            CONFIG_RELATIVE_PATH.parent.name,
+            flags,
+            dir_fd=repo.descriptor,
+        )
+        try:
+            parent_stat = os.fstat(descriptor)
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise OSError(errno.ENOTDIR, "migration target parent is not a directory")
+            if not _repository_path_has_identity(repo):
+                raise OSError(
+                    getattr(errno, "ESTALE", errno.EIO),
+                    "repository root path changed before config creation",
+                )
+            return descriptor, (parent_stat.st_dev, parent_stat.st_ino), created
+        except Exception:
+            os.close(descriptor)
+            raise
+    except OSError as exc:
+        if created:
+            raise _CreatedParentUnavailableError(str(exc)) from exc
+        raise
+
+
+def _repository_identity_blocker(exc: OSError) -> dict[str, Any]:
+    return {
+        "code": "migration_execution.repository_identity_changed",
+        "path": ".",
+        "message": f"Migration execution repository identity is unavailable: {exc}",
+    }
+
+
+def _require_descriptor_relative_operations(*operation_names: str) -> None:
+    supported_names = {operation.__name__ for operation in os.supports_dir_fd}
+    unsupported = [name for name in operation_names if name not in supported_names]
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise OSError(
+            errno.ENOTSUP,
+            f"descriptor-relative filesystem operations are unavailable: {names}",
+        )
+
+
+def _open_exact_parent_descriptor(
+    repo: _BoundRepository,
+    expected_identity: tuple[int, int],
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(
+        CONFIG_RELATIVE_PATH.parent.name,
+        flags,
+        dir_fd=repo.descriptor,
+    )
+    try:
+        parent_stat = os.fstat(descriptor)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise OSError(errno.ENOTDIR, "migration target parent is not a directory")
+        if (parent_stat.st_dev, parent_stat.st_ino) != expected_identity:
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "migration target parent identity changed",
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def _config_content_bytes(content: str) -> bytes:
     return content.encode()
 
 
-def _remove_created_parent(parent: Path, parent_existed: bool) -> None:
-    if parent_existed:
-        return
-    try:
-        parent.rmdir()
-    except OSError:
-        return
-
-
 def _verify_migration_execution(
-    repo: Path,
+    repo: _BoundRepository,
     preview: dict[str, Any],
+    created_targets: list[tuple[Path, _CreatedFileIdentity, bytes]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    report = build_status_report(repo, include_config=False)
+    target_blockers = _created_target_blockers(created_targets, repo)
+    if target_blockers:
+        return [], target_blockers
+    if not _repository_path_has_identity(repo):
+        return [], [_repository_identity_blocker(OSError("repository root path changed"))]
+    report = build_status_report(repo.path, include_config=False)
     required_level = "track-aware"
     required_available = bool(report["capability"]["levels"][required_level]["available"])
     status = "passed" if required_available else "failed"
@@ -2938,7 +3229,7 @@ def _verify_migration_execution(
                 ),
             }
         )
-    blockers = []
+    blockers = _created_target_blockers(created_targets, repo)
     if status != "passed":
         blockers.append(
             {
@@ -2948,6 +3239,23 @@ def _verify_migration_execution(
             }
         )
     return results, blockers
+
+
+def _created_target_blockers(
+    created_targets: list[tuple[Path, _CreatedFileIdentity, bytes]],
+    bound_repo: _BoundRepository | None = None,
+) -> list[dict[str, Any]]:
+    blockers = []
+    for path, identity, expected_content in created_targets:
+        _, blocker = _verify_created_target(
+            path,
+            identity,
+            expected_content,
+            bound_repo,
+        )
+        if blocker is not None:
+            blockers.append(blocker)
+    return blockers
 
 
 def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
@@ -5119,7 +5427,41 @@ def initialize_config(
     upstream_name: str = "UPSTREAM_REPO",
     default_branch: str = "main",
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    try:
+        bound_repo = _bind_repository(repo)
+    except OSError as exc:
+        return _config_initialization_result(
+            repo,
+            status="blocked",
+            applied_edits=[],
+            blockers=[_repository_identity_blocker(exc)],
+            verification=None,
+            mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
+        )
+    try:
+        return _initialize_config_in_bound_repository(
+            bound_repo,
+            repository_owner=repository_owner,
+            repository_name=repository_name,
+            upstream_owner=upstream_owner,
+            upstream_name=upstream_name,
+            default_branch=default_branch,
+        )
+    finally:
+        bound_repo.close()
+
+
+def _initialize_config_in_bound_repository(
+    bound_repo: _BoundRepository,
+    *,
+    repository_owner: str,
+    repository_name: str,
+    upstream_owner: str,
+    upstream_name: str,
+    default_branch: str,
+) -> dict[str, Any]:
+    repo = bound_repo.path
     content = create_initial_config_text(
         repo,
         repository_owner=repository_owner,
@@ -5145,15 +5487,39 @@ def initialize_config(
             mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
         )
 
-    applied_edit, apply_blocker, created_identity = _apply_migration_file_edit(repo, edit)
-    if apply_blocker is not None or applied_edit is None or created_identity is None:
+    if not _repository_path_has_identity(bound_repo):
         return _config_initialization_result(
             repo,
             status="blocked",
             applied_edits=[],
-            blockers=[apply_blocker] if apply_blocker is not None else [],
+            blockers=[_repository_identity_blocker(OSError("repository root path changed"))],
             verification=None,
             mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
+        )
+    applied_edit, apply_blocker, created_identity = _apply_migration_file_edit(
+        bound_repo,
+        edit,
+    )
+    if apply_blocker is not None or applied_edit is None or created_identity is None:
+        mutation_occurred = applied_edit is not None
+        parent_only_mutation = bool(
+            applied_edit is not None and applied_edit.get("target_created") is False
+        )
+        return _config_initialization_result(
+            repo,
+            status="applied_unverified" if mutation_occurred else "blocked",
+            applied_edits=[applied_edit] if applied_edit is not None else [],
+            blockers=[apply_blocker] if apply_blocker is not None else [],
+            verification=None,
+            mutation=_config_initialization_mutation(
+                mutation_occurred,
+                (
+                    "not-created"
+                    if parent_only_mutation or not mutation_occurred
+                    else "unverified"
+                ),
+                "not-attempted" if mutation_occurred and not parent_only_mutation else "not-needed",
+            ),
         )
 
     target_path = repo / CONFIG_RELATIVE_PATH
@@ -5162,6 +5528,7 @@ def initialize_config(
         target_path,
         created_identity,
         content_bytes,
+        bound_repo,
     )
     if target_blocker is not None:
         return _config_initialization_post_create_failure(
@@ -5169,6 +5536,7 @@ def initialize_config(
             applied_edit,
             created_identity,
             content_bytes,
+            bound_repo=bound_repo,
             blockers=[target_blocker],
             verification={"status": "failed", "target": target_verification},
         )
@@ -5192,6 +5560,7 @@ def initialize_config(
             applied_edit,
             created_identity,
             content_bytes,
+            bound_repo=bound_repo,
             blockers=[
                 {
                     "code": "config_initialization.verification_error",
@@ -5222,6 +5591,7 @@ def initialize_config(
             applied_edit,
             created_identity,
             content_bytes,
+            bound_repo=bound_repo,
             blockers=[
                 {
                     "code": "migration_execution.verification_failed",
@@ -5236,6 +5606,7 @@ def initialize_config(
         target_path,
         created_identity,
         content_bytes,
+        bound_repo,
     )
     verification["target"] = final_target_verification
     if final_target_blocker is not None:
@@ -5245,6 +5616,7 @@ def initialize_config(
             applied_edit,
             created_identity,
             content_bytes,
+            bound_repo=bound_repo,
             blockers=[final_target_blocker],
             verification=verification,
         )
@@ -5265,6 +5637,7 @@ def _config_initialization_post_create_failure(
     created_identity: _CreatedFileIdentity,
     expected_content: bytes,
     *,
+    bound_repo: _BoundRepository,
     blockers: list[dict[str, Any]],
     verification: dict[str, Any],
 ) -> dict[str, Any]:
@@ -5272,6 +5645,7 @@ def _config_initialization_post_create_failure(
         repo / CONFIG_RELATIVE_PATH,
         created_identity,
         expected_content,
+        bound_repo,
     )
     edit = copy.deepcopy(applied_edit)
     if rollback["status"] == "rolled_back":
@@ -5301,16 +5675,190 @@ def _verify_created_target(
     path: Path,
     identity: _CreatedFileIdentity,
     expected_content: bytes,
+    bound_repo: _BoundRepository | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    expected_parent_identity = (identity.parent_device, identity.parent_inode)
+    verification_repo: _BoundRepository | None = None
+    parent_descriptor: int | None = None
+    try:
+        verification_repo = (
+            _duplicate_bound_repository(bound_repo)
+            if bound_repo is not None
+            else _bind_repository(path.parent.parent)
+        )
+        if (verification_repo.device, verification_repo.inode) != (
+            identity.root_device,
+            identity.root_inode,
+        ):
+            verification_repo.close()
+            verification_repo = None
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "created config repository identity changed",
+            )
+        parent_descriptor = _open_exact_parent_descriptor(
+            verification_repo,
+            expected_parent_identity,
+        )
+    except OSError as exc:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+            parent_descriptor = None
+        if verification_repo is not None:
+            verification_repo.close()
+            verification_repo = None
+        verification = {
+            "status": "failed",
+            "path": str(path),
+            "expected_sha256": identity.content_sha256,
+            "parent_identity_matches": False,
+            "error": str(exc),
+        }
+        return verification, {
+            "code": "config_initialization.target_parent_identity_changed",
+            "path": CONFIG_RELATIVE_PATH.as_posix(),
+            "message": "Created config target parent identity changed after creation.",
+            "error": str(exc),
+        }
+    try:
+        verification, blocker, target_descriptor = _inspect_created_entry_in_parent(
+            parent_descriptor,
+            path.name,
+            path,
+            identity,
+            expected_content,
+        )
+        try:
+            if blocker is not None:
+                return verification, blocker
+            if target_descriptor is None:
+                raise OSError(errno.EIO, "created config descriptor is unavailable")
+            target_stat = os.fstat(target_descriptor)
+            name_stat = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (name_stat.st_dev, name_stat.st_ino) != (
+                target_stat.st_dev,
+                target_stat.st_ino,
+            ):
+                verification["status"] = "failed"
+                verification["identity_matches"] = False
+                return verification, {
+                    "code": "config_initialization.target_identity_changed",
+                    "path": CONFIG_RELATIVE_PATH.as_posix(),
+                    "message": "Created config target identity changed during verification.",
+                }
+            parent_name_stat = os.stat(
+                CONFIG_RELATIVE_PATH.parent.name,
+                dir_fd=verification_repo.descriptor,
+                follow_symlinks=False,
+            )
+            if (parent_name_stat.st_dev, parent_name_stat.st_ino) != expected_parent_identity:
+                verification["status"] = "failed"
+                verification["parent_identity_matches"] = False
+                return verification, {
+                    "code": "config_initialization.target_parent_identity_changed",
+                    "path": CONFIG_RELATIVE_PATH.as_posix(),
+                    "message": "Created config parent identity changed during final verification.",
+                }
+            if not _repository_path_has_identity(verification_repo):
+                verification["status"] = "failed"
+                verification["repository_identity_matches"] = False
+                return verification, {
+                    "code": "config_initialization.repository_identity_changed",
+                    "path": CONFIG_RELATIVE_PATH.as_posix(),
+                    "message": (
+                        "Created config repository identity changed during final verification."
+                    ),
+                }
+            pre_read_stat = os.fstat(target_descriptor)
+            with os.fdopen(target_descriptor, "rb", closefd=False) as handle:
+                handle.seek(0)
+                final_content = handle.read()
+            post_read_stat = os.fstat(target_descriptor)
+            expected_stat = (
+                identity.device,
+                identity.inode,
+                identity.size,
+                identity.modified_time_ns,
+                identity.change_time_ns,
+            )
+            pre_read_identity = _file_observation_tuple(pre_read_stat)
+            post_read_identity = _file_observation_tuple(post_read_stat)
+            final_sha256 = hashlib.sha256(final_content).hexdigest()
+            if (
+                pre_read_identity != expected_stat
+                or post_read_identity != expected_stat
+                or pre_read_identity != post_read_identity
+                or final_content != expected_content
+                or final_sha256 != identity.content_sha256
+            ):
+                verification["status"] = "failed"
+                verification["content_unchanged"] = False
+                verification["metadata_unchanged"] = False
+                verification["actual_bytes"] = len(final_content)
+                verification["actual_sha256"] = final_sha256
+                return verification, {
+                    "code": "config_initialization.target_content_changed",
+                    "path": CONFIG_RELATIVE_PATH.as_posix(),
+                    "message": "Created config target changed during final verification.",
+                    "expected_sha256": identity.content_sha256,
+                    "actual_sha256": final_sha256,
+                }
+            verification["content_unchanged"] = True
+            verification["metadata_unchanged"] = True
+            verification["parent_identity_matches"] = True
+            verification["repository_identity_matches"] = True
+            verification["identity_observed_at_final_check"] = True
+            return verification, None
+        except OSError as exc:
+            verification["status"] = "failed"
+            verification["identity_matches"] = False
+            verification["error"] = str(exc)
+            return verification, {
+                "code": "config_initialization.target_identity_changed",
+                "path": CONFIG_RELATIVE_PATH.as_posix(),
+                "message": "Created config target identity could not be confirmed at final check.",
+                "error": str(exc),
+            }
+        finally:
+            if target_descriptor is not None:
+                os.close(target_descriptor)
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if verification_repo is not None:
+            verification_repo.close()
+
+
+def _file_observation_tuple(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _inspect_created_entry_in_parent(
+    parent_descriptor: int,
+    entry_name: str,
+    display_path: Path,
+    identity: _CreatedFileIdentity,
+    expected_content: bytes,
+) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(entry_name, flags, dir_fd=parent_descriptor)
     except OSError as exc:
         verification = {
             "status": "failed",
-            "path": str(path),
+            "path": str(display_path),
             "expected_sha256": identity.content_sha256,
             "error": str(exc),
         }
@@ -5319,13 +5867,13 @@ def _verify_created_target(
             "path": CONFIG_RELATIVE_PATH.as_posix(),
             "message": "Created config target is missing, unreadable, or a symlink.",
             "error": str(exc),
-        }
+        }, None
     try:
         target_stat = os.fstat(descriptor)
         if not stat.S_ISREG(target_stat.st_mode):
             verification = {
                 "status": "failed",
-                "path": str(path),
+                "path": str(display_path),
                 "expected_sha256": identity.content_sha256,
                 "file_type": "not-regular",
             }
@@ -5333,11 +5881,11 @@ def _verify_created_target(
                 "code": "config_initialization.target_not_regular",
                 "path": CONFIG_RELATIVE_PATH.as_posix(),
                 "message": "Created config target is not a regular file.",
-            }
+            }, descriptor
         if (target_stat.st_dev, target_stat.st_ino) != (identity.device, identity.inode):
             verification = {
                 "status": "failed",
-                "path": str(path),
+                "path": str(display_path),
                 "expected_sha256": identity.content_sha256,
                 "identity_matches": False,
             }
@@ -5345,13 +5893,13 @@ def _verify_created_target(
                 "code": "config_initialization.target_identity_changed",
                 "path": CONFIG_RELATIVE_PATH.as_posix(),
                 "message": "Created config target identity changed after creation.",
-            }
+            }, descriptor
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             actual_content = handle.read()
     except OSError as exc:
         verification = {
             "status": "failed",
-            "path": str(path),
+            "path": str(display_path),
             "expected_sha256": identity.content_sha256,
             "error": str(exc),
         }
@@ -5360,9 +5908,7 @@ def _verify_created_target(
             "path": CONFIG_RELATIVE_PATH.as_posix(),
             "message": "Created config target could not be read for exact verification.",
             "error": str(exc),
-        }
-    finally:
-        os.close(descriptor)
+        }, descriptor
 
     actual_sha256 = hashlib.sha256(actual_content).hexdigest()
     if (
@@ -5372,7 +5918,7 @@ def _verify_created_target(
     ):
         verification = {
             "status": "failed",
-            "path": str(path),
+            "path": str(display_path),
             "identity_matches": True,
             "expected_bytes": identity.size,
             "actual_bytes": len(actual_content),
@@ -5385,84 +5931,137 @@ def _verify_created_target(
             "message": "Created config target bytes changed after creation.",
             "expected_sha256": identity.content_sha256,
             "actual_sha256": actual_sha256,
-        }
+        }, descriptor
     return {
         "status": "passed",
-        "path": str(path),
+        "path": str(display_path),
         "regular_file": True,
         "identity_matches": True,
         "bytes": len(actual_content),
         "content_sha256": actual_sha256,
-    }, None
+    }, None, descriptor
 
 
 def _rollback_created_target(
     path: Path,
     identity: _CreatedFileIdentity,
     expected_content: bytes,
+    bound_repo: _BoundRepository | None = None,
 ) -> dict[str, Any]:
+    expected_parent_identity = (identity.parent_device, identity.parent_inode)
+    rollback_repo: _BoundRepository | None = None
+    parent_descriptor: int | None = None
     try:
-        path.lstat()
-    except FileNotFoundError:
-        return {"status": "rolled_back", "detail": "target_already_absent"}
+        _require_descriptor_relative_operations("open", "stat")
+        rollback_repo = (
+            _duplicate_bound_repository(bound_repo)
+            if bound_repo is not None
+            else _bind_repository(path.parent.parent)
+        )
+        if (rollback_repo.device, rollback_repo.inode) != (
+            identity.root_device,
+            identity.root_inode,
+        ):
+            rollback_repo.close()
+            rollback_repo = None
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "created config repository identity changed",
+            )
+        parent_descriptor = _open_exact_parent_descriptor(
+            rollback_repo,
+            expected_parent_identity,
+        )
     except OSError as exc:
-        return {
-            "status": "unsafe",
-            "blocker": {
-                "code": "config_initialization.rollback_unsafe",
-                "path": CONFIG_RELATIVE_PATH.as_posix(),
-                "message": "Safe rollback could not inspect the created config target.",
-                "error": str(exc),
-            },
-        }
-    _, match_blocker = _verify_created_target(path, identity, expected_content)
-    if match_blocker is not None:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+            parent_descriptor = None
+        if rollback_repo is not None:
+            rollback_repo.close()
+            rollback_repo = None
         return {
             "status": "unsafe",
             "blocker": {
                 "code": "config_initialization.rollback_unsafe",
                 "path": CONFIG_RELATIVE_PATH.as_posix(),
                 "message": (
+                    "Safe rollback could not bind the exact created config parent with "
+                    "descriptor-relative operations."
+                ),
+                "error": str(exc),
+            },
+        }
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return _rollback_failure(
+                "unsafe",
+                "config_initialization.rollback_unsafe",
+                (
+                    "The target name is absent, but removal of the task-created "
+                    "identity cannot be proven; no rollback was claimed."
+                ),
+                reason_code="target_absent_unverified",
+            )
+        except OSError as exc:
+            return _rollback_failure(
+                "unsafe",
+                "config_initialization.rollback_unsafe",
+                "Safe rollback could not inspect the created config target.",
+                error=exc,
+            )
+
+        _, match_blocker = _verify_created_target(
+            path,
+            identity,
+            expected_content,
+            rollback_repo,
+        )
+        if match_blocker is not None:
+            return _rollback_failure(
+                "unsafe",
+                "config_initialization.rollback_unsafe",
+                (
                     "Safe rollback refused because the target no longer has the "
                     "task-created identity and exact content."
                 ),
-                "reason_code": match_blocker.get("code"),
-            },
-        }
-    try:
-        path.unlink()
-    except OSError as exc:
-        return {
-            "status": "failed",
-            "blocker": {
-                "code": "config_initialization.rollback_failed",
-                "path": CONFIG_RELATIVE_PATH.as_posix(),
-                "message": "The exact task-created config could not be rolled back.",
-                "error": str(exc),
-            },
-        }
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return {"status": "rolled_back", "detail": "exact_task_created_target_removed"}
-    except OSError as exc:
-        return {
-            "status": "failed",
-            "blocker": {
-                "code": "config_initialization.rollback_unverified",
-                "path": CONFIG_RELATIVE_PATH.as_posix(),
-                "message": "Rollback ran, but target absence could not be verified.",
-                "error": str(exc),
-            },
-        }
-    return {
-        "status": "failed",
-        "blocker": {
-            "code": "config_initialization.rollback_replaced",
-            "path": CONFIG_RELATIVE_PATH.as_posix(),
-            "message": "A config target exists after rollback; its state is unverified.",
-        },
+                reason_code=str(match_blocker.get("code")),
+            )
+        return _rollback_failure(
+            "unsafe",
+            "config_initialization.rollback_unsafe",
+            (
+                "Automatic rollback is unavailable because this platform does not "
+                "provide an atomic exact-identity delete; the target was preserved."
+            ),
+            reason_code="atomic_identity_delete_unavailable",
+        )
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if rollback_repo is not None:
+            rollback_repo.close()
+
+
+def _rollback_failure(
+    status: str,
+    code: str,
+    message: str,
+    *,
+    error: OSError | None = None,
+    reason_code: str | None = None,
+) -> dict[str, Any]:
+    blocker: dict[str, Any] = {
+        "code": code,
+        "path": CONFIG_RELATIVE_PATH.as_posix(),
+        "message": message,
     }
+    if error is not None:
+        blocker["error"] = str(error)
+    if reason_code is not None:
+        blocker["reason_code"] = reason_code
+    return {"status": status, "blocker": blocker}
 
 
 def _config_initialization_mutation(

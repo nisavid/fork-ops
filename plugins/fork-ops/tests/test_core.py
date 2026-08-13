@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, get_args
 from unittest.mock import patch
 
+from fork_ops import core as core_module
 from fork_ops import mcp_server
 from fork_ops.cli import main as cli_main
 from fork_ops.core import (
@@ -2922,6 +2923,7 @@ uncertainty_destination = "ask-human-operator"
     def test_cli_smokes_config_init_show_validate(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
             init_output = io.StringIO()
             show_output = io.StringIO()
             validate_output = io.StringIO()
@@ -3004,6 +3006,7 @@ uncertainty_destination = "ask-human-operator"
     def test_config_initialization_reports_guarded_mutation_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
 
             result = initialize_config(
                 repo_path,
@@ -3026,7 +3029,443 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["verification"]["status"], "passed")
         self.assertTrue(result["verification"]["required_level_available"])
 
-    def test_config_initialization_rolls_back_its_exact_file_after_verification_failure(
+    def test_config_initialization_does_not_follow_parent_swapped_after_path_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            repo_path = Path(repo)
+            outside_path = Path(outside)
+            parent_path = repo_path / CONFIG_RELATIVE_PATH.parent
+            parent_path.mkdir()
+            displaced_parent = repo_path / ".agents-displaced"
+            original_open_parent = core_module._open_or_create_agents_parent
+
+            def swap_parent_after_check(
+                bound_repo: Any,
+            ) -> tuple[int, tuple[int, int], bool]:
+                opened = original_open_parent(bound_repo)
+                parent_path.rename(displaced_parent)
+                parent_path.symlink_to(outside_path, target_is_directory=True)
+                return opened
+
+            with patch(
+                "fork_ops.core._open_or_create_agents_parent",
+                side_effect=swap_parent_after_check,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((outside_path / CONFIG_RELATIVE_PATH.name).exists())
+            self.assertTrue((displaced_parent / CONFIG_RELATIVE_PATH.name).is_file())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_config_initialization_does_not_follow_repository_root_swapped_before_create(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            displaced_repo = root_path / "repo-original"
+            original_blockers = core_module._migration_execution_blockers
+
+            def swap_repo_after_blockers(
+                repo: Path,
+                preview: dict[str, Any],
+            ) -> list[dict[str, Any]]:
+                blockers = original_blockers(repo, preview)
+                repo_path.rename(displaced_repo)
+                repo_path.symlink_to(Path(outside), target_is_directory=True)
+                return blockers
+
+            with patch(
+                "fork_ops.core._migration_execution_blockers",
+                side_effect=swap_repo_after_blockers,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((Path(outside) / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["mutation"]["occurred"])
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.repository_identity_changed",
+        )
+
+    def test_config_initialization_does_not_bind_repository_replacement_during_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            displaced_repo = root_path / "repo-original"
+            replacement_repo = root_path / "repo-replacement"
+            replacement_repo.mkdir()
+            (replacement_repo / CONFIG_RELATIVE_PATH.parent).mkdir()
+            original_bind = core_module._bind_repository
+
+            def swap_before_real_bind(path: Path) -> Any:
+                repo_path.rename(displaced_repo)
+                replacement_repo.rename(repo_path)
+                return original_bind(path)
+
+            with patch("fork_ops.core._bind_repository", side_effect=swap_before_real_bind):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["status"], "applied")
+
+    def test_config_initialization_rejects_repository_replaced_after_root_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
+            displaced_repo = root_path / "repo-original"
+            replacement_repo = root_path / "repo-replacement"
+            replacement_repo.mkdir()
+            original_open = os.open
+            swapped = False
+
+            def swap_after_root_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                if not swapped and dir_fd is None and Path(os.fsdecode(path)) == repo_path:
+                    swapped = True
+                    repo_path.rename(displaced_repo)
+                    replacement_repo.rename(repo_path)
+                return descriptor
+
+            with patch("fork_ops.core.os.open", side_effect=swap_after_root_open):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["mutation"]["occurred"])
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.repository_identity_changed",
+        )
+
+    def test_config_initialization_uses_lexical_root_without_proc_fd_display(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
+
+            with patch(
+                "fork_ops.core.os.readlink",
+                side_effect=OSError("descriptor display path unavailable"),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["status"], "applied")
+
+    def test_config_initialization_preserves_bound_config_after_repository_root_swap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
+            displaced_repo = root_path / "repo-original"
+            target_created = False
+            original_repo_identity = core_module._repository_path_has_identity
+
+            def swap_repo_after_create(bound_repo: Any) -> bool:
+                nonlocal target_created
+                if (
+                    not target_created
+                    and (displaced_repo / CONFIG_RELATIVE_PATH).exists() is False
+                    and (repo_path / CONFIG_RELATIVE_PATH).exists()
+                ):
+                    target_created = True
+                    repo_path.rename(displaced_repo)
+                    repo_path.symlink_to(Path(outside), target_is_directory=True)
+                return original_repo_identity(bound_repo)
+
+            with patch(
+                "fork_ops.core._repository_path_has_identity",
+                side_effect=swap_repo_after_create,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse((Path(outside) / CONFIG_RELATIVE_PATH).exists())
+            self.assertIn(
+                'owner = "nisavid"',
+                (displaced_repo / CONFIG_RELATIVE_PATH).read_text(),
+            )
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+
+    def test_config_initialization_preserves_parent_replacement_after_failed_create(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            parent_path = repo_path / CONFIG_RELATIVE_PATH.parent
+            parent_path.mkdir()
+            displaced_parent = repo_path / ".agents-displaced"
+            original_open_parent = core_module._open_or_create_agents_parent
+
+            def replace_parent_after_check(
+                bound_repo: Any,
+            ) -> tuple[int, tuple[int, int], bool]:
+                opened = original_open_parent(bound_repo)
+                parent_path.rename(displaced_parent)
+                parent_path.mkdir()
+                return opened
+
+            with patch(
+                "fork_ops.core._open_or_create_agents_parent",
+                side_effect=replace_parent_after_check,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue(parent_path.is_dir())
+            self.assertTrue(displaced_parent.is_dir())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+
+    def test_config_initialization_defers_new_parent_binding_until_next_invocation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            parent_path = repo_path / CONFIG_RELATIVE_PATH.parent
+            original_open = os.open
+            parent_open_attempts = 0
+
+            def reject_same_invocation_parent_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal parent_open_attempts
+                if path == CONFIG_RELATIVE_PATH.parent.name and dir_fd is not None:
+                    parent_open_attempts += 1
+                    raise AssertionError("new parent must not be reopened in this invocation")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch(
+                "fork_ops.core.os.open",
+                side_effect=reject_same_invocation_parent_open,
+            ):
+                first_result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            second_result = initialize_config(
+                repo_path,
+                repository_owner="nisavid",
+                repository_name="demo",
+                upstream_owner="upstream",
+                upstream_name="demo",
+            )
+
+            self.assertTrue(parent_path.is_dir())
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(parent_open_attempts, 0)
+        self.assertEqual(first_result["status"], "applied_unverified")
+        self.assertTrue(first_result["mutation"]["occurred"])
+        self.assertEqual(first_result["mutation"]["target_state"], "not-created")
+        self.assertEqual(first_result["mutation"]["rollback_status"], "not-needed")
+        self.assertEqual(first_result["applied_edits"][0]["created_parent"], ".agents")
+        self.assertEqual(
+            first_result["blockers"][0]["code"],
+            "migration_execution.target_parent_unverified",
+        )
+        self.assertEqual(second_result["status"], "applied")
+
+    def test_config_initialization_closes_parent_descriptor_when_parent_fstat_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
+            original_fstat = os.fstat
+            fstat_count = 0
+            before_fds = len(list(Path("/proc/self/fd").iterdir()))
+
+            def fail_parent_fstat(descriptor: int) -> os.stat_result:
+                nonlocal fstat_count
+                fstat_count += 1
+                if fstat_count == 2:
+                    raise OSError("injected parent fstat failure")
+                return original_fstat(descriptor)
+
+            with patch("fork_ops.core.os.fstat", side_effect=fail_parent_fstat):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            after_fds = len(list(Path("/proc/self/fd").iterdir()))
+
+        self.assertEqual(after_fds, before_fds)
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["mutation"]["occurred"])
+
+    def test_config_initialization_does_not_claim_rollback_when_target_is_renamed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            renamed_path = target_path.with_name("saved-by-concurrent-writer.toml")
+
+            def rename_then_fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                del args, kwargs
+                target_path.rename(renamed_path)
+                return {
+                    "capability": {
+                        "highest_available": None,
+                        "levels": {"track-aware": {"available": False}},
+                    },
+                    "diagnostics": [{"severity": "error", "code": "test.renamed"}],
+                }
+
+            with patch("fork_ops.core.build_status_report", side_effect=rename_then_fail):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertFalse(target_path.exists())
+            self.assertIn('owner = "nisavid"', renamed_path.read_text())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertEqual(
+            result["blockers"][-1]["reason_code"],
+            "target_absent_unverified",
+        )
+
+    def test_config_initialization_preserves_created_target_when_parent_swaps_after_create(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            repo_path = Path(repo)
+            parent_path = repo_path / CONFIG_RELATIVE_PATH.parent
+            parent_path.mkdir()
+            displaced_parent = repo_path / ".agents-displaced"
+            original_repo_identity_check = core_module._repository_path_has_identity
+            identity_check_count = 0
+
+            def swap_parent_after_create(
+                bound_repo: Any,
+            ) -> bool:
+                nonlocal identity_check_count
+                identity_check_count += 1
+                if identity_check_count == 3:
+                    parent_path.rename(displaced_parent)
+                    parent_path.symlink_to(Path(outside), target_is_directory=True)
+                return original_repo_identity_check(bound_repo)
+
+            with patch(
+                "fork_ops.core._repository_path_has_identity",
+                side_effect=swap_parent_after_create,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            displaced_target = displaced_parent / CONFIG_RELATIVE_PATH.name
+            self.assertTrue(displaced_target.is_file())
+            self.assertIn('owner = "nisavid"', displaced_target.read_text())
+            self.assertFalse((Path(outside) / CONFIG_RELATIVE_PATH.name).exists())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+
+    def test_config_initialization_preserves_its_exact_file_after_verification_failure(
         self,
     ) -> None:
         failed_report = {
@@ -3038,6 +3477,7 @@ uncertainty_destination = "ask-human-operator"
         }
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
             unrelated_path = repo_path / "keep.txt"
             unrelated_path.write_text("unrelated\n")
 
@@ -3050,19 +3490,286 @@ uncertainty_destination = "ask-human-operator"
                     upstream_name="demo",
                 )
 
-            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertIn(
+                'owner = "nisavid"',
+                (repo_path / CONFIG_RELATIVE_PATH).read_text(),
+            )
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(result["status"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
-        self.assertEqual(result["mutation"]["target_state"], "rolled_back")
-        self.assertEqual(result["mutation"]["rollback_status"], "rolled_back")
-        self.assertEqual(result["applied_edits"][0]["status"], "rolled_back")
+        self.assertEqual(result["mutation"]["target_state"], "unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_config_initialization_preserves_target_swapped_after_rollback_check(
+        self,
+    ) -> None:
+        failed_report = {
+            "capability": {
+                "highest_available": "scoutable",
+                "levels": {"track-aware": {"available": False}},
+            },
+            "diagnostics": [{"severity": "error", "code": "test.verification_failed"}],
+        }
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            original_verify = core_module._verify_created_target
+            verification_count = 0
+
+            def swap_after_rollback_check(
+                path: Path,
+                identity: Any,
+                expected_content: bytes,
+                bound_repo: Any = None,
+            ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+                nonlocal verification_count
+                verification = original_verify(path, identity, expected_content, bound_repo)
+                verification_count += 1
+                if verification_count == 2 and verification[1] is None:
+                    target_path.unlink()
+                    target_path.write_text("concurrent writer\n")
+                return verification
+
+            with (
+                patch("fork_ops.core.build_status_report", return_value=failed_report),
+                patch(
+                    "fork_ops.core._verify_created_target",
+                    side_effect=swap_after_rollback_check,
+                ),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertEqual(target_path.read_text(), "concurrent writer\n")
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_config_initialization_detects_target_swapped_after_final_content_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            original_inspect = core_module._inspect_created_entry_in_parent
+            inspection_count = 0
+
+            def swap_after_second_content_read(
+                parent_descriptor: int,
+                entry_name: str,
+                display_path: Path,
+                identity: Any,
+                expected_content: bytes,
+            ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
+                nonlocal inspection_count
+                inspected = original_inspect(
+                    parent_descriptor,
+                    entry_name,
+                    display_path,
+                    identity,
+                    expected_content,
+                )
+                inspection_count += 1
+                if inspection_count == 2 and inspected[1] is None:
+                    target_path.unlink()
+                    target_path.write_text("concurrent writer\n")
+                return inspected
+
+            with patch(
+                "fork_ops.core._inspect_created_entry_in_parent",
+                side_effect=swap_after_second_content_read,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertEqual(target_path.read_text(), "concurrent writer\n")
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertEqual(
+            result["verification"]["target"]["identity_matches"],
+            False,
+        )
+
+    def test_config_initialization_detects_in_place_tamper_after_final_content_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            original_inspect = core_module._inspect_created_entry_in_parent
+            inspection_count = 0
+
+            def tamper_after_second_content_read(
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                nonlocal inspection_count
+                inspected = original_inspect(*args, **kwargs)
+                inspection_count += 1
+                if inspection_count == 2 and inspected[1] is None:
+                    content = target_path.read_bytes()
+                    target_path.write_bytes(b"X" + content[1:])
+                return inspected
+
+            with patch(
+                "fork_ops.core._inspect_created_entry_in_parent",
+                side_effect=tamper_after_second_content_read,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue(target_path.read_bytes().startswith(b"X"))
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertFalse(result["verification"]["target"]["content_unchanged"])
+
+    def test_config_initialization_detects_same_inode_tamper_at_final_name_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            original_stat = os.stat
+            target_name_stats = 0
+
+            def tamper_at_second_target_name_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal target_name_stats
+                result = original_stat(
+                    path,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+                if path == CONFIG_RELATIVE_PATH.name and dir_fd is not None:
+                    target_name_stats += 1
+                    if target_name_stats == 2:
+                        content = target_path.read_bytes()
+                        target_path.write_bytes(b"Y" + content[1:])
+                return result
+
+            with patch("fork_ops.core.os.stat", side_effect=tamper_at_second_target_name_stat):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue(target_path.read_bytes().startswith(b"Y"))
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
+        self.assertFalse(result["verification"]["target"]["content_unchanged"])
+
+    def test_config_initialization_detects_parent_swapped_during_final_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            parent_path = repo_path / CONFIG_RELATIVE_PATH.parent
+            parent_path.mkdir()
+            displaced_parent = repo_path / ".agents-old"
+            original_inspect = core_module._inspect_created_entry_in_parent
+            inspection_count = 0
+
+            def swap_parent_after_second_content_read(*args: Any, **kwargs: Any) -> Any:
+                nonlocal inspection_count
+                inspected = original_inspect(*args, **kwargs)
+                inspection_count += 1
+                if inspection_count == 2 and inspected[1] is None:
+                    parent_path.rename(displaced_parent)
+                    parent_path.mkdir()
+                return inspected
+
+            with patch(
+                "fork_ops.core._inspect_created_entry_in_parent",
+                side_effect=swap_parent_after_second_content_read,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue((displaced_parent / CONFIG_RELATIVE_PATH.name).is_file())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertFalse(result["verification"]["target"]["parent_identity_matches"])
+
+    def test_config_initialization_detects_repository_swapped_during_final_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
+            displaced_repo = root_path / "repo-old"
+            original_inspect = core_module._inspect_created_entry_in_parent
+            inspection_count = 0
+
+            def swap_repo_after_second_content_read(*args: Any, **kwargs: Any) -> Any:
+                nonlocal inspection_count
+                inspected = original_inspect(*args, **kwargs)
+                inspection_count += 1
+                if inspection_count == 2 and inspected[1] is None:
+                    repo_path.rename(displaced_repo)
+                    repo_path.mkdir()
+                return inspected
+
+            with patch(
+                "fork_ops.core._inspect_created_entry_in_parent",
+                side_effect=swap_repo_after_second_content_read,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="nisavid",
+                    repository_name="demo",
+                    upstream_owner="upstream",
+                    upstream_name="demo",
+                )
+
+            self.assertTrue((displaced_repo / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertFalse(result["verification"]["target"]["repository_identity_matches"])
 
     def test_config_initialization_reports_applied_unverified_after_target_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
 
             def tamper_then_fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 del args, kwargs
@@ -3098,6 +3805,7 @@ uncertainty_destination = "ask-human-operator"
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
             unrelated_path = repo_path / "keep.txt"
             unrelated_path.write_text("unrelated\n")
 
@@ -3134,13 +3842,28 @@ uncertainty_destination = "ask-human-operator"
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
             unrelated_path = repo_path / "keep.txt"
             unrelated_path.write_text("unrelated\n")
 
-            with patch(
-                "fork_ops.core.os.open",
-                side_effect=PermissionError("injected verification denial"),
-            ):
+            original_open = os.open
+
+            def deny_target_verification(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if (
+                    path == CONFIG_RELATIVE_PATH.name
+                    and dir_fd is not None
+                    and flags & os.O_CREAT == 0
+                ):
+                    raise PermissionError("injected verification denial")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("fork_ops.core.os.open", side_effect=deny_target_verification):
                 result = initialize_config(
                     repo_path,
                     repository_owner="nisavid",
@@ -3158,11 +3881,12 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
 
-    def test_config_initialization_rolls_back_after_capability_verification_error(
+    def test_config_initialization_preserves_config_after_capability_verification_error(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
+            (repo_path / CONFIG_RELATIVE_PATH.parent).mkdir()
             unrelated_path = repo_path / "keep.txt"
             unrelated_path.write_text("unrelated\n")
 
@@ -3178,12 +3902,15 @@ uncertainty_destination = "ask-human-operator"
                     upstream_name="demo",
                 )
 
-            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertIn(
+                'owner = "nisavid"',
+                (repo_path / CONFIG_RELATIVE_PATH).read_text(),
+            )
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(result["status"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
-        self.assertEqual(result["mutation"]["rollback_status"], "rolled_back")
+        self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertEqual(
             result["verification"]["capability"]["error"],
             "injected capability failure",
@@ -3193,15 +3920,25 @@ uncertainty_destination = "ask-human-operator"
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
             unrelated_path = repo_path / "keep.txt"
             unrelated_path.write_text("unrelated\n")
 
-            def concurrent_create_then_conflict(source: Any, destination: Any) -> None:
-                del source
-                Path(destination).write_text("concurrent writer\n")
-                raise FileExistsError("injected create race")
+            original_open = os.open
 
-            with patch("fork_ops.core.os.link", side_effect=concurrent_create_then_conflict):
+            def concurrent_create_then_conflict(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == CONFIG_RELATIVE_PATH.name and flags & os.O_CREAT:
+                    target_path.write_text("concurrent writer\n")
+                    raise FileExistsError("injected create race")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("fork_ops.core.os.open", side_effect=concurrent_create_then_conflict):
                 result = initialize_config(
                     repo_path,
                     repository_owner="nisavid",
@@ -3215,7 +3952,6 @@ uncertainty_destination = "ask-human-operator"
 
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["mutation"]["occurred"])
-        self.assertEqual(result["mutation"]["target_state"], "not-created")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
     def test_config_initialization_refuses_existing_file_and_symlink_targets(self) -> None:
@@ -3248,14 +3984,15 @@ uncertainty_destination = "ask-human-operator"
                 else:
                     self.assertTrue(target_path.is_symlink())
 
-    def test_cli_config_init_write_reports_rollback_and_persisting_unverified_mutation(
+    def test_cli_config_init_write_reports_preserved_unverified_mutation(
         self,
     ) -> None:
-        scenarios = ("rolled_back", "applied_unverified")
+        scenarios = ("exact_created", "tampered")
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as repo:
                 repo_path = Path(repo)
                 target_path = repo_path / CONFIG_RELATIVE_PATH
+                target_path.parent.mkdir()
                 error = io.StringIO()
 
                 def fail_verification(
@@ -3265,7 +4002,7 @@ uncertainty_destination = "ask-human-operator"
                     **kwargs: Any,
                 ) -> dict[str, Any]:
                     del args, kwargs
-                    if _scenario == "applied_unverified":
+                    if _scenario == "tampered":
                         _target_path.write_text("changed after create\n")
                     return {
                         "capability": {
@@ -3298,13 +4035,44 @@ uncertainty_destination = "ask-human-operator"
                     )
 
                 self.assertEqual(exit_code, 2)
-                if scenario == "rolled_back":
-                    self.assertIn("rolled back", error.getvalue())
-                    self.assertFalse(target_path.exists())
-                else:
-                    self.assertIn("remains unverified", error.getvalue())
-                    self.assertIn(str(target_path), error.getvalue())
+                self.assertIn("remains unverified", error.getvalue())
+                self.assertIn(str(target_path), error.getvalue())
+                if scenario == "tampered":
                     self.assertEqual(target_path.read_text(), "changed after create\n")
+                else:
+                    self.assertIn('owner = "nisavid"', target_path.read_text())
+
+    def test_cli_config_init_write_requests_rerun_after_parent_only_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            error = io.StringIO()
+
+            with redirect_stderr(error):
+                exit_code = cli_main(
+                    [
+                        "config",
+                        "init",
+                        "--repo",
+                        str(repo_path),
+                        "--repository-owner",
+                        "nisavid",
+                        "--repository-name",
+                        "demo",
+                        "--upstream-owner",
+                        "upstream",
+                        "--upstream-name",
+                        "demo",
+                        "--write",
+                    ]
+                )
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH.parent).is_dir())
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("created the .agents directory", error.getvalue())
+        self.assertIn("rerun the command", error.getvalue())
+        self.assertNotIn("could not be safely rolled back", error.getvalue())
 
     def test_cli_schema_check_reports_drift(self) -> None:
         with tempfile.TemporaryDirectory() as plugin:
@@ -3870,15 +4638,20 @@ equipment = "not-a-table"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            original_open = Path.open
+            original_open = os.open
 
-            def late_target_create(path: Path, *args: Any, **kwargs: Any) -> Any:
-                mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
-                if "x" in mode:
+            def late_target_create(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == CONFIG_RELATIVE_PATH.name and flags & os.O_CREAT:
                     raise FileExistsError
-                return original_open(path, *args, **kwargs)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
 
-            with patch.object(Path, "open", late_target_create):
+            with patch("fork_ops.core.os.open", side_effect=late_target_create):
                 result = execute_migration_plan(plan)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
@@ -3945,7 +4718,17 @@ equipment = "not-a-table"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            with patch.object(Path, "mkdir", side_effect=FileExistsError("late parent file")):
+            original_open_parent = core_module._open_or_create_agents_parent
+
+            def parent_unavailable(bound_repo: Any) -> Any:
+                parent_descriptor, _, _ = original_open_parent(bound_repo)
+                os.close(parent_descriptor)
+                raise OSError("late parent replacement")
+
+            with patch(
+                "fork_ops.core._open_or_create_agents_parent",
+                side_effect=parent_unavailable,
+            ):
                 result = execute_migration_plan(plan)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
@@ -4158,36 +4941,63 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             target_path = repo_path / CONFIG_RELATIVE_PATH
 
-            def concurrent_target_then_link_failure(src: Path, dst: Path) -> None:
-                target_path.write_text("created by another process")
-                raise OSError("link failed after concurrent target create")
+            original_open = os.open
 
-            with patch("fork_ops.core.os.link", concurrent_target_then_link_failure):
+            def concurrent_target_then_create_failure(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == CONFIG_RELATIVE_PATH.name and flags & os.O_CREAT:
+                    target_path.write_text("created by another process")
+                    raise FileExistsError("target appeared")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch(
+                "fork_ops.core.os.open",
+                side_effect=concurrent_target_then_create_failure,
+            ):
                 result = execute_migration_plan(plan)
 
             self.assertEqual(target_path.read_text(), "created by another process")
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["blockers"][0]["code"], "migration_execution.write_failed")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
-    def test_migration_execution_removes_parent_created_for_blocked_write(self) -> None:
+    def test_migration_execution_preserves_parent_created_for_blocked_write(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / "AGENTS.md"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            def target_appeared(*args: Any, **kwargs: Any) -> None:
-                raise FileExistsError("target appeared")
+            original_open = os.open
 
-            with patch("fork_ops.core.os.link", target_appeared):
+            def target_appeared(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if path == CONFIG_RELATIVE_PATH.name and flags & os.O_CREAT:
+                    raise FileExistsError("target appeared")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("fork_ops.core.os.open", side_effect=target_appeared):
                 result = execute_migration_plan(plan)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
-            self.assertFalse((repo_path / ".agents").exists())
+            self.assertTrue((repo_path / ".agents").is_dir())
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.target_parent_unverified",
+        )
+        self.assertEqual(result["applied_edits"][0]["created_parent"], ".agents")
 
     def test_mcp_migration_execution_rejects_plan_repo_path_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
@@ -4218,6 +5028,44 @@ equipment = "not-a-table"
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
 
         self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+
+    def test_execute_migration_plan_rejects_repository_replaced_during_preflight(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            displaced_repo = root_path / "repo-original"
+            original_dry_run = core_module.dry_run_migration_plan
+
+            def replace_repo_after_preflight(
+                migration_plan: dict[str, Any],
+                selected_repo_path: str | Path | None = None,
+            ) -> dict[str, Any]:
+                preview = original_dry_run(migration_plan, selected_repo_path)
+                repo_path.rename(displaced_repo)
+                repo_path.mkdir()
+                return preview
+
+            with patch(
+                "fork_ops.core.dry_run_migration_plan",
+                side_effect=replace_repo_after_preflight,
+            ):
+                result = execute_migration_plan(plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["blockers"][0]["code"],
+            "migration_execution.repository_identity_changed",
+        )
 
     def test_execute_migration_rejects_dot_repo_path_mismatch_for_supplied_plan(self) -> None:
         original_cwd = Path.cwd()
