@@ -130,8 +130,10 @@ policy: the only permitted uv source is the exact `fork-ops` workspace member,
 workspace membership is fixed, candidate uv configuration and direct sources
 are forbidden, and build metadata is static and pinned. Those commands then
 honor that validated workspace mapping while retaining the fixed index,
-disabled keyring, no-build, no-config, no-download, and minimal-environment
-controls. Fresh resolution and provider audit remain explicitly
+disabled keyring, no-config, no-download, and minimal-environment controls.
+Dependency constraints and audits retain no-build; the local-observational
+distribution step enables only the requested candidate build after its exact
+hashed build requirements pass. Fresh resolution and provider audit remain explicitly
 `--no-sources` because they consume registry-only projections rather than the
 workspace-enabled lock identity.
 
