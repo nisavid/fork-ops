@@ -2034,7 +2034,7 @@ def _validate_fresh_resolution_project(repo: Path) -> dict[str, object]:
     if set(package) - {"build-system", "project", "dependency-groups", "tool"}:
         raise ValueError("Fresh resolution package has unsupported top-level tables")
     if package.get("build-system") != {
-        "requires": ["setuptools>=69", "wheel"],
+        "requires": ["setuptools==83.0.0", "wheel==0.46.2"],
         "build-backend": "setuptools.build_meta",
     }:
         raise ValueError("Fresh resolution package build contract is unsupported")

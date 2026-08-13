@@ -561,9 +561,10 @@ def _read_json_workflow_output(path: str) -> dict[str, Any]:
 def _read_json_object(path: str, label: str) -> dict[str, Any]:
     try:
         if path == "-":
-            raw = sys.stdin.read(MAX_FILE_BYTES + 1)
-            if len(raw.encode("utf-8")) > MAX_FILE_BYTES:
+            raw_bytes = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
+            if len(raw_bytes) > MAX_FILE_BYTES:
                 raise ForkOpsError(f"{label} exceeds the file byte limit.")
+            raw = raw_bytes.decode("utf-8")
         else:
             raw = _read_absolute_regular_file(path).decode("utf-8")
         parsed = json.loads(raw)

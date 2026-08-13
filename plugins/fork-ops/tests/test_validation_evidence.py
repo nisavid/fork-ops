@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tomllib
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2425,6 +2426,15 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             )
         root_content = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('default-groups = ["test", "development"]', root_content)
+        plugin_project = tomllib.loads(
+            (REPOSITORY_ROOT / "plugins" / "fork-ops" / "pyproject.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            plugin_project["build-system"]["requires"],
+            ["setuptools==83.0.0", "wheel==0.46.2"],
+        )
         lock = (REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8")
         self.assertRegex(lock, r'(?m)^name = "setuptools"$')
         self.assertRegex(lock, r'(?m)^name = "wheel"$')

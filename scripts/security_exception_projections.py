@@ -158,6 +158,20 @@ def _check_golden_vectors(contract: dict[str, Any]) -> None:
                 raise ValueError(f"{domain} digest golden vector drifted")
 
 
+def _response_window(entry: dict[str, Any]) -> str:
+    units = {
+        "elapsed_hours": "elapsed hours",
+        "mon_fri_utc_weekdays_no_holidays": "Monday-Friday UTC weekdays",
+        "calendar_days": "calendar days",
+    }
+    kind = entry["kind"]
+    try:
+        unit = units[kind]
+    except KeyError as error:
+        raise ValueError(f"unknown response-clock unit: {kind}") from error
+    return f"{entry['value']} {unit}"
+
+
 def _render_guide(contract: dict[str, Any], digest: str) -> str:
     matrix = contract["kind_subject_matrix"]
     effects = contract["v1_total_effects"]
@@ -179,18 +193,12 @@ def _render_guide(contract: dict[str, Any], digest: str) -> str:
     review_days = lifecycle["review_max_days"]
     expiry_days = lifecycle["expiry_max_days"]
     control_days = lifecycle["control_bypass_or_unavailability_max_days"]
-    critical_triage = response["triage"]["critical"]["value"]
-    high_triage = response["triage"]["high"]["value"]
-    critical_disposition = response["disposition"]["critical"]["value"]
-    high_disposition = response["disposition"]["high"]["value"]
-    medium_disposition = response["disposition"]["medium"]["value"]
-    low_disposition = response["disposition"]["low"]["value"]
-    critical_triage_window = f"{critical_triage} elapsed hours"
-    high_triage_window = f"{high_triage} Monday-Friday UTC weekdays"
-    critical_disposition_window = f"{critical_disposition} elapsed hours"
-    high_disposition_window = f"{high_disposition} calendar days"
-    medium_disposition_window = f"{medium_disposition} calendar days"
-    low_disposition_window = f"{low_disposition} calendar days"
+    critical_triage_window = _response_window(response["triage"]["critical"])
+    high_triage_window = _response_window(response["triage"]["high"])
+    critical_disposition_window = _response_window(response["disposition"]["critical"])
+    high_disposition_window = _response_window(response["disposition"]["high"])
+    medium_disposition_window = _response_window(response["disposition"]["medium"])
+    low_disposition_window = _response_window(response["disposition"]["low"])
     critical_response_line = (
         f"- Critical: triage in {critical_triage_window}; "
         f"disposition in {critical_disposition_window}."
