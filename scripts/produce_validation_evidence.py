@@ -146,6 +146,7 @@ SOURCE_SNAPSHOT_EXCLUDES = {
 class CandidateContainerBoundary:
     source_repo: Path
     site_packages: Path
+    tools_bin: Path
     image: str
     host_environment: dict[str, str]
     user: str
@@ -1052,6 +1053,33 @@ def _make_private_tree_group_writable(path: Path) -> None:
                 raise ValueError(f"Writable candidate mount has an unsupported entry: {entry}")
 
 
+def _make_private_tree_group_readable(path: Path) -> None:
+    if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        raise ValueError("Hosted read-only candidate mounts require a POSIX host")
+    expected_user = os.getuid()
+    expected_group = os.getgid()
+    for directory, directory_names, file_names in os.walk(
+        path,
+        topdown=True,
+        followlinks=False,
+    ):
+        entries = [Path(directory), *[Path(directory) / name for name in directory_names]]
+        entries.extend(Path(directory) / name for name in file_names)
+        for entry in entries:
+            metadata = entry.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"Read-only candidate mount must not contain symlinks: {entry}")
+            if metadata.st_uid != expected_user or metadata.st_gid != expected_group:
+                raise ValueError(f"Read-only candidate mount has unexpected ownership: {entry}")
+            if stat.S_ISDIR(metadata.st_mode):
+                os.chmod(entry, 0o750, follow_symlinks=False)
+            elif stat.S_ISREG(metadata.st_mode):
+                executable = 0o110 if metadata.st_mode & 0o100 else 0
+                os.chmod(entry, 0o640 | executable, follow_symlinks=False)
+            else:
+                raise ValueError(f"Read-only candidate mount has an unsupported entry: {entry}")
+
+
 def _candidate_container_base(*, user: str = "65532:65532") -> list[str]:
     if re.fullmatch(r"[1-9][0-9]*:[0-9]+", user) is None:
         raise ValueError("Candidate containers require a numeric non-root user and group")
@@ -1102,6 +1130,7 @@ def _source_candidate_container_command(
         "--workdir=/workspace",
         f"--mount=type=bind,src={boundary.source_repo},dst=/workspace,readonly",
         f"--mount=type=bind,src={boundary.site_packages},dst=/opt/fork-ops/site-packages,readonly",
+        f"--mount=type=bind,src={boundary.tools_bin},dst=/opt/fork-ops/bin,readonly",
     ]
     if scratch is not None:
         command.append(f"--mount=type=bind,src={scratch},dst=/scratch")
@@ -1112,6 +1141,24 @@ def _source_candidate_container_command(
             ["/opt/fork-ops/site-packages", "/workspace/plugins/fork-ops/src"],
             python_args,
         ),
+    ]
+
+
+def _source_candidate_tool_command(
+    boundary: CandidateContainerBoundary,
+    tool: str,
+    arguments: list[str],
+) -> list[str]:
+    if tool not in {"ruff", "pyrefly"}:
+        raise ValueError(f"Unsupported trusted source tool: {tool}")
+    return [
+        *_candidate_container_base(user=boundary.user),
+        "--workdir=/workspace",
+        f"--mount=type=bind,src={boundary.source_repo},dst=/workspace,readonly",
+        f"--mount=type=bind,src={boundary.tools_bin},dst=/opt/fork-ops/bin,readonly",
+        boundary.image,
+        f"/opt/fork-ops/bin/{tool}",
+        *arguments,
     ]
 
 
@@ -1253,9 +1300,11 @@ def _prepare_source_candidate_container(
     if failed or image is None:
         return aggregate, None
     site_packages = environment / "lib" / f"python{python_minor}" / "site-packages"
+    tools_bin = environment / "bin"
     return aggregate, CandidateContainerBoundary(
         repo,
         site_packages,
+        tools_bin,
         image,
         dict(subprocess_env),
         container_user,
@@ -1678,11 +1727,10 @@ def _source_checks_in_boundary(
                 ["source", "tests", "validation_entrypoint"],
                 ["lint.repository_python"],
                 (
-                    _source_candidate_container_command(
+                    _source_candidate_tool_command(
                         candidate_boundary,
+                        "ruff",
                         [
-                            "-m",
-                            "ruff",
                             "check",
                             "--no-cache",
                             "scripts",
@@ -1854,10 +1902,7 @@ def _source_checks_in_boundary(
                 ["source", "tests"],
                 ["types.pyrefly_strict"],
                 (
-                    _source_candidate_container_command(
-                        candidate_boundary,
-                        ["-m", "pyrefly", "check"],
-                    )
+                    _source_candidate_tool_command(candidate_boundary, "pyrefly", ["check"])
                     if candidate_boundary is not None
                     else [*uv_run, "pyrefly", "check"]
                 ),
@@ -2177,7 +2222,9 @@ def _dependency_audit_matrix_check(
     normalized_advisories: list[dict[str, object]] = []
     provider_requests: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="fork-ops-dependency-audit-") as temp_dir:
-        with _minimal_subprocess_environment(Path(temp_dir)) as environment:
+        with _workspace_locked_subprocess_environment(
+            repo, Path(temp_dir)
+        ) as environment:
             for minor in SUPPORTED_PYTHON_MINORS:
                 check = _run_command(
                     f"dependency_audit:{minor}",
@@ -2187,9 +2234,7 @@ def _dependency_audit_matrix_check(
                         str(_trusted_uv_executable()),
                         "audit",
                         "--locked",
-                        "--frozen",
                         "--no-config",
-                        "--no-sources",
                         "--no-build",
                         "--default-index",
                         "https://pypi.org/simple",
@@ -2198,7 +2243,7 @@ def _dependency_audit_matrix_check(
                         "--keyring-provider",
                         "disabled",
                         "--service-url",
-                        "https://api.osv.dev/v1/querybatch",
+                        "https://api.osv.dev",
                         "--output-format",
                         "json",
                         "--python-platform",
@@ -3159,15 +3204,15 @@ def _isolated_build_backend_checks(
             ["build.wheel_and_sdist_once", "build.pep517_backend_isolated"],
             "Build backend was not executed because candidate isolation failed.",
         )
-    scratch_repo = temp_root / "candidate-scratch"
-    shutil.copytree(repo, scratch_repo)
-    _make_private_tree_group_writable(scratch_repo)
     original_artifact_mode = stat.S_IMODE(artifact_dir.lstat().st_mode)
     _make_private_tree_group_writable(artifact_dir)
     site_packages = environment / "lib" / f"python{python_minor}" / "site-packages"
     build_script = (
+        "import os, shutil; "
         "from pathlib import Path; "
         "from setuptools import build_meta; "
+        "shutil.copytree('/workspace', '/tmp/candidate'); "
+        "os.chdir('/tmp/candidate/plugins/fork-ops'); "
         "output=Path('/output'); "
         "build_meta.build_wheel(str(output)); "
         "build_meta.build_sdist(str(output))"
@@ -3179,8 +3224,8 @@ def _isolated_build_backend_checks(
             ["build.wheel_and_sdist_once", "build.pep517_backend_isolated"],
             [
                 *_candidate_container_base(user=_host_group_container_user()),
-                "--workdir=/workspace/plugins/fork-ops",
-                f"--mount=type=bind,src={scratch_repo},dst=/workspace",
+                "--workdir=/workspace",
+                f"--mount=type=bind,src={repo},dst=/workspace,readonly",
                 f"--mount=type=bind,src={site_packages},dst=/opt/fork-ops/site-packages,readonly",
                 f"--mount=type=bind,src={artifact_dir},dst=/output",
                 image,
@@ -4783,6 +4828,8 @@ def main(argv: list[str] | None = None) -> int:
                 bound_root_descriptor=candidate_descriptor,
             )
         )
+        if args.execution_boundary == "container":
+            _make_private_tree_group_readable(execution_repo)
         if args.mode == "locked-source":
             checks, scope_provenance = _source_checks(
                 execution_repo,

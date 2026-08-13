@@ -262,6 +262,14 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 check for check in build_evidence["checks"] if check["id"] == "build_distributions"
             )
             self.assertEqual(build_check["command"][0:2], ["docker", "run"])
+            build_workspace_mount = next(
+                argument
+                for argument in build_check["command"]
+                if "dst=/workspace" in argument
+            )
+            self.assertTrue(build_workspace_mount.endswith(",readonly"))
+            self.assertIn("shutil.copytree", build_check["command"][-1])
+            self.assertIn("/tmp/candidate", build_check["command"][-1])
 
             installed_output = fixture_root / "installed.json"
             installed = subprocess.run(
@@ -318,6 +326,28 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self.assertIn("--env=PYTHONSAFEPATH=1", command)
                 self.assertFalse(any("GITHUB" in argument for argument in command))
                 self.assertFalse(any("ACTIONS" in argument for argument in command))
+            source_commands = {
+                check["id"]: check["command"] for check in source_evidence["checks"]
+            }
+            for check_id in ("cli_surface_inventory", "workflow_catalog", "pytest"):
+                workspace_mount = next(
+                    argument
+                    for argument in source_commands[check_id]
+                    if "dst=/workspace" in argument
+                )
+                self.assertTrue(workspace_mount.endswith(",readonly"))
+            for check_id, tool in (("ruff", "ruff"), ("pyrefly_strict", "pyrefly")):
+                command = source_commands[check_id]
+                tools_mount = next(
+                    argument for argument in command if "dst=/opt/fork-ops/bin" in argument
+                )
+                self.assertTrue(tools_mount.endswith(",readonly"))
+                image_index = next(
+                    index
+                    for index, argument in enumerate(command)
+                    if argument.startswith("python:") and "@sha256:" in argument
+                )
+                self.assertEqual(command[image_index + 1], f"/opt/fork-ops/bin/{tool}")
 
     def test_hosted_locked_workspace_modes_keep_the_closed_source_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -731,6 +761,74 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                     self.assertEqual(includes_typing_extensions, minor in {"3.11", "3.12"})
+
+    def test_workflow_pinned_uv_osv_service_url_is_a_base_url(self) -> None:
+        uv = shutil.which("uv")
+        if uv is None:
+            self.skipTest("uv is not installed")
+        version = subprocess.run(
+            [uv, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if version.returncode != 0 or version.stdout.strip().split()[:2] != ["uv", "0.12.3"]:
+            self.skipTest("This integration regression requires workflow-pinned uv 0.12.3")
+
+        requested_paths: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                requested_paths.append(self.path)
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                response = json.dumps(
+                    {"results": [{} for _ in request.get("queries", [])]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host = str(server.server_address[0])
+            port = int(server.server_address[1])
+            completed = subprocess.run(
+                [
+                    uv,
+                    "audit",
+                    "--locked",
+                    "--no-config",
+                    "--no-build",
+                    "--service-url",
+                    f"http://{host}:{port}",
+                    "--output-format",
+                    "json",
+                    "--python-platform",
+                    "linux",
+                    "--python-version",
+                    "3.11",
+                ],
+                cwd=REPOSITORY_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(requested_paths, ["/v1/querybatch"])
 
     def test_child_failure_still_emits_terminal_aggregate_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3350,9 +3448,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
                         required = {{
                             "--locked",
-                            "--frozen",
                             "--no-config",
-                            "--no-sources",
                             "--no-build",
                             "--output-format",
                             "--python-platform",
@@ -3370,9 +3466,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         expected = [
                             "audit",
                             "--locked",
-                            "--frozen",
                             "--no-config",
-                            "--no-sources",
                             "--no-build",
                             "--default-index",
                             "https://pypi.org/simple",
@@ -3381,7 +3475,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                             "--keyring-provider",
                             "disabled",
                             "--service-url",
-                            "https://api.osv.dev/v1/querybatch",
+                            "https://api.osv.dev",
                             "--output-format",
                             "json",
                             "--python-platform",
@@ -3389,7 +3483,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                             "--python-version",
                             sys.argv[-1],
                         ]
-                        if len(sys.argv) != 21 or sys.argv[1:] != expected:
+                        if len(sys.argv) != 19 or sys.argv[1:] != expected:
                             print(
                                 f"unexpected fake uv audit argv: {{sys.argv[1:]!r}}",
                                 file=sys.stderr,
@@ -3684,6 +3778,23 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     )
                     (workspace / "uv.lock").write_text("version = 2\\n")
                     raise SystemExit(0)
+                if isolated_python[:1] in (
+                    ["/opt/fork-ops/bin/ruff"],
+                    ["/opt/fork-ops/bin/pyrefly"],
+                ):
+                    tools_mount = next(
+                        value for value in sys.argv if "dst=/opt/fork-ops/bin" in value
+                    )
+                    if not tools_mount.endswith(",readonly"):
+                        print("trusted tool binaries were writable", file=sys.stderr)
+                        raise SystemExit(98)
+                    workspace_mount = next(
+                        value for value in sys.argv if "dst=/workspace" in value
+                    )
+                    if not workspace_mount.endswith(",readonly"):
+                        print("candidate source was writable", file=sys.stderr)
+                        raise SystemExit(98)
+                    raise SystemExit(0)
                 if isolated_python[:4] != ["python", "-I", "-S", "-c"]:
                     print("candidate Python did not use isolated startup", file=sys.stderr)
                     raise SystemExit(98)
@@ -3744,10 +3855,42 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         raise SystemExit(98)
                     return source
 
+                def require_isolated_user_readable_mount(destination):
+                    source = mount_source(destination)
+                    user = next(
+                        value.split("=", 1)[1]
+                        for value in sys.argv
+                        if value.startswith("--user=")
+                    )
+                    _, group_id = (int(value) for value in user.split(":", 1))
+                    ownership = source.stat()
+                    mode = stat.S_IMODE(ownership.st_mode)
+                    if ownership.st_gid != group_id or not mode & stat.S_IRGRP:
+                        print(
+                            f"{{destination}} is not readable by the isolated container user",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(98)
+                    if source.is_dir() and not mode & stat.S_IXGRP:
+                        print(
+                            f"{{destination}} is not traversable by the isolated container user",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(98)
+                    return source
+
                 candidate_paths = [path for path in isolated_paths if path.startswith("/workspace")]
                 if candidate_paths and isolated_paths.index(candidate_paths[0]) == 0:
                     print("candidate source precedes trusted verifier tools", file=sys.stderr)
                     raise SystemExit(98)
+                if candidate_paths:
+                    workspace_mount = next(
+                        value for value in sys.argv if "dst=/workspace" in value
+                    )
+                    if not workspace_mount.endswith(",readonly"):
+                        print("candidate source was writable", file=sys.stderr)
+                        raise SystemExit(98)
+                    require_isolated_user_readable_mount("/workspace")
 
                 if python_args[:1] == ["-c"] and "platform.python_version_tuple" in python_args[1]:
                     print(json.dumps({{  # noqa: E501
@@ -3856,13 +3999,23 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                             "percent_covered": 100.0,
                         }},
                     }}, sort_keys=True))
-                elif python_args[:2] in (["-m", "ruff"], ["-m", "pyrefly"]):
-                    pass
                 elif (
                     python_args[:1] == ["-c"]
                     and "from setuptools import build_meta" in python_args[1]
                 ):
-                    require_isolated_user_writable_mount("/workspace")
+                    workspace = require_isolated_user_readable_mount("/workspace")
+                    workspace_mount = next(
+                        value for value in sys.argv if "dst=/workspace" in value
+                    )
+                    if not workspace_mount.endswith(",readonly"):
+                        print("build source was writable on the host", file=sys.stderr)
+                        raise SystemExit(98)
+                    if (
+                        "shutil.copytree" not in python_args[1]
+                        or "/tmp/candidate" not in python_args[1]
+                    ):
+                        print("build did not use a container-private source copy", file=sys.stderr)
+                        raise SystemExit(98)
                     output = require_isolated_user_writable_mount("/output")
                     (output / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
                     (output / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
