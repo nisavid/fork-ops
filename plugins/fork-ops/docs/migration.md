@@ -65,10 +65,24 @@ accounted as retained fork-local authority when path or content evidence marks
 that material as authoritative.
 
 Full-breadth workflow inventory reports `scan_profile`, `source_root_records`,
-`accounting_records`, and `follow_up_candidates`. Each discovered inventory
+`accounting_records`, `follow_up_candidates`, `complete`, and
+`scan_accounting`. Each discovered inventory
 entry maps to exactly one accounting record. Each unresolvable source root maps
 to an `unassessed` accounting record. Planned workflows, future Repo Ops
 candidates, and unassessed records map to follow-up candidates.
+
+All repository and operator-root reads are descriptor-relative, regular-file
+only, and do not follow symlinks. Scans enforce explicit limits: 32 roots,
+20,000 encountered entries, 4,000 files, depth 32, 1 MiB per file, 16 MiB in
+aggregate, 4,000 results, and 30 seconds. Input structures are also bounded by
+object depth, nodes, container items, per-string bytes, 4 MiB aggregate object
+bytes, and file bytes. Reaching a
+limit or encountering an unsafe or unstable path makes `complete` false and
+records a structured reason; inventory output never implies complete coverage
+after a partial scan.
+The elapsed-time budget assumes ordinary local filesystem semantics. Hostile or
+stalling mounted filesystems are unsupported and must be excluded from selected
+scan roots.
 
 Accounting statuses are:
 
@@ -197,8 +211,13 @@ generates the current plan internally.
 
 ```bash
 uv run --package fork-ops fork-ops migration execute --repo /path/to/fork
-uv run --package fork-ops fork-ops migration execute --plan /path/to/migration-plan.json
+uv run --package fork-ops fork-ops migration execute --repo /path/to/fork --plan /path/to/migration-plan.json
 ```
+
+Every mutating call requires an explicit non-empty selected repository. A plan's
+`repo_path` is only an exact assertion against that selection and never chooses
+the write target. Execution also requires `complete = true` with complete scan
+accounting, so removing an incomplete-scan blocker cannot enable a write.
 
 The current execution slice supports creating `.agents/fork-ops.toml` from the
 validated config proposal, preserving retained source materials, reporting the
@@ -209,6 +228,9 @@ preservation steps, retained authority, deferred removals, blockers,
 verification results, and narrative refusal context. It refuses malformed plans,
 plans with unresolved dry-run blockers, unsupported edit actions, unsafe target
 paths, and config content that fails parse or validation checks.
+Once a write occurs, any verification, blocker, or response-construction failure
+returns `applied_unverified`; every created edit is labeled the same way and the
+CLI exits nonzero.
 
 Migration outputs include a `narrative` object. The narrative is rendered from
 the structured output and names source paths, dispositions, blockers, retained

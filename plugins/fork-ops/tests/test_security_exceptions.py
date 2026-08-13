@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -168,6 +169,31 @@ def test_contract_hash_mismatch_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(SecurityExceptionContractError, match="embedded SHA-256"):
         load_security_exception_contract(altered)
+
+
+def test_contract_reader_rejects_symlink_fifo_and_oversize(tmp_path: Path) -> None:
+    contract_path = (
+        REPOSITORY_ROOT
+        / "plugins"
+        / "fork-ops"
+        / "src"
+        / "fork_ops"
+        / "security-exception-contract-1.0.json"
+    )
+    link = tmp_path / "contract-link.json"
+    link.symlink_to(contract_path)
+    with pytest.raises(SecurityExceptionContractError, match="unavailable"):
+        load_security_exception_contract(link)
+
+    fifo = tmp_path / "contract-fifo.json"
+    os.mkfifo(fifo)
+    with pytest.raises(SecurityExceptionContractError, match="unavailable"):
+        load_security_exception_contract(fifo)
+
+    oversized = tmp_path / "contract-large.json"
+    oversized.write_bytes(b"x" * (1_048_576 + 1))
+    with pytest.raises(SecurityExceptionContractError, match="unavailable"):
+        load_security_exception_contract(oversized)
 
 
 def test_contract_closes_kind_subject_pairs_and_all_v1_effects() -> None:

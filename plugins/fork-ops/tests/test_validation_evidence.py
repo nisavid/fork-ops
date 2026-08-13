@@ -44,6 +44,44 @@ MCP_TOOL_NAMES = [
 
 
 class ValidationEvidenceEntrypointTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "This test requires POSIX process groups.")
+    def test_bounded_process_caps_combined_output_and_terminates_pipe_holders(self) -> None:
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        run_bounded = namespace["_run_bounded_process"]
+        limit_error = namespace["SubprocessOutputLimitExceeded"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.assertRaises(limit_error):
+                run_bounded(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os,threading; "
+                        "threads=[threading.Thread(target=os.write,args=(fd,b'x'*70000)) "
+                        "for fd in (1,2)]; "
+                        "[t.start() for t in threads]; [t.join() for t in threads]",
+                    ],
+                    cwd=root,
+                    env={"PATH": os.defpath},
+                    timeout=2,
+                    max_output_bytes=100_000,
+                )
+            started = time.monotonic()
+            with self.assertRaises(limit_error):
+                run_bounded(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import subprocess,sys; "
+                        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])",
+                    ],
+                    cwd=root,
+                    env={"PATH": os.defpath},
+                    timeout=2,
+                    max_output_bytes=100_000,
+                )
+            self.assertLess(time.monotonic() - started, 2)
+
     def test_isolated_python_bootstrap_keeps_stdlib_and_trusted_tools_ahead_of_candidate(
         self,
     ) -> None:
@@ -153,10 +191,48 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 text=True,
                 env=env,
             )
-            self.assertEqual(source.returncode, 0, source.stderr)
+            self.assertEqual(
+                source.returncode,
+                0,
+                source.stderr + source_output.read_text(encoding="utf-8"),
+            )
             source_evidence = json.loads(source_output.read_text(encoding="utf-8"))
             self.assertEqual(source_evidence["execution_boundary"], "container")
             self.assertEqual(source_evidence["checks"][0]["id"], "candidate_isolation")
+
+            env.update(
+                {
+                    "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_WORKFLOW_REF": (
+                        "owner/repo/.github/workflows/validation.yml@refs/heads/main"
+                    ),
+                    "GITHUB_WORKFLOW_SHA": self._git_commit(repo),
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                }
+            )
+            fresh_output = fixture_root / "fresh-source.json"
+            fresh = subprocess.run(
+                [*common, "--mode", "fresh-source", "--output", str(fresh_output)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(
+                fresh.returncode,
+                0,
+                fresh.stderr + fresh_output.read_text(encoding="utf-8"),
+            )
+            fresh_evidence = json.loads(fresh_output.read_text(encoding="utf-8"))
+            resolver = fresh_evidence["checks"][0]
+            self.assertEqual(resolver["id"], "fresh_resolution")
+            self.assertEqual(
+                resolver["environment_policy"],
+                "networked_resolver_container_explicit_minimal",
+            )
+            self.assertIn("--network=bridge", resolver["command"])
+            self.assertNotIn("--network=none", resolver["command"])
 
             artifact_dir = fixture_root / "candidate"
             build_output = fixture_root / "build.json"
@@ -577,6 +653,182 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self._sha256(repo / "uv.lock"),
             )
 
+    def test_candidate_git_configuration_cannot_execute_host_fsmonitor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            sentinel = fixture_root / "candidate-fsmonitor-executed"
+            fsmonitor = fixture_root / "candidate-fsmonitor"
+            fsmonitor.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    from pathlib import Path
+
+                    Path({str(sentinel)!r}).write_text("executed", encoding="utf-8")
+                    print("builtin:fake")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fsmonitor.chmod(0o755)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "core.fsmonitor", str(fsmonitor)],
+                check=True,
+            )
+            fake_bin = self._create_fake_uv(fixture_root)
+            output_path = fixture_root / "validation-evidence.json"
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATION_ENTRYPOINT),
+                    "--mode",
+                    "locked-source",
+                    "--interpreter",
+                    sys.executable,
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(sentinel.exists(), "candidate fsmonitor executed on the host")
+
+    def test_fresh_source_never_executes_candidate_audit_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            sentinel = fixture_root / "candidate-audit-adapter-executed"
+            candidate_module = (
+                repo / "plugins" / "fork-ops" / "src" / "fork_ops" / "dependency_security.py"
+            )
+            candidate_module.write_text(
+                textwrap.dedent(
+                    f"""\
+                    from pathlib import Path
+
+                    Path({str(sentinel)!r}).write_text("executed", encoding="utf-8")
+
+                    class ForgedEvidence:
+                        def to_dict(self):
+                            return {{"status": "available", "advisories": []}}
+
+                    def collect_uv_audit_evidence(*args, **kwargs):
+                        return ForgedEvidence()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", str(candidate_module)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "malicious audit adapter"],
+                check=True,
+            )
+            fake_bin = self._create_fake_uv(fixture_root)
+            output_path = fixture_root / "validation-evidence.json"
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+            env.update(
+                {
+                    "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_WORKFLOW_REF": (
+                        "owner/repo/.github/workflows/validation.yml@refs/heads/main"
+                    ),
+                    "GITHUB_WORKFLOW_SHA": self._git_commit(repo),
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATION_ENTRYPOINT),
+                    "--mode",
+                    "fresh-source",
+                    "--interpreter",
+                    sys.executable,
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            evidence = json.loads(output_path.read_text(encoding="utf-8"))
+            audit = next(
+                check
+                for check in evidence["checks"]
+                if check["id"] == "dependency_audit_matrix"
+            )
+            self.assertEqual(audit["status"], "passed", completed.stderr)
+            self.assertFalse(sentinel.exists(), "candidate audit adapter executed on the host")
+            self.assertEqual(audit["evidence"]["provenance"]["source_observation"]["page_count"], 4)
+            self.assertEqual(len(audit["provider_requests"]), 4)
+
+    def test_fresh_source_rejects_candidate_network_sources_before_uv_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            (repo / "uv.toml").write_text(
+                'index-url = "http://169.254.169.254/latest/meta-data"\n',
+                encoding="utf-8",
+            )
+            sentinel = fixture_root / "uv-executed"
+            fake_bin = self._create_fake_uv(fixture_root, operation_sentinel=sentinel)
+            output_path = fixture_root / "validation-evidence.json"
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+            env.update(
+                {
+                    "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_WORKFLOW_REF": (
+                        "owner/repo/.github/workflows/validation.yml@refs/heads/main"
+                    ),
+                    "GITHUB_WORKFLOW_SHA": self._git_commit(repo),
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATION_ENTRYPOINT),
+                    "--mode",
+                    "fresh-source",
+                    "--interpreter",
+                    sys.executable,
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            evidence = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["checks"][0]["id"], "fresh_resolution")
+            self.assertIn("rejects candidate uv config", evidence["checks"][0]["stderr_tail"])
+            self.assertFalse(sentinel.exists(), "uv executed after unsafe source policy")
+
     def test_explicit_diff_base_checks_committed_candidate_range(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
@@ -793,7 +1045,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             repo = self._create_fixture_repository(fixture_root)
             large_source = repo / "large-source.bin"
             with large_source.open("wb") as source:
-                source.truncate(128 * 1024 * 1024)
+                source.truncate(16 * 1024 * 1024)
             fake_bin = self._create_fake_uv(fixture_root, delay_when="export")
             output_path = fixture_root / "validation-evidence.json"
             env = os.environ.copy()
@@ -939,6 +1191,8 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
             fake_bin = self._create_fake_uv(fixture_root)
+            selected_interpreter = fake_bin / "selected-python"
+            selected_interpreter.symlink_to(sys.executable)
             artifact_dir = fixture_root / "candidate"
             artifact_dir.mkdir()
             (artifact_dir / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
@@ -954,7 +1208,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     "--mode",
                     "installed",
                     "--interpreter",
-                    sys.executable,
+                    selected_interpreter.name,
                     "--repo",
                     str(repo),
                     "--artifact-dir",
@@ -971,6 +1225,12 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             evidence = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(evidence["outcome"], "passed")
+            resolved_interpreter = evidence["identity"]["interpreter"]["resolved"]
+            self.assertEqual(resolved_interpreter, str(Path(sys.executable).resolve()))
+            for check_id in ("clean_environment", "runtime_constraints"):
+                check = next(check for check in evidence["checks"] if check["id"] == check_id)
+                python_index = check["command"].index("--python") + 1
+                self.assertEqual(check["command"][python_index], resolved_interpreter)
             self.assertEqual(
                 [check["id"] for check in evidence["checks"]],
                 [
@@ -1717,49 +1977,123 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 changed_result["checks"][0]["stderr_tail"],
             )
 
-    @unittest.skipIf(os.name == "nt", "This test exercises POSIX byte filenames and symlinks.")
-    def test_source_snapshot_hashes_symlink_target_text_without_reading_target(self) -> None:
+    @unittest.skipIf(os.name == "nt", "This test exercises POSIX symlinks.")
+    def test_source_snapshot_rejects_symlinks_without_reading_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
             outside = fixture_root / "outside-secret"
             outside.write_bytes(b"first-secret")
             (repo / "outside-link").symlink_to(outside)
-            byte_name = os.fsdecode(b"non-utf8-\xff.txt")
-            descriptor = os.open(
-                os.path.join(os.fsencode(repo), os.fsencode(byte_name)),
-                os.O_CREAT,
-                0o600,
-            )
-            os.close(descriptor)
             fake_bin = self._create_fake_uv(fixture_root)
             env = os.environ.copy()
             env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+            output = fixture_root / "evidence.json"
 
-            first = self._run_fixture_build(repo, fixture_root / "first", env)
-            outside.write_bytes(b"second-secret")
-            second = self._run_fixture_build(repo, fixture_root / "second", env)
-            self.assertEqual(
-                self._source_snapshot_sha256(first),
-                self._source_snapshot_sha256(second),
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(VALIDATION_ENTRYPOINT),
+                    "--mode",
+                    "locked-source",
+                    "--interpreter",
+                    sys.executable,
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    str(output),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
             )
 
-            tracked = repo / "pyproject.toml"
-            tracked.chmod(0o755)
-            executable = self._run_fixture_build(repo, fixture_root / "executable", env)
-            self.assertNotEqual(
-                self._source_snapshot_sha256(second),
-                self._source_snapshot_sha256(executable),
-            )
-            tracked.chmod(0o644)
+            self.assertEqual(completed.returncode, 1)
+            evidence = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIn("rejects symlink", evidence["checks"][0]["stderr_tail"])
+            self.assertEqual(outside.read_bytes(), b"first-secret")
 
-            (repo / "outside-link").unlink()
-            (repo / "outside-link").symlink_to(fixture_root / "other-target")
-            third = self._run_fixture_build(repo, fixture_root / "third", env)
-            self.assertNotEqual(
-                self._source_snapshot_sha256(second),
-                self._source_snapshot_sha256(third),
-            )
+    @unittest.skipIf(os.name == "nt", "This test exercises POSIX dirfd semantics.")
+    def test_source_snapshot_rejects_a_parent_swap_to_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            nested = repo / "nested"
+            nested.mkdir()
+            (nested / "source.py").write_bytes(b"candidate")
+            outside = fixture_root / "outside"
+            outside.mkdir()
+            (outside / "source.py").write_bytes(b"external!")
+            namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+            snapshotter = namespace["_verified_execution_snapshot"]
+            original_open = os.open
+            swapped = False
+
+            def swapping_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                if (
+                    not swapped
+                    and path == "nested"
+                    and dir_fd is not None
+                    and flags & os.O_DIRECTORY
+                ):
+                    displaced = repo / "nested-original"
+                    nested.rename(displaced)
+                    nested.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(os, "open", side_effect=swapping_open),
+                self.assertRaises(OSError),
+                snapshotter(repo, (repo / "uv.lock").read_bytes(), []),
+            ):
+                self.fail("a swapped parent directory must fail before yielding")
+            self.assertTrue(swapped)
+
+    @unittest.skipIf(os.name == "nt", "This test exercises POSIX dirfd semantics.")
+    def test_candidate_root_binding_spans_identity_snapshot_and_diff_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            repo = self._create_fixture_repository(fixture_root)
+            namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+            bind = namespace["_bind_candidate_repository"]
+            verify = namespace["_verify_candidate_repository_binding"]
+            snapshotter = namespace["_verified_execution_snapshot"]
+            git_commit = namespace["_git_commit"]
+            descriptor, bound_repo, identity = bind(repo)
+            original_commit = git_commit(bound_repo)
+            displaced = fixture_root / "displaced-repo"
+            try:
+                with snapshotter(
+                    repo,
+                    (bound_repo / "uv.lock").read_bytes(),
+                    [],
+                    bound_root_descriptor=descriptor,
+                ) as (snapshot, _digest):
+                    repo.rename(displaced)
+                    replacement = self._create_fixture_repository(fixture_root)
+                    (replacement / "replacement.txt").write_text("replacement\n")
+                    subprocess.run(["git", "-C", str(replacement), "add", "."], check=True)
+                    subprocess.run(
+                        ["git", "-C", str(replacement), "commit", "-qm", "replacement"],
+                        check=True,
+                    )
+                    self.assertEqual(repo, replacement)
+                    self.assertEqual(git_commit(bound_repo), original_commit)
+                    self.assertNotEqual(self._git_commit(replacement), original_commit)
+                    self.assertTrue((snapshot / "pyproject.toml").is_file())
+                    with self.assertRaisesRegex(RuntimeError, "root changed"):
+                        verify(repo, descriptor, identity)
+            finally:
+                os.close(descriptor)
 
     def test_validation_rejects_lock_symlinks_before_hashing_or_running_uv(self) -> None:
         for target_kind in ("outside", "in-tree"):
@@ -1880,7 +2214,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse((outside_directory / output_path.name).exists())
 
-    def test_uv_consumes_a_verified_snapshot_instead_of_the_checkout_tree(self) -> None:
+    def test_uv_never_receives_a_symlink_bearing_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
@@ -1914,9 +2248,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 env=env,
             )
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.returncode, 1, completed.stderr)
             evidence = json.loads(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(evidence["outcome"], "passed")
+            self.assertEqual(evidence["outcome"], "failed")
+            self.assertIn("rejects symlink", evidence["checks"][0]["stderr_tail"])
 
     def test_workflows_expose_one_pinned_validation_contract(self) -> None:
         workflow_paths = (
@@ -2135,7 +2470,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         packaged_schema_dir.mkdir(parents=True)
         tests_dir.mkdir(parents=True)
         (repo / "scripts").mkdir()
-        (repo / "pyproject.toml").write_text("[project]\nname = 'fixture'\n", encoding="utf-8")
+        (repo / "pyproject.toml").write_bytes((REPOSITORY_ROOT / "pyproject.toml").read_bytes())
+        (repo / "plugins" / "fork-ops" / "pyproject.toml").write_bytes(
+            (REPOSITORY_ROOT / "plugins" / "fork-ops" / "pyproject.toml").read_bytes()
+        )
         (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
         schema = (
             REPOSITORY_ROOT / "plugins" / "fork-ops" / "schema" / "fork-ops.schema.json"
@@ -2248,6 +2586,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         extra_artifact: bool = False,
         assert_clean_environment: bool = False,
         reject_candidate_repo_cwd: bool = False,
+        operation_sentinel: Path | None = None,
     ) -> Path:
         fake_bin = fixture_root / "bin"
         fake_bin.mkdir()
@@ -2258,6 +2597,17 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 #!{sys.executable}
                 import sys
                 import time
+
+                operation_sentinel = {
+                    str(operation_sentinel) if operation_sentinel is not None else ""!r
+                }
+                if operation_sentinel and sys.argv[1:] != ["--version"]:
+                    from pathlib import Path
+
+                    Path(operation_sentinel).write_text(
+                        "executed",
+                        encoding="utf-8",
+                    )
 
                 if {reject_candidate_repo_cwd!r} and sys.argv[1:] != ["--version"]:
                     from pathlib import Path
@@ -2332,9 +2682,20 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         len(lock_args) == 4
                         and lock_args[:3] == ["lock", "--check", "--python"]
                     ) or (
-                        len(lock_args) == 5
-                        and lock_args[:4]
-                        == ["lock", "--upgrade", "--refresh", "--python"]
+                        len(lock_args) == 10
+                        and lock_args[:10]
+                        == [
+                            "lock",
+                            "--upgrade",
+                            "--refresh",
+                            "--no-config",
+                            "--no-sources",
+                            "--no-build",
+                            "--default-index",
+                            "https://pypi.org/simple",
+                            "--python",
+                            lock_args[-1],
+                        ]
                     )
                     if not valid_lock:
                         print(
@@ -2429,6 +2790,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     python_value = export_args[export_args.index("--python") + 1]
                     if python_value not in {{
                         sys.executable,
+                        str(Path(sys.executable).resolve()),
                         "3.11",
                         "3.12",
                         "3.13",
@@ -2669,6 +3031,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
                         required = {{
                             "--locked",
+                            "--frozen",
+                            "--no-config",
+                            "--no-sources",
+                            "--no-build",
                             "--output-format",
                             "--python-platform",
                             "--python-version",
@@ -2685,6 +3051,18 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         expected = [
                             "audit",
                             "--locked",
+                            "--frozen",
+                            "--no-config",
+                            "--no-sources",
+                            "--no-build",
+                            "--default-index",
+                            "https://pypi.org/simple",
+                            "--index-strategy",
+                            "first-index",
+                            "--keyring-provider",
+                            "disabled",
+                            "--service-url",
+                            "https://api.osv.dev/v1/querybatch",
                             "--output-format",
                             "json",
                             "--python-platform",
@@ -2692,7 +3070,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                             "--python-version",
                             sys.argv[-1],
                         ]
-                        if len(sys.argv) != 9 or sys.argv[1:] != expected:
+                        if len(sys.argv) != 21 or sys.argv[1:] != expected:
                             print(
                                 f"unexpected fake uv audit argv: {{sys.argv[1:]!r}}",
                                 file=sys.stderr,
@@ -2949,6 +3327,32 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if value.startswith("python:") and "@sha256:" in value
                 )
                 isolated_python = sys.argv[image_index + 1 :]
+                if isolated_python[:1] == ["/opt/fork-ops/uv"]:
+                    resolver_flags = {{
+                        "--read-only",
+                        "--cap-drop=ALL",
+                        "--security-opt=no-new-privileges",
+                        "--network=bridge",
+                        "--env=UV_NO_CONFIG=1",
+                        "--env=UV_DEFAULT_INDEX=https://pypi.org/simple",
+                    }}
+                    if not resolver_flags.issubset(sys.argv) or "--network=none" in sys.argv:
+                        print("fresh resolver container boundary is incomplete", file=sys.stderr)
+                        raise SystemExit(98)
+                    workspace_mount = next(
+                        value for value in sys.argv if "dst=/workspace" in value
+                    )
+                    uv_mount = next(
+                        value for value in sys.argv if "dst=/opt/fork-ops/uv" in value
+                    )
+                    if not uv_mount.endswith(",readonly"):
+                        print("trusted uv mount was writable", file=sys.stderr)
+                        raise SystemExit(98)
+                    workspace = pathlib.Path(
+                        workspace_mount.split("src=", 1)[1].split(",dst=", 1)[0]
+                    )
+                    (workspace / "uv.lock").write_text("version = 2\\n")
+                    raise SystemExit(0)
                 if isolated_python[:4] != ["python", "-I", "-S", "-c"]:
                     print("candidate Python did not use isolated startup", file=sys.stderr)
                     raise SystemExit(98)

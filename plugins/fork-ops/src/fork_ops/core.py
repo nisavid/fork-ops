@@ -8,17 +8,20 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shlex
+import signal as process_signal
 import stat
 import subprocess
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from time import monotonic
+from typing import IO, Any, cast
+from urllib.parse import SplitResult, urlparse, urlsplit, urlunsplit
 
 from .schema import CAPABILITY_LEVELS, CONFIG_SCHEMA, Diagnostic, schema_diagnostics
 from .workflow_catalog import WorkflowContract, workflow_contracts
@@ -55,6 +58,82 @@ PLUGIN_HEALTH_STATUS_VALUES = {
 }
 PLUGIN_HEALTH_CHECK_STATUSES = {"ready", "failed", "unavailable", "uninspectable"}
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
+
+# All limits are part of the public operation contract. Equality is allowed; the
+# first byte, item, level, or instant beyond a limit fails or marks a scan incomplete.
+MAX_SCAN_ROOTS = 32
+MAX_SCAN_ENTRIES = 20_000
+MAX_SCAN_FILES = 4_000
+MAX_SCAN_DEPTH = 32
+MAX_FILE_BYTES = 1_048_576
+MAX_TOTAL_READ_BYTES = 16_777_216
+MAX_RESULT_ITEMS = 4_000
+MAX_OBJECT_NODES = 50_000
+MAX_OBJECT_DEPTH = 64
+MAX_CONTAINER_ITEMS = 10_000
+MAX_STRING_BYTES = 1_048_576
+MAX_OBJECT_BYTES = 4_194_304
+MAX_PATH_BYTES = 4_096
+MAX_SUBPROCESS_STREAM_BYTES = 1_048_576
+MAX_SUBPROCESS_OUTPUT_BYTES = 2_097_152
+MAX_OPERATION_SECONDS = 30.0
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass
+class _OperationBudget:
+    started_at: float = field(default_factory=monotonic)
+    root_count: int = 0
+    entry_count: int = 0
+    file_count: int = 0
+    byte_count: int = 0
+    result_count: int = 0
+    incomplete_reasons: list[dict[str, str]] = field(default_factory=list)
+
+    def mark_incomplete(self, code: str, subject: str = "") -> None:
+        reason = {"code": code}
+        if subject:
+            reason["subject"] = subject
+        if reason not in self.incomplete_reasons:
+            self.incomplete_reasons.append(reason)
+
+    def check_time(self) -> bool:
+        if monotonic() - self.started_at <= MAX_OPERATION_SECONDS:
+            return True
+        self.mark_incomplete("limit.elapsed_time")
+        return False
+
+    def accounting(self) -> dict[str, Any]:
+        return {
+            "complete": not self.incomplete_reasons,
+            "limit_reached": bool(self.incomplete_reasons),
+            "limits": {
+                "roots": MAX_SCAN_ROOTS,
+                "entries": MAX_SCAN_ENTRIES,
+                "files": MAX_SCAN_FILES,
+                "depth": MAX_SCAN_DEPTH,
+                "file_bytes": MAX_FILE_BYTES,
+                "aggregate_bytes": MAX_TOTAL_READ_BYTES,
+                "results": MAX_RESULT_ITEMS,
+                "object_nodes": MAX_OBJECT_NODES,
+                "object_depth": MAX_OBJECT_DEPTH,
+                "container_items": MAX_CONTAINER_ITEMS,
+                "string_bytes": MAX_STRING_BYTES,
+                "object_bytes": MAX_OBJECT_BYTES,
+                "path_bytes": MAX_PATH_BYTES,
+                "subprocess_stream_bytes": MAX_SUBPROCESS_STREAM_BYTES,
+                "subprocess_output_bytes": MAX_SUBPROCESS_OUTPUT_BYTES,
+                "elapsed_seconds": MAX_OPERATION_SECONDS,
+            },
+            "observed": {
+                "roots": self.root_count,
+                "entries": self.entry_count,
+                "files": self.file_count,
+                "bytes": self.byte_count,
+                "results": self.result_count,
+            },
+            "incomplete_reasons": list(self.incomplete_reasons),
+        }
 
 
 @dataclass(frozen=True)
@@ -267,27 +346,429 @@ class ForkOpsError(RuntimeError):
     """Base error for expected Fork Ops failures."""
 
 
+class _BoundedReadError(ForkOpsError):
+    """A root-bound file read could not be completed safely."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _require_explicit_repository_path(repo_path: str | Path | None) -> str | Path:
+    if not isinstance(repo_path, str | Path) or not str(repo_path).strip():
+        raise ForkOpsError("Mutation requires an explicit non-empty repository path.")
+    return repo_path
+
+
+def _validate_bounded_object(value: Any, *, label: str) -> None:
+    """Reject structures that cannot be safely copied, validated, or serialized."""
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    seen_containers: set[int] = set()
+    node_count = 0
+    object_bytes = 0
+    while pending:
+        item, depth = pending.pop()
+        node_count += 1
+        if node_count > MAX_OBJECT_NODES:
+            raise ForkOpsError(f"{label} exceeds the object node limit.")
+        if depth > MAX_OBJECT_DEPTH:
+            raise ForkOpsError(f"{label} exceeds the object nesting limit.")
+        if isinstance(item, str):
+            encoded_bytes = len(item.encode("utf-8"))
+            if encoded_bytes > MAX_STRING_BYTES:
+                raise ForkOpsError(f"{label} contains a string larger than the limit.")
+            object_bytes += encoded_bytes
+            if object_bytes > MAX_OBJECT_BYTES:
+                raise ForkOpsError(f"{label} exceeds the aggregate object byte limit.")
+            continue
+        if item is None or isinstance(item, bool | float):
+            continue
+        if isinstance(item, datetime | date | time):
+            continue
+        if isinstance(item, int):
+            if item.bit_length() > MAX_STRING_BYTES * 8:
+                raise ForkOpsError(f"{label} contains an integer larger than the limit.")
+            continue
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ForkOpsError(f"{label} contains a cyclic or aliased container.")
+            seen_containers.add(identity)
+            if len(item) > MAX_CONTAINER_ITEMS:
+                raise ForkOpsError(f"{label} exceeds the container item limit.")
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ForkOpsError(f"{label} object keys must be strings.")
+                pending.append((child, depth + 1))
+                pending.append((key, depth + 1))
+            continue
+        if isinstance(item, _JSON_SEQUENCE_TYPES):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ForkOpsError(f"{label} contains a cyclic or aliased container.")
+            seen_containers.add(identity)
+            if len(item) > MAX_CONTAINER_ITEMS:
+                raise ForkOpsError(f"{label} exceeds the container item limit.")
+            pending.extend((child, depth + 1) for child in item)
+            continue
+        raise ForkOpsError(f"{label} contains unsupported value type {type(item).__name__}.")
+
+
+def _relative_path_parts(relative_path: str | Path) -> tuple[str, ...]:
+    path = Path(relative_path)
+    if path.is_absolute() or not path.parts:
+        raise _BoundedReadError("path.invalid", "Read path must be non-empty and relative.")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise _BoundedReadError("path.invalid", "Read path contains an unsafe component.")
+    if len(path.parts) > MAX_SCAN_DEPTH:
+        raise _BoundedReadError("limit.depth", "Read path exceeds the traversal depth limit.")
+    if len(os.fsencode(path.as_posix())) > MAX_PATH_BYTES:
+        raise _BoundedReadError("limit.path_bytes", "Read path exceeds the byte limit.")
+    return path.parts
+
+
+def _read_regular_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    budget: _OperationBudget | None = None,
+) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise _BoundedReadError("read.open_failed", "Regular file could not be opened.") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise _BoundedReadError("read.special_file", "Read target is not a regular file.")
+        if budget is not None:
+            budget.file_count += 1
+            if budget.file_count > MAX_SCAN_FILES:
+                raise _BoundedReadError("limit.files", "File count exceeds the scan limit.")
+        content = bytearray()
+        while True:
+            if budget is not None and not budget.check_time():
+                raise _BoundedReadError("limit.elapsed_time", "Read elapsed-time limit reached.")
+            chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if budget is not None:
+                budget.byte_count += len(chunk)
+            if len(content) > MAX_FILE_BYTES:
+                raise _BoundedReadError("limit.file_bytes", "File exceeds the byte limit.")
+            if budget is not None and budget.byte_count > MAX_TOTAL_READ_BYTES:
+                raise _BoundedReadError(
+                    "limit.aggregate_bytes",
+                    "Aggregate read bytes exceed the scan limit.",
+                )
+        after = os.fstat(descriptor)
+        identity_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(getattr(before, field) != getattr(after, field) for field in identity_fields):
+            raise _BoundedReadError("read.changed", "File changed while it was being read.")
+        if after.st_size != len(content):
+            raise _BoundedReadError("read.changed", "File size changed while it was being read.")
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def _read_bound_regular_file(
+    root: _BoundRepository,
+    relative_path: str | Path,
+    *,
+    budget: _OperationBudget | None = None,
+) -> bytes:
+    parts = _relative_path_parts(relative_path)
+    parent_descriptor = os.dup(root.descriptor)
+    try:
+        for component in parts[:-1]:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            try:
+                next_descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+            except OSError as exc:
+                raise _BoundedReadError(
+                    "read.parent_open_failed",
+                    "A read parent directory could not be opened.",
+                ) from exc
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+            parent_stat = os.fstat(parent_descriptor)
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise _BoundedReadError(
+                    "read.parent_not_directory",
+                    "A read parent is not a directory.",
+                )
+        return _read_regular_at(parent_descriptor, parts[-1], budget=budget)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _bound_lstat(root: _BoundRepository, relative_path: str | Path) -> os.stat_result:
+    parts = _relative_path_parts(relative_path)
+    parent_descriptor = os.dup(root.descriptor)
+    try:
+        for component in parts[:-1]:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            next_descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _bound_path_kind(root_path: str | Path, relative_path: str | Path) -> str:
+    """Return lexical, descriptor-bound metadata without following repository links."""
+    lexical_root = Path(os.path.abspath(os.path.expanduser(str(root_path))))
+    try:
+        bound_root = _bind_repository(lexical_root)
+    except OSError:
+        return "uninspectable"
+    kind = "uninspectable"
+    try:
+        try:
+            path_stat = (
+                os.fstat(bound_root.descriptor)
+                if Path(relative_path) == Path(".")
+                else _bound_lstat(bound_root, relative_path)
+            )
+        except FileNotFoundError:
+            kind = "missing"
+        except OSError:
+            kind = "uninspectable"
+        else:
+            mode = path_stat.st_mode
+            if stat.S_ISREG(mode):
+                kind = "regular"
+            elif stat.S_ISDIR(mode):
+                kind = "directory"
+            elif stat.S_ISLNK(mode):
+                kind = "symlink"
+            else:
+                kind = "special"
+        if not _repository_path_has_identity(bound_root):
+            kind = "uninspectable"
+    finally:
+        try:
+            bound_root.close()
+        except OSError:
+            kind = "uninspectable"
+    return kind
+
+
+def _lexical_path_kind(path: str | Path) -> str:
+    lexical_path = Path(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        path_stat = os.stat(lexical_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "uninspectable"
+    mode = path_stat.st_mode
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "special"
+
+
+def _open_bound_directory(
+    root: _BoundRepository,
+    relative_path: str | Path,
+) -> int:
+    if Path(relative_path) == Path("."):
+        return os.dup(root.descriptor)
+    parts = _relative_path_parts(relative_path)
+    descriptor = os.dup(root.descriptor)
+    try:
+        for component in parts:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _scan_bound_directory(
+    root: _BoundRepository,
+    relative_directory: Path,
+    *,
+    budget: _OperationBudget,
+    suffixes: set[str],
+    skip_dirs: set[str],
+    depth: int,
+    seen_directories: set[tuple[int, int]],
+) -> Iterable[Path]:
+    if depth > MAX_SCAN_DEPTH:
+        budget.mark_incomplete("limit.depth", relative_directory.as_posix())
+        return
+    try:
+        descriptor = _open_bound_directory(root, relative_directory)
+    except OSError:
+        budget.mark_incomplete("scan.directory_open_failed", relative_directory.as_posix())
+        return
+    try:
+        directory_stat = os.fstat(descriptor)
+        identity = (directory_stat.st_dev, directory_stat.st_ino)
+        if identity in seen_directories:
+            return
+        seen_directories.add(identity)
+        try:
+            iterator = os.scandir(descriptor)
+        except OSError:
+            budget.mark_incomplete("scan.directory_read_failed", relative_directory.as_posix())
+            return
+        with iterator:
+            for entry in iterator:
+                budget.entry_count += 1
+                subject = (relative_directory / entry.name).as_posix()
+                if budget.entry_count > MAX_SCAN_ENTRIES:
+                    budget.mark_incomplete("limit.entries", subject)
+                    return
+                if not budget.check_time():
+                    return
+                if len(os.fsencode(entry.name)) > MAX_PATH_BYTES or len(
+                    os.fsencode(subject)
+                ) > MAX_PATH_BYTES:
+                    budget.mark_incomplete("limit.path_bytes", subject)
+                    continue
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    budget.mark_incomplete("scan.entry_stat_failed", subject)
+                    continue
+                mode = entry_stat.st_mode
+                if stat.S_ISLNK(mode):
+                    budget.mark_incomplete("scan.symlink_rejected", subject)
+                    continue
+                if stat.S_ISDIR(mode):
+                    if entry.name in skip_dirs:
+                        continue
+                    if entry.name in {"pkg", "src"}:
+                        try:
+                            package_marker = os.stat(
+                                "PKGBUILD",
+                                dir_fd=descriptor,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            package_marker = None
+                        if package_marker is not None and stat.S_ISREG(package_marker.st_mode):
+                            continue
+                    yield from _scan_bound_directory(
+                        root,
+                        relative_directory / entry.name,
+                        budget=budget,
+                        suffixes=suffixes,
+                        skip_dirs=skip_dirs,
+                        depth=depth + 1,
+                        seen_directories=seen_directories,
+                    )
+                    if budget.incomplete_reasons and any(
+                        reason["code"].startswith("limit.")
+                        for reason in budget.incomplete_reasons
+                    ):
+                        return
+                    continue
+                if stat.S_ISREG(mode):
+                    if Path(entry.name).suffix.lower() in suffixes:
+                        yield relative_directory / entry.name
+                    continue
+                budget.mark_incomplete("scan.special_file_rejected", subject)
+    finally:
+        os.close(descriptor)
+
+
+def _read_file_within_root(
+    root_path: str | Path,
+    relative_path: str | Path,
+    *,
+    budget: _OperationBudget | None = None,
+) -> bytes:
+    lexical_root = Path(os.path.abspath(os.path.expanduser(str(root_path))))
+    try:
+        bound_root = _bind_repository(lexical_root)
+    except OSError as exc:
+        raise _BoundedReadError("read.root_open_failed", "Read root could not be bound.") from exc
+    try:
+        content = _read_bound_regular_file(bound_root, relative_path, budget=budget)
+        if not _repository_path_has_identity(bound_root):
+            raise _BoundedReadError("read.root_changed", "Read root changed during the read.")
+        return content
+    finally:
+        bound_root.close()
+
+
+def _read_absolute_regular_file(path: str | Path) -> bytes:
+    absolute_path = Path(os.path.abspath(os.path.expanduser(str(path))))
+    anchor = Path(absolute_path.anchor)
+    return _read_file_within_root(anchor, absolute_path.relative_to(anchor))
+
+
 def find_config_path(repo_path: str | Path = ".") -> Path:
-    return Path(repo_path).expanduser().resolve() / CONFIG_RELATIVE_PATH
+    return Path(os.path.abspath(os.path.expanduser(str(repo_path)))) / CONFIG_RELATIVE_PATH
 
 
 def load_raw_config(repo_path: str | Path = ".", config_path: str | Path | None = None) -> str:
-    path = Path(config_path).expanduser().resolve() if config_path else find_config_path(repo_path)
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    path = (
+        Path(os.path.abspath(os.path.expanduser(str(config_path))))
+        if config_path
+        else repo / CONFIG_RELATIVE_PATH
+    )
     try:
-        return path.read_text()
-    except FileNotFoundError as exc:
-        raise ForkOpsError(f"Fork Ops config not found: {path}") from exc
-    except OSError as exc:
-        raise ForkOpsError(f"Fork Ops config read failed: {path}: {exc}") from exc
+        relative_path = path.relative_to(repo)
+    except ValueError as exc:
+        raise ForkOpsError(
+            "Fork Ops config path must stay inside the selected repository."
+        ) from exc
+    try:
+        raw = _read_file_within_root(repo, relative_path)
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ForkOpsError("Fork Ops config is not valid UTF-8 text.") from exc
+    except _BoundedReadError as exc:
+        raise ForkOpsError(f"Fork Ops config read failed ({exc.code}).") from exc
 
 
 def parse_config_text(raw: str) -> dict[str, Any]:
+    if len(raw.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ForkOpsError("Fork Ops config exceeds the file byte limit.")
     try:
         parsed = tomllib.loads(raw)
     except tomllib.TOMLDecodeError as exc:
         raise ForkOpsError(f"Fork Ops config TOML parse failed: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ForkOpsError("Fork Ops config must parse to a TOML table.")
+    _validate_bounded_object(parsed, label="Fork Ops config")
     return parsed
 
 
@@ -299,6 +780,7 @@ def load_config(
 
 
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
+    _validate_bounded_object(config, label="Fork Ops config")
     normalized = copy.deepcopy(config)
     repository = normalized.setdefault("repository", {})
     if isinstance(repository, dict) and repository.get("owner") and repository.get("name"):
@@ -385,16 +867,16 @@ def build_plugin_health_report(
 
 def _plugin_root(plugin_root: str | Path | None) -> Path:
     if plugin_root is not None:
-        return Path(plugin_root).expanduser().resolve()
+        return Path(os.path.abspath(os.path.expanduser(str(plugin_root))))
     return Path(__file__).resolve().parents[2]
 
 
 def _plugin_repo_root(plugin_root: Path, repo_root: str | Path | None) -> Path:
     if repo_root is not None:
-        return Path(repo_root).expanduser().resolve()
+        return Path(os.path.abspath(os.path.expanduser(str(repo_root))))
     if plugin_root.parent.name == "plugins":
-        return plugin_root.parent.parent.resolve()
-    return plugin_root.parent.resolve()
+        return plugin_root.parent.parent
+    return plugin_root.parent
 
 
 def _health_check(
@@ -420,7 +902,8 @@ def _health_check(
 
 def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, Any]:
     marketplace_path = repo_root / ".agents/plugins/marketplace.json"
-    if not marketplace_path.exists():
+    marketplace_kind = _bound_path_kind(repo_root, Path(".agents/plugins/marketplace.json"))
+    if marketplace_kind == "missing":
         return _health_check(
             "plugin_registration",
             "Plugin registration",
@@ -432,8 +915,22 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
                 "Pass --repo-root if the plugin marketplace metadata lives outside this checkout.",
             ),
         )
+    if marketplace_kind != "regular":
+        return _health_check(
+            "plugin_registration",
+            "Plugin registration",
+            "uninspectable",
+            "Plugin marketplace metadata could not be inspected safely.",
+            evidence={"path": str(marketplace_path), "path_kind": marketplace_kind},
+            next_steps=("Check the selected repository root and marketplace file type.",),
+        )
     try:
-        marketplace = json.loads(marketplace_path.read_text())
+        marketplace = json.loads(
+            _read_file_within_root(
+                repo_root,
+                Path(".agents/plugins/marketplace.json"),
+            ).decode("utf-8")
+        )
     except UnicodeDecodeError as exc:
         return _health_check(
             "plugin_registration",
@@ -443,7 +940,7 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
             evidence={"path": str(marketplace_path), "error": str(exc)},
             next_steps=("Repair .agents/plugins/marketplace.json text encoding.",),
         )
-    except OSError as exc:
+    except (OSError, _BoundedReadError) as exc:
         return _health_check(
             "plugin_registration",
             "Plugin registration",
@@ -550,7 +1047,8 @@ def _plugin_registration_check(plugin_root: Path, repo_root: Path) -> dict[str, 
 
 def _skill_discovery_check(plugin_root: Path) -> dict[str, Any]:
     skill_path = plugin_root / "skills/fork-ops/SKILL.md"
-    if not skill_path.exists():
+    skill_kind = _bound_path_kind(plugin_root, Path("skills/fork-ops/SKILL.md"))
+    if skill_kind == "missing":
         return _health_check(
             "skill_discovery",
             "Skill discovery",
@@ -559,8 +1057,20 @@ def _skill_discovery_check(plugin_root: Path) -> dict[str, Any]:
             evidence={"path": str(skill_path)},
             next_steps=("Restore plugins/fork-ops/skills/fork-ops/SKILL.md.",),
         )
+    if skill_kind != "regular":
+        return _health_check(
+            "skill_discovery",
+            "Skill discovery",
+            "uninspectable",
+            "Fork Ops skill file could not be inspected safely.",
+            evidence={"path": str(skill_path), "path_kind": skill_kind},
+            next_steps=("Check the selected plugin root and skill file type.",),
+        )
     try:
-        skill_text = skill_path.read_text()
+        skill_text = _read_file_within_root(
+            plugin_root,
+            Path("skills/fork-ops/SKILL.md"),
+        ).decode("utf-8")
     except UnicodeDecodeError as exc:
         return _health_check(
             "skill_discovery",
@@ -570,7 +1080,7 @@ def _skill_discovery_check(plugin_root: Path) -> dict[str, Any]:
             evidence={"path": str(skill_path), "error": str(exc)},
             next_steps=("Repair plugins/fork-ops/skills/fork-ops/SKILL.md text encoding.",),
         )
-    except OSError as exc:
+    except (OSError, _BoundedReadError) as exc:
         return _health_check(
             "skill_discovery",
             "Skill discovery",
@@ -674,7 +1184,8 @@ def _mcp_config_resolution_check(
     plugin_root: Path,
 ) -> dict[str, Any]:
     mcp_config_path = plugin_root / ".mcp.json"
-    if not mcp_config_path.exists():
+    mcp_config_kind = _bound_path_kind(plugin_root, Path(".mcp.json"))
+    if mcp_config_kind == "missing":
         return _health_check(
             "mcp_config_resolution",
             "MCP config resolution",
@@ -683,8 +1194,19 @@ def _mcp_config_resolution_check(
             evidence={"path": str(mcp_config_path)},
             next_steps=("Restore plugins/fork-ops/.mcp.json or configure the MCP server.",),
         )
+    if mcp_config_kind != "regular":
+        return _health_check(
+            "mcp_config_resolution",
+            "MCP config resolution",
+            "uninspectable",
+            "Fork Ops MCP config could not be inspected safely.",
+            evidence={"path": str(mcp_config_path), "path_kind": mcp_config_kind},
+            next_steps=("Check the selected plugin root and MCP config file type.",),
+        )
     try:
-        mcp_config = json.loads(mcp_config_path.read_text())
+        mcp_config = json.loads(
+            _read_file_within_root(plugin_root, Path(".mcp.json")).decode("utf-8")
+        )
     except UnicodeDecodeError as exc:
         return _health_check(
             "mcp_config_resolution",
@@ -694,7 +1216,7 @@ def _mcp_config_resolution_check(
             evidence={"path": str(mcp_config_path), "error": str(exc)},
             next_steps=("Repair plugins/fork-ops/.mcp.json text encoding.",),
         )
-    except OSError as exc:
+    except (OSError, _BoundedReadError) as exc:
         return _health_check(
             "mcp_config_resolution",
             "MCP config resolution",
@@ -1034,25 +1556,66 @@ def _default_command_runner(
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
-            command,
-            124,
-            _short_output(exc.stdout),
-            _short_output(exc.stderr) or str(exc),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
     except OSError as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        if stream is not None:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+    deadline = monotonic() + min(max(timeout, 0.0), MAX_OPERATION_SECONDS)
+    failure = ""
+    try:
+        while process.poll() is None or selector.get_map():
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                failure = "subprocess wall-time limit reached"
+                break
+            events = selector.select(min(remaining, 0.1)) if selector.get_map() else []
+            for key, _ in events:
+                stream = cast(IO[Any], key.fileobj)
+                try:
+                    chunk = os.read(stream.fileno(), _READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                streams[stream].extend(chunk)
+                stdout_size = len(streams[process.stdout]) if process.stdout is not None else 0
+                stderr_size = len(streams[process.stderr]) if process.stderr is not None else 0
+                if (
+                    len(streams[stream]) > MAX_SUBPROCESS_STREAM_BYTES
+                    or stdout_size + stderr_size > MAX_SUBPROCESS_OUTPUT_BYTES
+                ):
+                    failure = "subprocess output limit reached"
+                    break
+            if failure:
+                break
+        if failure:
+            try:
+                os.killpg(process.pid, process_signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            return subprocess.CompletedProcess(command, 124, "", failure)
+        return_code = process.wait()
+        stdout = bytes(streams[process.stdout]).decode("utf-8", errors="replace")
+        stderr = bytes(streams[process.stderr]).decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(command, return_code, stdout, stderr)
+    finally:
+        selector.close()
+        for stream in streams:
+            if stream is not None:
+                stream.close()
 
 
 def build_status_report(
@@ -1060,18 +1623,46 @@ def build_status_report(
     config_path: str | Path | None = None,
     include_config: bool = True,
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
     config_file = (
-        Path(config_path).expanduser().resolve() if config_path else find_config_path(repo)
+        Path(os.path.abspath(os.path.expanduser(str(config_path))))
+        if config_path
+        else find_config_path(repo)
     )
     diagnostics: list[Diagnostic] = []
 
-    if not config_file.exists():
+    try:
+        config_relative_path = config_file.relative_to(repo)
+    except ValueError:
+        config_kind = "uninspectable"
+    else:
+        config_kind = _bound_path_kind(repo, config_relative_path)
+    if config_kind == "missing":
         diagnostics.append(
             Diagnostic(
                 severity="error",
                 code="config.missing",
                 message=f"Fork Ops config not found at {config_file}",
+                path=str(CONFIG_RELATIVE_PATH),
+            )
+        )
+        capability = capability_report({}, diagnostics)
+        equipment_review = _equipment_review_record_report(repo)
+        capability["equipment_review"] = equipment_review
+        capability["accounting"] = _capability_accounting_summary(equipment_review)
+        return {
+            "repo_path": str(repo),
+            "config_path": str(config_file),
+            "config_exists": False,
+            "capability": capability,
+            "diagnostics": [item.to_dict() for item in diagnostics],
+        }
+    if config_kind != "regular":
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                code="config.uninspectable",
+                message="Fork Ops config could not be inspected safely.",
                 path=str(CONFIG_RELATIVE_PATH),
             )
         )
@@ -1285,17 +1876,23 @@ def assess_migration(
     repo_path: str | Path = ".",
     include_proposed_config_patch: bool = False,
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
-    candidates = _migration_candidates(repo)
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    budget = _OperationBudget()
+    candidates = _migration_candidates(repo, budget)
+    scan_accounting = budget.accounting()
+    config_kind = _bound_path_kind(repo, CONFIG_RELATIVE_PATH)
     assessment: dict[str, Any] = {
         "repo_path": str(repo),
         "mode": "read-only",
         "operation": "migration-assessment",
         "summary": {
             "candidate_count": len(candidates),
-            "has_fork_ops_config": (repo / CONFIG_RELATIVE_PATH).exists(),
+            "has_fork_ops_config": config_kind == "regular",
+            "fork_ops_config_path_kind": config_kind,
         },
         "candidates": candidates,
+        "scan_accounting": scan_accounting,
+        "complete": scan_accounting["complete"],
         "next_actions": [
             "Review candidates before creating a migration plan.",
             "Generate a proposed config patch only when the migration plan needs one.",
@@ -1312,8 +1909,11 @@ def propose_migration_config_patch(
     repo_path: str | Path = ".",
     candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
-    migration_candidates = candidates if candidates is not None else _migration_candidates(repo)
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    budget = _OperationBudget()
+    migration_candidates = (
+        candidates if candidates is not None else _migration_candidates(repo, budget)
+    )
     proposed_config = _build_proposed_config(repo, migration_candidates)
     toml = _toml_dumps(proposed_config)
     parsed = parse_config_text(toml)
@@ -1322,11 +1922,13 @@ def propose_migration_config_patch(
         + schema_diagnostics(parsed)
         + reference_diagnostics(normalize_config(parsed))
     )
-    return {
+    config_kind = _bound_path_kind(repo, CONFIG_RELATIVE_PATH)
+    proposal = {
         "mode": "non-mutating",
         "purpose": "migration plan input",
         "target_path": str(CONFIG_RELATIVE_PATH),
-        "operation": "create" if not find_config_path(repo).exists() else "review-and-merge",
+        "operation": "create" if config_kind == "missing" else "review-and-merge",
+        "target_path_kind": config_kind,
         "requires_review": True,
         "config": proposed_config,
         "toml": toml,
@@ -1346,6 +1948,10 @@ def propose_migration_config_patch(
             ),
         ],
     }
+    if candidates is None:
+        proposal["scan_accounting"] = budget.accounting()
+        proposal["complete"] = not budget.incomplete_reasons
+    return proposal
 
 
 def generate_migration_plan(
@@ -1353,20 +1959,39 @@ def generate_migration_plan(
     candidates: list[dict[str, Any]] | None = None,
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
     scan_profile = _normalize_scan_profile(scan_profile)
-    migration_candidates = candidates if candidates is not None else _migration_candidates(repo)
+    budget = _OperationBudget()
+    migration_candidates = (
+        candidates if candidates is not None else _migration_candidates(repo, budget)
+    )
     proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
     evidence = _migration_plan_evidence(migration_candidates)
     retained_source_materials = _retained_source_materials(migration_candidates)
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     migration_review_artifact = _migration_review_artifact(migration_map)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
+    if budget.incomplete_reasons:
+        blockers.append(
+            {
+                "code": "migration.scan_incomplete",
+                "message": "Migration discovery stopped before complete coverage was proven.",
+                "scan_accounting": budget.accounting(),
+            }
+        )
     workflow_inventory = (
         build_workflow_migration_inventory(scan_profile=scan_profile)
         if scan_profile == "full-breadth"
         else None
     )
+    if workflow_inventory is not None and not workflow_inventory.get("complete", False):
+        blockers.append(
+            {
+                "code": "migration.workflow_inventory_incomplete",
+                "message": "Workflow inventory stopped before complete coverage was proven.",
+                "scan_accounting": workflow_inventory.get("scan_accounting", {}),
+            }
+        )
     equipment_preflight = _equipment_migration_preflight(
         repo,
         migration_candidates,
@@ -1420,6 +2045,24 @@ def generate_migration_plan(
         "retained_source_materials": retained_source_materials,
         "deferred_removals": _deferred_removals(retained_source_materials),
         "blockers": blockers,
+        "scan_accounting": {
+            "complete": not budget.incomplete_reasons
+            and (
+                workflow_inventory is None
+                or bool(workflow_inventory.get("complete", False))
+            ),
+            "repository": budget.accounting(),
+            "workflow_inventory": (
+                workflow_inventory.get("scan_accounting", {})
+                if workflow_inventory is not None
+                else None
+            ),
+        },
+        "complete": not budget.incomplete_reasons
+        and (
+            workflow_inventory is None
+            or bool(workflow_inventory.get("complete", False))
+        ),
         "required_review": _migration_plan_required_review(blockers),
         "validation_requirements": _migration_plan_validation_requirements(),
         "limitations": [
@@ -1434,7 +2077,10 @@ def generate_migration_plan(
             "Run validation requirements after any manual application of the proposed config.",
         ],
     }
-    return _with_migration_narrative(plan)
+    result = _with_migration_narrative(plan)
+    # Public plans are JSON values. Materializing that boundary removes Python
+    # object aliases so a later caller can be validated before deepcopy safely.
+    return json.loads(json.dumps(result))
 
 
 def build_equipment_migration_preflight(
@@ -1442,9 +2088,10 @@ def build_equipment_migration_preflight(
     source_roots: Iterable[str | Path] | str | Path | None = None,
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
-    repo = Path(repo_path).expanduser().resolve()
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
     scan_profile = _normalize_scan_profile(scan_profile)
-    migration_candidates = _migration_candidates(repo)
+    budget = _OperationBudget()
+    migration_candidates = _migration_candidates(repo, budget)
     proposed_config_patch = propose_migration_config_patch(repo, migration_candidates)
     migration_map = _migration_map(migration_candidates, proposed_config_patch)
     blockers = _migration_plan_blockers(migration_candidates, proposed_config_patch)
@@ -1454,6 +2101,22 @@ def build_equipment_migration_preflight(
         if roots or scan_profile == "full-breadth"
         else None
     )
+    if budget.incomplete_reasons:
+        blockers.append(
+            {
+                "code": "migration.scan_incomplete",
+                "message": "Migration discovery stopped before complete coverage was proven.",
+                "scan_accounting": budget.accounting(),
+            }
+        )
+    if workflow_inventory is not None and not workflow_inventory.get("complete", False):
+        blockers.append(
+            {
+                "code": "migration.workflow_inventory_incomplete",
+                "message": "Workflow inventory stopped before complete coverage was proven.",
+                "scan_accounting": workflow_inventory.get("scan_accounting", {}),
+            }
+        )
     preflight = _equipment_migration_preflight(
         repo,
         migration_candidates,
@@ -1469,6 +2132,18 @@ def build_equipment_migration_preflight(
         blockers,
         preflight,
     )
+    preflight["complete"] = not budget.incomplete_reasons and (
+        workflow_inventory is None or bool(workflow_inventory.get("complete", False))
+    )
+    preflight["scan_accounting"] = {
+        "complete": preflight["complete"],
+        "repository": budget.accounting(),
+        "workflow_inventory": (
+            workflow_inventory.get("scan_accounting", {})
+            if workflow_inventory is not None
+            else None
+        ),
+    }
     return preflight
 
 
@@ -1477,27 +2152,32 @@ def build_workflow_migration_inventory(
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
     scan_profile = _normalize_scan_profile(scan_profile)
-    roots = _workflow_inventory_roots(source_roots, scan_profile)
+    budget = _OperationBudget()
+    roots = _workflow_inventory_roots(source_roots, scan_profile, budget)
     source_root_records = _workflow_source_root_records(roots, scan_profile)
     scopes_by_root = {record["path"]: record["source_scope"] for record in source_root_records}
     contracts = {item.id: item for item in workflow_contracts()}
-    unresolvable_roots = [str(root) for root in roots if not root.exists()]
+    unresolvable_roots = [
+        record["path"] for record in source_root_records if record["status"] == "unresolvable"
+    ]
     entries: list[dict[str, Any]] = []
-    seen_paths: set[Path] = set()
+    seen_files: set[tuple[int, int]] = set()
     for root in roots:
-        for path in _iter_workflow_inventory_paths(root):
-            resolved_path = path.resolve()
-            if resolved_path in seen_paths:
-                continue
-            seen_paths.add(resolved_path)
+        for path, raw_bytes in _workflow_root_files(root, budget, seen_files):
             entry = _workflow_inventory_entry(
                 root,
                 path,
                 contracts,
                 source_scope=scopes_by_root.get(str(root), "operator-source-root"),
+                raw_bytes=raw_bytes,
             )
             if entry:
                 entries.append(entry)
+                budget.result_count += 1
+                if budget.result_count > MAX_RESULT_ITEMS:
+                    entries.pop()
+                    budget.mark_incomplete("limit.results", str(path))
+                    break
     entries.sort(key=_source_root_and_path_sort_key)
     catalog_evidence = _workflow_catalog_evidence(entries, contracts)
     backlog_candidates = _workflow_backlog_candidates(entries)
@@ -1512,6 +2192,7 @@ def build_workflow_migration_inventory(
         accounting_records,
         follow_up_candidates,
     )
+    accounting = budget.accounting()
     return {
         "operation": "workflow-migration-inventory",
         "mode": "read-only",
@@ -1534,6 +2215,9 @@ def build_workflow_migration_inventory(
         "accounting_records": accounting_records,
         "follow_up_candidates": follow_up_candidates,
         "unresolvable_source_roots": unresolvable_roots,
+        "complete": accounting["complete"],
+        "limit_reached": accounting["limit_reached"],
+        "scan_accounting": accounting,
         "mutation_policy": "no source roots are modified",
         "limitations": [
             "This inventory classifies source material for workflow migration only.",
@@ -1558,8 +2242,18 @@ def dry_run_migration_plan(
     plan: dict[str, Any],
     repo_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    return _dry_run_migration_plan(plan, repo_path)
+
+
+def _dry_run_migration_plan(
+    plan: dict[str, Any],
+    repo_path: str | Path | None = None,
+    *,
+    bound_repo: _BoundRepository | None = None,
+) -> dict[str, Any]:
     if not isinstance(plan, dict):
         raise ForkOpsError("Migration dry run requires a migration plan object.")
+    _validate_bounded_object(plan, label="Migration plan")
     if plan.get("operation") != "migration-plan":
         raise ForkOpsError("Migration dry run input must have operation='migration-plan'.")
 
@@ -1588,15 +2282,34 @@ def dry_run_migration_plan(
         migration_review_artifact,
         equipment_review_record,
     )
+    scan_accounting = plan.get("scan_accounting")
+    if (
+        plan.get("complete") is not True
+        or not isinstance(scan_accounting, dict)
+        or scan_accounting.get("complete") is not True
+    ):
+        blocked_steps.append(
+            {
+                "code": "migration_execution.scan_accounting_incomplete",
+                "step": "verify_migration_plan",
+                "source": "migration_plan",
+                "message": "Migration execution requires complete trusted scan accounting.",
+            }
+        )
     blocked_steps.extend(_proposed_config_patch_consistency_blockers(proposed_config_patch))
     blocked_steps.extend(
         _migration_execution_blockers(
             Path(normalized_repo_path),
             {"file_edits": file_edits},
+            bound_repo=bound_repo,
         )
     )
     blocked_steps.extend(
-        _retained_source_material_blockers(Path(normalized_repo_path), retained_materials)
+        _retained_source_material_blockers(
+            Path(normalized_repo_path),
+            retained_materials,
+            bound_repo=bound_repo,
+        )
     )
     expected_verification_commands = _require_plan_list(plan, "validation_requirements")
     if not expected_verification_commands:
@@ -1673,13 +2386,13 @@ def dry_run_migration_plan(
 
 
 def execute_migration(
-    repo_path: str | Path = ".",
+    repo_path: str | Path | None = None,
     plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    migration_plan = plan if plan is not None else generate_migration_plan(repo_path)
-    if plan is None:
-        return execute_migration_plan(migration_plan)
-    selected_repo_path: str | Path | None = repo_path if str(repo_path) else None
+    selected_repo_path = _require_explicit_repository_path(repo_path)
+    migration_plan = (
+        plan if plan is not None else generate_migration_plan(selected_repo_path)
+    )
     return execute_migration_plan(migration_plan, selected_repo_path)
 
 
@@ -1687,9 +2400,8 @@ def execute_migration_plan(
     plan: dict[str, Any],
     repo_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    raw_repo = repo_path if repo_path is not None and str(repo_path) else plan.get("repo_path")
-    if not isinstance(raw_repo, str | Path) or not str(raw_repo):
-        raise ForkOpsError("Migration execution input has malformed repo_path.")
+    _validate_bounded_object(plan, label="Migration plan")
+    raw_repo = _require_explicit_repository_path(repo_path)
     repo = Path(os.path.abspath(os.path.expanduser(str(raw_repo))))
     try:
         bound_repo = _bind_repository(repo)
@@ -1703,15 +2415,22 @@ def execute_migration_plan(
             blockers=[_repository_identity_blocker(exc)],
             verification_results=[],
         )
+    result: dict[str, Any] | None = None
+
+    def finish(value: dict[str, Any]) -> dict[str, Any]:
+        nonlocal result
+        result = value
+        return value
+
     try:
         mismatch_result = _bound_repo_path_mismatch_result(plan, repo_path, bound_repo)
         if mismatch_result is not None:
-            return mismatch_result
-        preview = dry_run_migration_plan(plan, repo_path)
+            return finish(mismatch_result)
+        preview = _dry_run_migration_plan(plan, repo_path, bound_repo=bound_repo)
         if preview.get("repo_path") != str(bound_repo.path) or not _repository_path_has_identity(
             bound_repo
         ):
-            return _migration_execution_result(
+            return finish(_migration_execution_result(
                 repo=repo,
                 preview=preview,
                 status="blocked",
@@ -1723,10 +2442,10 @@ def execute_migration_plan(
                     )
                 ],
                 verification_results=[],
-            )
+            ))
         preview_blockers = _require_preview_list(preview, "blocked_steps")
         if preview_blockers:
-            return _migration_execution_result(
+            return finish(_migration_execution_result(
                 repo=repo,
                 preview=preview,
                 status="blocked",
@@ -1734,40 +2453,141 @@ def execute_migration_plan(
                 skipped_edits=_skipped_preview_edits(preview, "blocked_steps_present"),
                 blockers=preview_blockers,
                 verification_results=[],
-            )
+            ))
 
         applied_edits, apply_blockers, created_targets = _apply_migration_file_edits(
             bound_repo,
             _require_preview_list(preview, "file_edits"),
         )
         if apply_blockers:
-            return _migration_execution_result(
+            if applied_edits:
+                _mark_edits_applied_unverified(applied_edits)
+            try:
+                return finish(_migration_execution_result(
+                    repo=repo,
+                    preview=preview,
+                    status="applied_unverified" if applied_edits else "blocked",
+                    applied_edits=applied_edits,
+                    skipped_edits=_skipped_preview_edits(preview, "write_guard_blocked"),
+                    blockers=apply_blockers,
+                    verification_results=[],
+                ))
+            except Exception as exc:
+                if applied_edits:
+                    _mark_edits_applied_unverified(applied_edits)
+                    return finish(
+                        _minimal_applied_unverified_migration_result(repo, applied_edits, exc)
+                    )
+                raise
+        skipped_edits = _preserved_source_materials(preview)
+        try:
+            verification_results, verification_blockers = _verify_migration_execution(
+                bound_repo,
+                preview,
+                created_targets,
+            )
+        except Exception as exc:
+            _mark_edits_applied_unverified(applied_edits)
+            try:
+                return finish(_migration_execution_result(
+                    repo=repo,
+                    preview=preview,
+                    status="applied_unverified",
+                    applied_edits=applied_edits,
+                    skipped_edits=skipped_edits,
+                    blockers=[
+                        {
+                            "code": "migration_execution.post_write_error",
+                            "message": (
+                                "Migration changed the repository but verification did not "
+                                "complete."
+                            ),
+                            "error_type": type(exc).__name__,
+                        }
+                    ],
+                    verification_results=[],
+                ))
+            except Exception as result_exc:
+                return finish(
+                    _minimal_applied_unverified_migration_result(
+                        repo,
+                        applied_edits,
+                        result_exc,
+                    )
+                )
+        status = "applied" if not verification_blockers else "applied_unverified"
+        if verification_blockers:
+            _mark_edits_applied_unverified(applied_edits)
+        try:
+            return finish(_migration_execution_result(
                 repo=repo,
                 preview=preview,
-                status="applied_unverified" if applied_edits else "blocked",
+                status=status,
                 applied_edits=applied_edits,
-                skipped_edits=_skipped_preview_edits(preview, "write_guard_blocked"),
-                blockers=apply_blockers,
-                verification_results=[],
-            )
-        skipped_edits = _preserved_source_materials(preview)
-        verification_results, verification_blockers = _verify_migration_execution(
-            bound_repo,
-            preview,
-            created_targets,
-        )
-        status = "applied" if not verification_blockers else "verification_failed"
-        return _migration_execution_result(
-            repo=repo,
-            preview=preview,
-            status=status,
-            applied_edits=applied_edits,
-            skipped_edits=skipped_edits,
-            blockers=verification_blockers,
-            verification_results=verification_results,
-        )
+                skipped_edits=skipped_edits,
+                blockers=verification_blockers,
+                verification_results=verification_results,
+            ))
+        except Exception as exc:
+            _mark_edits_applied_unverified(applied_edits)
+            return finish(_minimal_applied_unverified_migration_result(repo, applied_edits, exc))
     finally:
-        bound_repo.close()
+        try:
+            bound_repo.close()
+        except OSError as exc:
+            completed_result = result
+            if completed_result is None:
+                raise
+            completed_result = cast(dict[str, Any], completed_result)
+            applied = completed_result.get("applied_edits")
+            if isinstance(applied, list) and applied:
+                typed_applied = [edit for edit in applied if isinstance(edit, dict)]
+                _mark_edits_applied_unverified(typed_applied)
+                fallback = _minimal_applied_unverified_migration_result(repo, typed_applied, exc)
+                completed_result.clear()
+                completed_result.update(fallback)
+            else:
+                completed_result["status"] = "blocked"
+                blockers = completed_result.setdefault("blockers", [])
+                if isinstance(blockers, list):
+                    blockers.append(
+                        {
+                            "code": "migration_execution.repository_close_failed",
+                            "message": "The selected repository descriptor could not be closed.",
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+
+
+def _mark_edits_applied_unverified(applied_edits: list[dict[str, Any]]) -> None:
+    for edit in applied_edits:
+        edit["status"] = "applied_unverified"
+
+
+def _minimal_applied_unverified_migration_result(
+    repo: Path,
+    applied_edits: list[dict[str, Any]],
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "repo_path": str(repo),
+        "mode": "mutating",
+        "operation": "migration-execution",
+        "status": "applied_unverified",
+        "applied_edits": applied_edits,
+        "skipped_edits": [],
+        "blockers": [
+            {
+                "code": "migration_execution.post_write_error",
+                "message": (
+                    "Migration changed the repository but the result could not be completed."
+                ),
+                "error_type": type(error).__name__,
+            }
+        ],
+        "verification_results": [],
+        "mutation": {"occurred": True, "target_state": "unverified"},
+    }
 
 
 def explain_migration_blocker(
@@ -2386,7 +3206,7 @@ def _dry_run_repo_path(plan: dict[str, Any], repo_path: str | Path | None) -> st
     raw_path = repo_path if repo_path is not None else plan.get("repo_path")
     if not isinstance(raw_path, str | Path) or not str(raw_path):
         raise ForkOpsError("Migration dry run input has malformed repo_path.")
-    return str(Path(raw_path).expanduser().resolve())
+    return os.path.abspath(os.path.expanduser(str(raw_path)))
 
 
 def _dry_run_file_edits(proposed_config_patch: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2658,7 +3478,13 @@ def _preserved_source_materials(preview: dict[str, Any]) -> list[dict[str, Any]]
     ]
 
 
-def _migration_execution_blockers(repo: Path, preview: dict[str, Any]) -> list[dict[str, Any]]:
+def _migration_execution_blockers(
+    repo: Path,
+    preview: dict[str, Any],
+    *,
+    bound_repo: _BoundRepository | None = None,
+    check_target: bool = True,
+) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     file_edits = _require_preview_list(preview, "file_edits")
     if len(file_edits) != 1:
@@ -2669,11 +3495,24 @@ def _migration_execution_blockers(repo: Path, preview: dict[str, Any]) -> list[d
             }
         )
     for edit in file_edits:
-        blockers.extend(_migration_file_edit_blockers(repo, edit))
+        blockers.extend(
+            _migration_file_edit_blockers(
+                repo,
+                edit,
+                bound_repo=bound_repo,
+                check_target=check_target,
+            )
+        )
     return blockers
 
 
-def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict[str, Any]]:
+def _migration_file_edit_blockers(
+    repo: Path,
+    edit: dict[str, Any],
+    *,
+    bound_repo: _BoundRepository | None,
+    check_target: bool,
+) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     path, path_blocker = _migration_edit_target(repo, edit.get("path"))
     if path_blocker:
@@ -2705,12 +3544,42 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
                 "message": "Migration execution currently writes only .agents/fork-ops.toml.",
             }
         )
-    if (path.exists() or path.is_symlink()) and action == "create":
+    target_relative_path = Path(_normalize_migration_relative_path(str(edit.get("path", ""))))
+    parent_kind, target_kind = _migration_target_path_kinds(
+        repo,
+        target_relative_path,
+        bound_repo=bound_repo,
+        check_target=check_target,
+    )
+    if parent_kind == "symlink":
+        blockers.append(
+            {
+                "code": "migration_execution.unsafe_target_path",
+                "path": edit.get("path"),
+                "message": "Migration execution refuses target paths outside the repository.",
+                "path_kind": parent_kind,
+            }
+        )
+    elif parent_kind not in {"missing", "directory"}:
+        blockers.append(
+            {
+                "code": "migration_execution.target_parent_not_directory",
+                "path": edit.get("path"),
+                "message": (
+                    "Migration execution target parent is not safely inspectable as a directory."
+                ),
+                "path_kind": parent_kind,
+            }
+        )
+    elif check_target and target_kind != "missing" and action == "create":
         blockers.append(
             {
                 "code": "migration_execution.target_exists",
                 "path": edit.get("path"),
-                "message": "Refusing to overwrite an existing target during config creation.",
+                "message": (
+                    "Refusing to overwrite or inspect an unsafe target during config creation."
+                ),
+                "path_kind": target_kind,
             }
         )
 
@@ -2763,6 +3632,54 @@ def _migration_file_edit_blockers(repo: Path, edit: dict[str, Any]) -> list[dict
     return blockers
 
 
+def _migration_target_path_kinds(
+    repo: Path,
+    target: Path,
+    *,
+    bound_repo: _BoundRepository | None,
+    check_target: bool,
+) -> tuple[str, str]:
+    owned_bound_repo = bound_repo is None
+    try:
+        active_bound_repo = bound_repo or _bind_repository(repo)
+    except OSError:
+        return "uninspectable", "uninspectable"
+    try:
+        try:
+            parent_stat = _bound_lstat(active_bound_repo, target.parent)
+        except FileNotFoundError:
+            return "missing", "missing"
+        except OSError:
+            return "uninspectable", "uninspectable"
+        parent_kind = _stat_result_kind(parent_stat)
+        if parent_kind != "directory" or not check_target:
+            return parent_kind, "missing"
+        try:
+            target_stat = _bound_lstat(active_bound_repo, target)
+        except FileNotFoundError:
+            return parent_kind, "missing"
+        except OSError:
+            return parent_kind, "uninspectable"
+        return parent_kind, _stat_result_kind(target_stat)
+    finally:
+        if owned_bound_repo:
+            try:
+                active_bound_repo.close()
+            except OSError:
+                pass
+
+
+def _stat_result_kind(path_stat: os.stat_result) -> str:
+    mode = path_stat.st_mode
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "special"
+
+
 def _normalize_migration_relative_path(raw_path: str) -> str:
     return raw_path.replace("\\", "/")
 
@@ -2784,26 +3701,14 @@ def _migration_edit_target(
             "path": raw_path,
             "message": "Migration execution refuses absolute paths and parent traversal.",
         }
-    repo_root = repo.resolve()
-    resolved_parent = (repo / target).parent.resolve(strict=False)
-    if not resolved_parent.is_relative_to(repo_root):
-        return repo, {
-            "code": "migration_execution.unsafe_target_path",
-            "path": raw_path,
-            "message": "Migration execution refuses target paths outside the repository.",
-        }
-    if resolved_parent.exists() and not resolved_parent.is_dir():
-        return repo, {
-            "code": "migration_execution.target_parent_not_directory",
-            "path": raw_path,
-            "message": "Migration execution target parent is not a directory.",
-        }
     return repo / target, None
 
 
 def _retained_source_material_blockers(
     repo: Path,
     retained_materials: list[dict[str, Any]],
+    *,
+    bound_repo: _BoundRepository | None = None,
 ) -> list[dict[str, Any]]:
     blockers = []
     for material in retained_materials:
@@ -2826,25 +3731,6 @@ def _retained_source_material_blockers(
                 }
             )
             continue
-        path = repo / raw_path
-        if not path.resolve(strict=False).is_relative_to(repo.resolve()):
-            blockers.append(
-                {
-                    "code": "migration_execution.unsafe_retained_source_path",
-                    "path": raw_path,
-                    "message": "Retained source material must stay inside the repository.",
-                }
-            )
-            continue
-        if not path.exists():
-            blockers.append(
-                {
-                    "code": "migration_execution.retained_source_missing",
-                    "path": raw_path,
-                    "message": "Retained source material is missing before migration execution.",
-                }
-            )
-            continue
         expected_sha256 = material.get("content_sha256")
         if not isinstance(expected_sha256, str) or not expected_sha256:
             blockers.append(
@@ -2855,7 +3741,26 @@ def _retained_source_material_blockers(
                 }
             )
             continue
-        if _file_sha256(path) != expected_sha256:
+        try:
+            actual_content = (
+                _read_bound_regular_file(bound_repo, retained_path)
+                if bound_repo is not None
+                else _read_file_within_root(repo, retained_path)
+            )
+        except _BoundedReadError as exc:
+            blockers.append(
+                {
+                    "code": "migration_execution.retained_source_unreadable",
+                    "path": raw_path,
+                    "message": "Retained source material could not be read safely.",
+                    "reason": exc.code,
+                }
+            )
+            continue
+        if bound_repo is not None and not _repository_path_has_identity(bound_repo):
+            blockers.append(_repository_identity_blocker(OSError("repository root changed")))
+            continue
+        if hashlib.sha256(actual_content).hexdigest() != expected_sha256:
             blockers.append(
                 {
                     "code": "migration_execution.retained_source_changed",
@@ -2920,6 +3825,11 @@ def _apply_migration_file_edit(
             "path": edit.get("path"),
             "message": f"Migration execution target parent is unavailable: {exc}",
         }, None
+    outcome: tuple[
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+        _CreatedFileIdentity | None,
+    ]
     try:
         identity = _write_new_file_atomically(
             repo,
@@ -2929,42 +3839,79 @@ def _apply_migration_file_edit(
             parent_identity=parent_identity,
         )
     except _TargetAlreadyExistsError:
-        return _parent_only_applied_edit(edit, parent_created), {
-            "code": "migration_execution.target_exists",
-            "path": edit.get("path"),
-            "message": "Refusing to overwrite a target created before config write.",
-        }, None
+        outcome = (
+            _parent_only_applied_edit(edit, parent_created),
+            {
+                "code": "migration_execution.target_exists",
+                "path": edit.get("path"),
+                "message": "Refusing to overwrite a target created before config write.",
+            },
+            None,
+        )
     except _IndeterminateCreatedFileError as exc:
-        return {
-            "path": edit["path"],
-            "action": edit["action"],
-            "status": "applied_unverified",
-            "content_kind": edit.get("content_kind"),
-        }, {
-            "code": "migration_execution.write_unverified",
-            "path": edit.get("path"),
-            "message": (
-                "Migration execution may have created the config, but the exact "
-                f"result could not be verified: {exc}"
-            ),
-        }, None
+        outcome = (
+            {
+                "path": edit["path"],
+                "action": edit["action"],
+                "status": "applied_unverified",
+                "content_kind": edit.get("content_kind"),
+            },
+            {
+                "code": "migration_execution.write_unverified",
+                "path": edit.get("path"),
+                "message": (
+                    "Migration execution may have created the config, but the exact "
+                    f"result could not be verified: {exc}"
+                ),
+            },
+            None,
+        )
     except OSError as exc:
-        return _parent_only_applied_edit(edit, parent_created), {
-            "code": "migration_execution.write_failed",
-            "path": edit.get("path"),
-            "message": f"Migration execution config write failed: {exc}",
-        }, None
+        outcome = (
+            _parent_only_applied_edit(edit, parent_created),
+            {
+                "code": "migration_execution.write_failed",
+                "path": edit.get("path"),
+                "message": f"Migration execution config write failed: {exc}",
+            },
+            None,
+        )
+    else:
+        content_bytes = _config_content_bytes(content)
+        outcome = (
+            {
+                "path": edit["path"],
+                "action": edit["action"],
+                "status": "applied",
+                "content_kind": edit.get("content_kind"),
+                "bytes": len(content_bytes),
+                "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+            },
+            None,
+            identity,
+        )
     finally:
-        os.close(parent_descriptor)
-    content_bytes = _config_content_bytes(content)
-    return {
-        "path": edit["path"],
-        "action": edit["action"],
-        "status": "applied",
-        "content_kind": edit.get("content_kind"),
-        "bytes": len(content_bytes),
-        "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
-    }, None, identity
+        try:
+            os.close(parent_descriptor)
+        except OSError as exc:
+            applied_edit, blocker, _ = outcome
+            if applied_edit is not None:
+                applied_edit["status"] = "applied_unverified"
+                outcome = (
+                    applied_edit,
+                    {
+                        "code": "migration_execution.descriptor_close_unverified",
+                        "path": edit.get("path"),
+                        "message": (
+                            "Migration execution changed repository state, but descriptor "
+                            f"cleanup could not be verified: {exc}"
+                        ),
+                    },
+                    None,
+                )
+            elif blocker is None:
+                raise
+    return outcome
 
 
 def _parent_only_applied_edit(
@@ -3016,7 +3963,12 @@ def _write_new_file_atomically(
             "writing or synchronizing the descriptor-relative target failed"
         ) from exc
     finally:
-        os.close(target_descriptor)
+        try:
+            os.close(target_descriptor)
+        except OSError as exc:
+            raise _IndeterminateCreatedFileError(
+                "target descriptor cleanup failed after config creation"
+            ) from exc
     if not _repository_path_has_identity(repo):
         raise _IndeterminateCreatedFileError(
             "the repository path changed after config creation"
@@ -3037,6 +3989,9 @@ def _write_new_file_atomically(
 
 def _bind_repository(repo: Path) -> _BoundRepository:
     _require_descriptor_relative_operations("open")
+    lexical_stat = os.stat(repo, follow_symlinks=False)
+    if not stat.S_ISDIR(lexical_stat.st_mode):
+        raise OSError(errno.ENOTDIR, "repository root is not a directory")
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -3047,6 +4002,14 @@ def _bind_repository(repo: Path) -> _BoundRepository:
         repo_stat = os.fstat(descriptor)
         if not stat.S_ISDIR(repo_stat.st_mode):
             raise OSError(errno.ENOTDIR, "repository root is not a directory")
+        if (repo_stat.st_dev, repo_stat.st_ino) != (
+            lexical_stat.st_dev,
+            lexical_stat.st_ino,
+        ):
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "repository root changed while opening",
+            )
         bound_path = _bound_repository_display_path(descriptor, repo)
         bound = _BoundRepository(
             repo,
@@ -3258,17 +4221,32 @@ def _created_target_blockers(
     return blockers
 
 
-def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
+def _migration_candidates(
+    repo: Path,
+    budget: _OperationBudget | None = None,
+) -> list[dict[str, Any]]:
+    active_budget = budget or _OperationBudget()
     candidates: list[dict[str, Any]] = []
-    for path in _iter_candidate_paths(repo):
-        rel = path.relative_to(repo).as_posix()
-        raw_bytes = _read_bytes(path)
+    for rel_path, bound_repo in _iter_candidate_paths(repo, active_budget):
+        rel = rel_path.as_posix()
+        try:
+            raw_bytes = _read_bound_regular_file(bound_repo, rel_path, budget=active_budget)
+        except _BoundedReadError as exc:
+            active_budget.mark_incomplete(exc.code, rel)
+            continue
         raw_text = raw_bytes.decode(errors="ignore")
         lowered_text = raw_text.lower()
         signals = _fork_signals(lowered_text)
         if not signals:
             continue
-        urls = _extract_urls(raw_text)
+        urls = _extract_urls(raw_text, budget=active_budget)
+        if active_budget.incomplete_reasons:
+            break
+        extracted_facts = _extracted_facts(raw_text)
+        nested_result_count = len(signals) + len(urls) + len(extracted_facts)
+        if active_budget.result_count + nested_result_count + 1 > MAX_RESULT_ITEMS:
+            active_budget.mark_incomplete("limit.results", rel)
+            break
         candidates.append(
             {
                 "path": rel,
@@ -3276,12 +4254,13 @@ def _migration_candidates(repo: Path) -> list[dict[str, Any]]:
                 "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
                 "signals": signals,
                 "domains": _candidate_domains(signals),
-                "extracted_facts": _extracted_facts(raw_text),
+                "extracted_facts": extracted_facts,
                 "urls": urls,
                 "proposed_destination": _proposed_destination(rel, signals),
                 "portability_hint": _portability_hint(rel, signals),
             }
         )
+        active_budget.result_count += nested_result_count + 1
     return sorted(candidates, key=_path_sort_key)
 
 
@@ -3595,7 +4574,15 @@ def _normalize_equipment_source_roots(
         raw_roots: Iterable[str | Path] = [source_roots]
     else:
         raw_roots = source_roots
-    return [Path(root).expanduser().resolve() for root in raw_roots]
+    roots: list[Path] = []
+    for index, root in enumerate(raw_roots):
+        if index >= MAX_SCAN_ROOTS:
+            raise ForkOpsError("Equipment source roots exceed the root count limit.")
+        path = Path(os.path.abspath(os.path.expanduser(str(root))))
+        if len(os.fsencode(path)) > MAX_PATH_BYTES:
+            raise ForkOpsError("Equipment source root exceeds the path byte limit.")
+        roots.append(path)
+    return roots
 
 
 def _equipment_migration_preflight(
@@ -3807,7 +4794,15 @@ def _equipment_discovery_scopes(
                 "path": str(root),
                 "source_scope": "operator-source-root",
                 "root_role": "operator-provided",
-                "status": "unresolvable" if not root.exists() else "scanned",
+                "status": (
+                    "scanned"
+                    if _lexical_path_kind(root) in {"regular", "directory"}
+                    else (
+                        "unresolvable"
+                        if _lexical_path_kind(root) == "missing"
+                        else "rejected"
+                    )
+                ),
             }
             for root in source_roots
         ]
@@ -3992,13 +4987,29 @@ def _equipment_review_record_toml(record: dict[str, Any]) -> str:
 
 
 def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
-    path = repo / EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH
-    if not path.exists():
+    try:
+        raw = _read_file_within_root(repo, EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH)
+    except _BoundedReadError as exc:
+        if exc.__cause__ and isinstance(exc.__cause__, FileNotFoundError):
+            return {
+                "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+                "exists": False,
+                "valid": False,
+                "activation_readiness": "not_assessed",
+                "replacement_coverage_ready": False,
+                "retained_authority_paths": [],
+                "pending_decision_count": 0,
+                "unassessed_equipment_area_count": 0,
+                "accounting_record_count": 0,
+                "follow_up_candidate_count": 0,
+                "accounting_status_counts": _empty_accounting_status_counts(),
+            }
         return {
             "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
-            "exists": False,
+            "exists": True,
             "valid": False,
-            "activation_readiness": "not_assessed",
+            "error": exc.code,
+            "activation_readiness": "equipment_review_invalid",
             "replacement_coverage_ready": False,
             "retained_authority_paths": [],
             "pending_decision_count": 0,
@@ -4008,8 +5019,8 @@ def _equipment_review_record_report(repo: Path) -> dict[str, Any]:
             "accounting_status_counts": _empty_accounting_status_counts(),
         }
     try:
-        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         return {
             "path": EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
             "exists": True,
@@ -4738,14 +5749,19 @@ def _validation_requirement_blockers(
 
 
 def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    origin_url = _git_output(repo, "remote", "get-url", "origin") or _find_remote_url(
+    raw_origin_url = _git_output(repo, "remote", "get-url", "origin") or _find_remote_url(
         candidates, "origin"
     )
-    upstream_url = _git_output(repo, "remote", "get-url", "upstream") or _find_remote_url(
+    raw_upstream_url = _git_output(repo, "remote", "get-url", "upstream") or _find_remote_url(
         candidates, "upstream"
     )
+    origin_url = _credential_free_source_url(raw_origin_url)
+    upstream_url = _credential_free_source_url(raw_upstream_url)
     origin_slug = _github_slug_from_url(origin_url) or ("OWNER", "REPO")
-    upstream_slug = _github_slug_from_url(upstream_url) or ("UPSTREAM_OWNER", "UPSTREAM_REPO")
+    upstream_slug = _github_slug_from_url(upstream_url) or (
+        "UPSTREAM_OWNER",
+        "UPSTREAM_REPO",
+    )
     default_branch = _default_branch(repo)
     upstream_default_branch = _upstream_default_branch(repo) or "main"
     upstream_id = _slug_id(upstream_slug[1])
@@ -4774,7 +5790,9 @@ def _build_proposed_config(repo: Path, candidates: list[dict[str, Any]]) -> dict
     }
     if upstream_url:
         upstream_remote["url"] = upstream_url
-    upstream_push_url = _git_output(repo, "remote", "get-url", "--push", "upstream")
+    upstream_push_url = _credential_free_source_url(
+        _git_output(repo, "remote", "get-url", "--push", "upstream") or ""
+    )
     if upstream_push_url:
         upstream_remote["push_url"] = upstream_push_url
     elif upstream_url:
@@ -5122,7 +6140,7 @@ def _required_context_paths(repo: Path) -> list[str]:
         "docs/agents/domain.md",
         "docs/agents/research-map.md",
     ]
-    return [path for path in candidates if (repo / path).exists()]
+    return [path for path in candidates if _bound_path_kind(repo, path) == "regular"]
 
 
 def _durable_discovery_destinations(repo: Path) -> list[str]:
@@ -5132,7 +6150,11 @@ def _durable_discovery_destinations(repo: Path) -> list[str]:
         "docs/agents/fork-stewardship.md": "fork operating policy",
         "AGENTS.md": "always-loaded high-impact rules",
     }
-    return [f"{path}: {purpose}" for path, purpose in candidates.items() if (repo / path).exists()]
+    return [
+        f"{path}: {purpose}"
+        for path, purpose in candidates.items()
+        if _bound_path_kind(repo, path) == "regular"
+    ]
 
 
 def _default_branch(repo: Path) -> str:
@@ -5222,7 +6244,10 @@ def _infer_product_site_url(urls: list[str], docs_url: str = "") -> str:
 
 
 def _is_public_web_url(url: str) -> bool:
-    parsed = urlparse(url)
+    projected = _public_url_projection(url)
+    if not projected:
+        return False
+    parsed = urlparse(projected)
     return (
         parsed.scheme in {"http", "https"} and parsed.netloc != "" and parsed.netloc != "github.com"
     )
@@ -5236,14 +6261,91 @@ def _looks_like_docs_url(url: str) -> bool:
 
 
 def _site_root(url: str) -> str:
-    parsed = urlparse(url)
+    projected = _public_url_projection(url)
+    if not projected:
+        return ""
+    parsed = urlparse(projected)
     if not parsed.scheme or not parsed.netloc:
         return url
     return f"{parsed.scheme}://{parsed.netloc}/"
 
 
-def _extract_urls(text: str) -> list[str]:
-    return [url.rstrip(".,)>`;'\"") for url in re.findall(r"https?://[^\s<)]+", text)]
+def _url_parts(raw_url: str) -> SplitResult | None:
+    candidate = raw_url.rstrip(".,)>`;'\"")
+    if not candidate or "\\" in candidate or any(ord(char) < 32 for char in candidate):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        _ = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    return parsed
+
+
+def _url_has_credentials(raw_url: str) -> bool:
+    parsed = _url_parts(raw_url)
+    return bool(parsed and (parsed.username is not None or parsed.password is not None))
+
+
+def _public_url_projection(raw_url: str) -> str:
+    parsed = _url_parts(raw_url)
+    if parsed is None:
+        return ""
+    hostname = parsed.hostname or ""
+    host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    path = parsed.path or "/"
+    return urlunsplit((parsed.scheme.lower(), host, path, "", ""))
+
+
+def _credential_free_source_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    if re.fullmatch(r"git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", raw_url):
+        github_slug = _github_repo_root_slug_from_url(raw_url)
+        if github_slug:
+            owner, name = github_slug
+            return f"https://github.com/{owner}/{name}.git"
+        return ""
+    if _url_has_credentials(raw_url):
+        parsed = _url_parts(raw_url)
+        if not (
+            parsed
+            and parsed.scheme.lower() == "ssh"
+            and parsed.username == "git"
+            and parsed.password is None
+            and parsed.hostname == "github.com"
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            return ""
+    github_slug = _github_repo_root_slug_from_url(raw_url)
+    if github_slug:
+        owner, name = github_slug
+        return f"https://github.com/{owner}/{name}.git"
+    return _public_url_projection(raw_url)
+
+
+def _extract_urls(
+    text: str,
+    *,
+    budget: _OperationBudget | None = None,
+) -> list[str]:
+    seen: set[str] = set()
+    projected_urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s<)]+", text, flags=re.IGNORECASE):
+        projected = _public_url_projection(match.group(0))
+        if not projected or projected in seen:
+            continue
+        if budget is not None and budget.result_count + len(projected_urls) + 1 > MAX_RESULT_ITEMS:
+            budget.mark_incomplete("limit.results", "extracted_urls")
+            break
+        seen.add(projected)
+        projected_urls.append(projected)
+    return projected_urls
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -5340,10 +6442,19 @@ def create_initial_config_text(
     upstream_owner: str = "UPSTREAM_OWNER",
     upstream_name: str = "UPSTREAM_REPO",
     default_branch: str = "main",
+    discover_git_remotes: bool = True,
 ) -> str:
-    repo = Path(repo_path).expanduser().resolve()
-    origin_url = _git_output(repo, "remote", "get-url", "origin") or ""
-    upstream_url = _git_output(repo, "remote", "get-url", "upstream") or ""
+    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    origin_url = (
+        _credential_free_source_url(_git_output(repo, "remote", "get-url", "origin") or "")
+        if discover_git_remotes
+        else ""
+    )
+    upstream_url = (
+        _credential_free_source_url(_git_output(repo, "remote", "get-url", "upstream") or "")
+        if discover_git_remotes
+        else ""
+    )
     upstream_id = _slug_id(upstream_name)
     fork_remote: dict[str, Any] = {
         "name": "origin",
@@ -5420,14 +6531,15 @@ def create_initial_config_text(
 
 
 def initialize_config(
-    repo_path: str | Path = ".",
+    repo_path: str | Path = "",
     repository_owner: str = "OWNER",
     repository_name: str = "REPO",
     upstream_owner: str = "UPSTREAM_OWNER",
     upstream_name: str = "UPSTREAM_REPO",
     default_branch: str = "main",
 ) -> dict[str, Any]:
-    repo = Path(os.path.abspath(os.path.expanduser(str(repo_path))))
+    selected_repo_path = _require_explicit_repository_path(repo_path)
+    repo = Path(os.path.abspath(os.path.expanduser(str(selected_repo_path))))
     try:
         bound_repo = _bind_repository(repo)
     except OSError as exc:
@@ -5440,7 +6552,7 @@ def initialize_config(
             mutation=_config_initialization_mutation(False, "not-created", "not-needed"),
         )
     try:
-        return _initialize_config_in_bound_repository(
+        result = _initialize_config_in_bound_repository(
             bound_repo,
             repository_owner=repository_owner,
             repository_name=repository_name,
@@ -5448,8 +6560,28 @@ def initialize_config(
             upstream_name=upstream_name,
             default_branch=default_branch,
         )
-    finally:
+    except Exception:
         bound_repo.close()
+        raise
+    try:
+        bound_repo.close()
+    except OSError as exc:
+        applied = result.get("applied_edits")
+        if isinstance(applied, list) and applied:
+            first_edit = next((edit for edit in applied if isinstance(edit, dict)), None)
+            if first_edit is not None:
+                return _minimal_applied_unverified_config_result(repo, first_edit, exc)
+        result["status"] = "blocked"
+        blockers = result.setdefault("blockers", [])
+        if isinstance(blockers, list):
+            blockers.append(
+                {
+                    "code": "config_initialization.repository_close_failed",
+                    "message": "The selected repository descriptor could not be closed.",
+                    "error_type": type(exc).__name__,
+                }
+            )
+    return result
 
 
 def _initialize_config_in_bound_repository(
@@ -5469,6 +6601,7 @@ def _initialize_config_in_bound_repository(
         upstream_owner=upstream_owner,
         upstream_name=upstream_name,
         default_branch=default_branch,
+        discover_git_remotes=False,
     )
     edit = {
         "path": CONFIG_RELATIVE_PATH.as_posix(),
@@ -5476,7 +6609,12 @@ def _initialize_config_in_bound_repository(
         "content_kind": "fork-ops-config",
         "content": content,
     }
-    blockers = _migration_execution_blockers(repo, {"file_edits": [edit]})
+    blockers = _migration_execution_blockers(
+        repo,
+        {"file_edits": [edit]},
+        bound_repo=bound_repo,
+        check_target=True,
+    )
     if blockers:
         return _config_initialization_result(
             repo,
@@ -5505,33 +6643,45 @@ def _initialize_config_in_bound_repository(
         parent_only_mutation = bool(
             applied_edit is not None and applied_edit.get("target_created") is False
         )
-        return _config_initialization_result(
-            repo,
-            status="applied_unverified" if mutation_occurred else "blocked",
-            applied_edits=[applied_edit] if applied_edit is not None else [],
-            blockers=[apply_blocker] if apply_blocker is not None else [],
-            verification=None,
-            mutation=_config_initialization_mutation(
-                mutation_occurred,
-                (
-                    "not-created"
-                    if parent_only_mutation or not mutation_occurred
-                    else "unverified"
+        try:
+            return _config_initialization_result(
+                repo,
+                status="applied_unverified" if mutation_occurred else "blocked",
+                applied_edits=[applied_edit] if applied_edit is not None else [],
+                blockers=[apply_blocker] if apply_blocker is not None else [],
+                verification=None,
+                mutation=_config_initialization_mutation(
+                    mutation_occurred,
+                    (
+                        "not-created"
+                        if parent_only_mutation or not mutation_occurred
+                        else "unverified"
+                    ),
+                    (
+                        "not-attempted"
+                        if mutation_occurred and not parent_only_mutation
+                        else "not-needed"
+                    ),
                 ),
-                "not-attempted" if mutation_occurred and not parent_only_mutation else "not-needed",
-            ),
-        )
+            )
+        except Exception as exc:
+            if mutation_occurred and applied_edit is not None:
+                return _minimal_applied_unverified_config_result(repo, applied_edit, exc)
+            raise
 
     target_path = repo / CONFIG_RELATIVE_PATH
     content_bytes = _config_content_bytes(content)
-    target_verification, target_blocker = _verify_created_target(
-        target_path,
-        created_identity,
-        content_bytes,
-        bound_repo,
-    )
+    try:
+        target_verification, target_blocker = _verify_created_target(
+            target_path,
+            created_identity,
+            content_bytes,
+            bound_repo,
+        )
+    except Exception as exc:
+        return _minimal_applied_unverified_config_result(repo, applied_edit, exc)
     if target_blocker is not None:
-        return _config_initialization_post_create_failure(
+        return _safe_config_initialization_post_create_failure(
             repo,
             applied_edit,
             created_identity,
@@ -5555,7 +6705,7 @@ def _initialize_config_in_bound_repository(
                 "error": str(exc),
             },
         }
-        return _config_initialization_post_create_failure(
+        return _safe_config_initialization_post_create_failure(
             repo,
             applied_edit,
             created_identity,
@@ -5586,7 +6736,7 @@ def _initialize_config_in_bound_repository(
         "diagnostics": report.get("diagnostics", []),
     }
     if not required_available:
-        return _config_initialization_post_create_failure(
+        return _safe_config_initialization_post_create_failure(
             repo,
             applied_edit,
             created_identity,
@@ -5602,16 +6752,19 @@ def _initialize_config_in_bound_repository(
             verification=verification,
         )
 
-    final_target_verification, final_target_blocker = _verify_created_target(
-        target_path,
-        created_identity,
-        content_bytes,
-        bound_repo,
-    )
+    try:
+        final_target_verification, final_target_blocker = _verify_created_target(
+            target_path,
+            created_identity,
+            content_bytes,
+            bound_repo,
+        )
+    except Exception as exc:
+        return _minimal_applied_unverified_config_result(repo, applied_edit, exc)
     verification["target"] = final_target_verification
     if final_target_blocker is not None:
         verification["status"] = "failed"
-        return _config_initialization_post_create_failure(
+        return _safe_config_initialization_post_create_failure(
             repo,
             applied_edit,
             created_identity,
@@ -5621,14 +6774,69 @@ def _initialize_config_in_bound_repository(
             verification=verification,
         )
 
-    return _config_initialization_result(
-        repo,
-        status="applied",
-        applied_edits=[applied_edit],
-        blockers=[],
-        verification=verification,
-        mutation=_config_initialization_mutation(True, "verified", "not-needed"),
-    )
+    try:
+        return _config_initialization_result(
+            repo,
+            status="applied",
+            applied_edits=[applied_edit],
+            blockers=[],
+            verification=verification,
+            mutation=_config_initialization_mutation(True, "verified", "not-needed"),
+        )
+    except Exception as exc:
+        return _minimal_applied_unverified_config_result(repo, applied_edit, exc)
+
+
+def _safe_config_initialization_post_create_failure(
+    repo: Path,
+    applied_edit: dict[str, Any],
+    created_identity: _CreatedFileIdentity,
+    expected_content: bytes,
+    *,
+    bound_repo: _BoundRepository,
+    blockers: list[dict[str, Any]],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return _config_initialization_post_create_failure(
+            repo,
+            applied_edit,
+            created_identity,
+            expected_content,
+            bound_repo=bound_repo,
+            blockers=blockers,
+            verification=verification,
+        )
+    except Exception as exc:
+        return _minimal_applied_unverified_config_result(repo, applied_edit, exc)
+
+
+def _minimal_applied_unverified_config_result(
+    repo: Path,
+    applied_edit: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    applied_edit["status"] = "applied_unverified"
+    return {
+        "repo_path": str(repo),
+        "operation": "config-initialization",
+        "status": "applied_unverified",
+        "target_path": str(repo / CONFIG_RELATIVE_PATH),
+        "applied_edits": [applied_edit],
+        "blockers": [
+            {
+                "code": "config_initialization.post_write_error",
+                "message": "Config initialization changed the repository but could not complete.",
+                "error_type": type(error).__name__,
+            }
+        ],
+        "verification": None,
+        "mutation": {
+            "occurred": True,
+            "target_state": "unverified",
+            "rollback_status": "not-attempted",
+        },
+    }
 
 
 def _config_initialization_post_create_failure(
@@ -6122,21 +7330,21 @@ def _migration_proposal_diagnostics(facts: list[dict[str, str]]) -> list[Diagnos
 
 
 def schema_artifact_report(plugin_root: str | Path = ".") -> dict[str, Any]:
-    root = Path(plugin_root).expanduser().resolve()
+    root = Path(os.path.abspath(os.path.expanduser(str(plugin_root))))
     runtime_schema = schema_json().encode("utf-8")
     artifacts = []
     for relative_path in SCHEMA_ARTIFACT_RELATIVE_PATHS:
         path = root / relative_path
         try:
-            content = path.read_bytes()
-        except OSError as exc:
+            content = _read_file_within_root(root, relative_path)
+        except _BoundedReadError as exc:
             artifacts.append(
                 {
                     "path": relative_path.as_posix(),
                     "absolute_path": str(path),
-                    "exists": path.exists(),
+                    "exists": False,
                     "matches_runtime_schema": False,
-                    "error": str(exc),
+                    "error": exc.code,
                 }
             )
             continue
@@ -6160,19 +7368,30 @@ def schema_artifact_report(plugin_root: str | Path = ".") -> dict[str, Any]:
 def _workflow_inventory_roots(
     source_roots: Iterable[str | Path] | str | Path | None,
     scan_profile: str = "custom",
+    budget: _OperationBudget | None = None,
 ) -> list[Path]:
+    active_budget = budget or _OperationBudget()
     profile_roots = _scan_profile_roots(scan_profile)
     if source_roots is None:
         raw_roots: list[str | Path] = [] if scan_profile == "full-breadth" else ["."]
     elif isinstance(source_roots, (str, Path)):
         raw_roots = [source_roots]
     else:
-        raw_roots = list(source_roots)
+        raw_roots = []
+        for index, root in enumerate(source_roots):
+            if index >= MAX_SCAN_ROOTS:
+                active_budget.mark_incomplete("limit.roots")
+                break
+            raw_roots.append(root)
     if scan_profile == "full-breadth":
         raw_roots = [*profile_roots, *raw_roots]
     if not raw_roots:
         raw_roots = ["."]
-    roots = [Path(root).expanduser().resolve() for root in raw_roots]
+    if len(raw_roots) > MAX_SCAN_ROOTS:
+        active_budget.mark_incomplete("limit.roots")
+        raw_roots = raw_roots[:MAX_SCAN_ROOTS]
+    roots = [Path(os.path.abspath(os.path.expanduser(str(root)))) for root in raw_roots]
+    active_budget.root_count = len(roots)
     return _dedupe_paths(roots)
 
 
@@ -6188,7 +7407,7 @@ def _normalize_scan_profile(scan_profile: str | None) -> str:
 def _scan_profile_roots(scan_profile: str) -> list[Path]:
     if scan_profile != "full-breadth":
         return []
-    home = Path.home().resolve()
+    home = Path(os.path.abspath(os.path.expanduser(str(Path.home()))))
     repo_base = _full_breadth_repo_base()
     roots = [home / relative for relative in FULL_BREADTH_USER_ROOTS]
     if repo_base is not None:
@@ -6200,7 +7419,7 @@ def _scan_profile_roots(scan_profile: str) -> list[Path]:
 def _full_breadth_repo_base() -> Path | None:
     configured = os.environ.get(FULL_BREADTH_REPO_BASE_ENV)
     if configured:
-        return Path(configured).expanduser().resolve()
+        return Path(os.path.abspath(os.path.expanduser(configured)))
     return None
 
 
@@ -6278,22 +7497,49 @@ def _workflow_source_root_records(
 
 def _workflow_source_root_record(root: Path, scan_profile: str) -> dict[str, Any]:
     scope, role = _workflow_source_root_scope(root, scan_profile)
+    try:
+        root_stat = os.stat(root, follow_symlinks=False)
+    except OSError:
+        status = "unresolvable"
+    else:
+        status = (
+            "scanned"
+            if stat.S_ISDIR(root_stat.st_mode) or stat.S_ISREG(root_stat.st_mode)
+            else "rejected"
+        )
     return {
         "id": f"source-root:{_short_digest(str(root))}",
         "path": str(root),
         "source_scope": scope,
         "root_role": role,
-        "status": "scanned" if root.exists() else "unresolvable",
+        "status": status,
     }
 
 
 def _workflow_source_root_scope(root: Path, scan_profile: str) -> tuple[str, str]:
+    lexical_root = Path(os.path.abspath(os.path.expanduser(str(root))))
+    home = Path(os.path.abspath(os.path.expanduser(str(Path.home()))))
+    user_global_roots = {
+        home / ".agents",
+        home / ".agents" / "skills",
+        home / ".codex" / "skills",
+        home / ".codex" / "plugins" / "cache" / "fork-ops",
+    }
+    if any(
+        lexical_root == user_root or lexical_root.is_relative_to(user_root)
+        for user_root in user_global_roots
+    ):
+        try:
+            relative_to_home = lexical_root.relative_to(home)
+        except ValueError:
+            pass
+        else:
+            return "user-global", relative_to_home.as_posix()
     if scan_profile != "full-breadth":
         return "operator-source-root", "operator-provided"
-    home = Path.home().resolve()
     repo_base = _full_breadth_repo_base()
     try:
-        relative_to_home = root.resolve().relative_to(home)
+        relative_to_home = lexical_root.relative_to(home)
     except ValueError:
         relative_to_home = None
     if relative_to_home is not None:
@@ -6302,40 +7548,145 @@ def _workflow_source_root_scope(root: Path, scan_profile: str) -> tuple[str, str
             return "user-global", rel
     if repo_base is not None:
         for name in _full_breadth_maintained_repos():
-            if root.resolve() == (repo_base / name).resolve():
+            if lexical_root == repo_base / name:
                 return "maintained-fork", name
         for name in _full_breadth_adjacent_repos():
-            if root.resolve() == (repo_base / name).resolve():
+            if lexical_root == repo_base / name:
                 return "adjacent-root", name
     return "operator-source-root", "operator-provided"
 
 
-def _iter_workflow_inventory_paths(root: Path) -> Iterable[Path]:
-    if root.is_file():
-        if root.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
-            yield root
+def _workflow_root_files(
+    root: Path,
+    budget: _OperationBudget,
+    seen_files: set[tuple[int, int]],
+) -> Iterable[tuple[Path, bytes]]:
+    try:
+        root_stat = os.stat(root, follow_symlinks=False)
+    except OSError:
+        budget.mark_incomplete("scan.root_unresolvable", str(root))
         return
-    if not root.is_dir():
+    if stat.S_ISLNK(root_stat.st_mode):
+        budget.mark_incomplete("scan.root_symlink_rejected", str(root))
         return
-    for current_root, dirnames, filenames in os.walk(root):
-        current_path = Path(current_root)
-        dirnames[:] = [
-            dirname
-            for dirname in dirnames
-            if not _workflow_inventory_skip_dir(current_path, dirname)
-        ]
-        for filename in filenames:
-            path = current_path / filename
-            if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
-                yield path
-
-
-def _workflow_inventory_skip_dir(parent: Path, dirname: str) -> bool:
-    if dirname in _CANDIDATE_SCAN_SKIP_DIRS:
-        return True
-    if dirname in {"pkg", "src"} and (parent / "PKGBUILD").exists():
-        return True
-    return False
+    if stat.S_ISREG(root_stat.st_mode):
+        if root.suffix.lower() not in _CANDIDATE_FILE_SUFFIXES:
+            return
+        try:
+            bound_parent = _bind_repository(root.parent)
+        except OSError:
+            budget.mark_incomplete("scan.root_parent_open_failed", str(root))
+            return
+        try:
+            try:
+                current_stat = _bound_lstat(bound_parent, root.name)
+                identity = (root_stat.st_dev, root_stat.st_ino)
+                if (
+                    not stat.S_ISREG(current_stat.st_mode)
+                    or (current_stat.st_dev, current_stat.st_ino) != identity
+                ):
+                    budget.mark_incomplete("scan.root_changed", str(root))
+                    return
+                raw_bytes = _read_bound_regular_file(bound_parent, root.name, budget=budget)
+                after_stat = _bound_lstat(bound_parent, root.name)
+            except (OSError, _BoundedReadError) as exc:
+                code = exc.code if isinstance(exc, _BoundedReadError) else "read.failed"
+                budget.mark_incomplete(code, str(root))
+                return
+            if (
+                (after_stat.st_dev, after_stat.st_ino) != identity
+                or not _repository_path_has_identity(bound_parent)
+            ):
+                budget.mark_incomplete("scan.root_changed", str(root))
+                return
+            if identity not in seen_files:
+                seen_files.add(identity)
+                yield root, raw_bytes
+                try:
+                    final_stat = _bound_lstat(bound_parent, root.name)
+                except OSError:
+                    budget.mark_incomplete("scan.root_changed", str(root))
+                    return
+                if (
+                    (final_stat.st_dev, final_stat.st_ino) != identity
+                    or not _repository_path_has_identity(bound_parent)
+                ):
+                    budget.mark_incomplete("scan.root_changed", str(root))
+        finally:
+            try:
+                if not _repository_path_has_identity(bound_parent):
+                    budget.mark_incomplete("scan.root_changed", str(root))
+                else:
+                    try:
+                        closing_stat = _bound_lstat(bound_parent, root.name)
+                    except OSError:
+                        budget.mark_incomplete("scan.root_changed", str(root))
+                    else:
+                        if (closing_stat.st_dev, closing_stat.st_ino) != (
+                            root_stat.st_dev,
+                            root_stat.st_ino,
+                        ):
+                            budget.mark_incomplete("scan.root_changed", str(root))
+            finally:
+                try:
+                    bound_parent.close()
+                except OSError:
+                    budget.mark_incomplete("scan.root_close_failed", str(root))
+        return
+    if not stat.S_ISDIR(root_stat.st_mode):
+        budget.mark_incomplete("scan.root_special_file_rejected", str(root))
+        return
+    try:
+        bound_root = _bind_repository(root)
+    except OSError:
+        budget.mark_incomplete("scan.root_open_failed", str(root))
+        return
+    files: list[tuple[Path, bytes]] = []
+    try:
+        seen_directories: set[tuple[int, int]] = set()
+        for relative_path in _scan_bound_directory(
+            bound_root,
+            Path("."),
+            budget=budget,
+            suffixes=_CANDIDATE_FILE_SUFFIXES,
+            skip_dirs=_CANDIDATE_SCAN_SKIP_DIRS,
+            depth=0,
+            seen_directories=seen_directories,
+        ):
+            try:
+                file_stat = _bound_lstat(bound_root, relative_path)
+                identity = (file_stat.st_dev, file_stat.st_ino)
+                if identity in seen_files:
+                    continue
+                raw_bytes = _read_bound_regular_file(
+                    bound_root,
+                    relative_path,
+                    budget=budget,
+                )
+            except (OSError, _BoundedReadError) as exc:
+                code = exc.code if isinstance(exc, _BoundedReadError) else "read.failed"
+                budget.mark_incomplete(code, relative_path.as_posix())
+                continue
+            seen_files.add(identity)
+            files.append((root / relative_path, raw_bytes))
+        if not _repository_path_has_identity(bound_root):
+            budget.mark_incomplete("scan.root_changed", str(root))
+            files.clear()
+        for path, raw_bytes in files:
+            if not _repository_path_has_identity(bound_root):
+                budget.mark_incomplete("scan.root_changed", str(root))
+                return
+            yield path, raw_bytes
+            if not _repository_path_has_identity(bound_root):
+                budget.mark_incomplete("scan.root_changed", str(root))
+                return
+    finally:
+        if not _repository_path_has_identity(bound_root):
+            budget.mark_incomplete("scan.root_changed", str(root))
+        try:
+            bound_root.close()
+        except OSError:
+            budget.mark_incomplete("scan.root_close_failed", str(root))
 
 
 def _workflow_inventory_entry(
@@ -6344,11 +7695,11 @@ def _workflow_inventory_entry(
     contracts: dict[str, WorkflowContract],
     *,
     source_scope: str = "operator-source-root",
+    raw_bytes: bytes,
 ) -> dict[str, Any] | None:
-    raw_bytes = _read_bytes(path)
     raw_text = raw_bytes.decode(errors="ignore")
     source_path = path.relative_to(root).as_posix() if path != root else path.name
-    source_kind = _workflow_source_kind(root, path, raw_text)
+    source_kind = _workflow_source_kind(root, path, raw_text, source_scope)
     signals = _workflow_inventory_signals(source_path, raw_text, source_kind)
     if not signals:
         return None
@@ -6361,7 +7712,13 @@ def _workflow_inventory_entry(
         "source_scope": source_scope,
         "source_path": source_path,
         "source_kind": source_kind,
-        "material_scope": _workflow_material_scope(source_kind, source_path, path, raw_text),
+        "material_scope": _workflow_material_scope(
+            source_kind,
+            source_path,
+            path,
+            raw_text,
+            source_scope,
+        ),
         "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "candidate_operator_intent": _workflow_operator_intent(target, signals, source_kind),
         "likely_workflow_catalog_target": target,
@@ -6375,13 +7732,18 @@ def _workflow_inventory_entry_id(root: Path, path: Path) -> str:
     return f"workflow-inventory:{digest[:16]}"
 
 
-def _workflow_source_kind(root: Path, path: Path, raw_text: str) -> str:
+def _workflow_source_kind(
+    root: Path,
+    path: Path,
+    raw_text: str,
+    source_scope: str,
+) -> str:
     rel_parts = path.relative_to(root).parts if path != root else path.parts[-1:]
     lowered_text = raw_text.lower()
     if path.name in {"AGENTS.md", "CLAUDE.md"}:
         return "agent-instruction"
     if path.name == "SKILL.md":
-        return "global-skill" if _is_user_global_agents_path(path) else "repo-local-skill"
+        return "global-skill" if source_scope == "user-global" else "repo-local-skill"
     if _workflow_path_has_token(rel_parts, {"handoff", "handoffs"}) or (
         "handoff contract" in lowered_text
     ):
@@ -6419,17 +7781,6 @@ def _workflow_path_tokens(part: str) -> tuple[str, ...]:
     return tuple(token for token in re.split(r"[^a-z0-9]+", Path(part).stem.lower()) if token)
 
 
-def _is_user_global_agents_path(path: Path) -> bool:
-    resolved = path.resolve()
-    home = Path.home().resolve()
-    user_global_roots = (
-        home / ".agents",
-        home / ".codex" / "skills",
-        home / ".codex" / "plugins" / "cache" / "fork-ops",
-    )
-    return any(resolved.is_relative_to(root.resolve()) for root in user_global_roots)
-
-
 def _workflow_inventory_signals(
     source_path: str,
     raw_text: str,
@@ -6458,6 +7809,7 @@ def _workflow_material_scope(
     source_path: str,
     path: Path,
     raw_text: str,
+    source_scope: str,
 ) -> str:
     lowered_text = raw_text.lower()
     if source_kind == "global-skill":
@@ -6465,10 +7817,20 @@ def _workflow_material_scope(
     if source_kind in {"repo-local-skill", "agent-instruction", "config"}:
         return "fork-local-authority-material"
     if source_kind in {"policy", "gate"}:
-        if _workflow_path_or_content_is_fork_local_authority(source_path, path, lowered_text):
+        if _workflow_path_or_content_is_fork_local_authority(
+            source_path,
+            path,
+            lowered_text,
+            source_scope,
+        ):
             return "fork-local-authority-material"
         return "reusable-workflow-material"
-    if _workflow_path_or_content_is_fork_local_authority(source_path, path, lowered_text):
+    if _workflow_path_or_content_is_fork_local_authority(
+        source_path,
+        path,
+        lowered_text,
+        source_scope,
+    ):
         return "fork-local-authority-material"
     return "reusable-workflow-material"
 
@@ -6477,10 +7839,11 @@ def _workflow_path_or_content_is_fork_local_authority(
     source_path: str,
     path: Path,
     lowered_text: str,
+    source_scope: str,
 ) -> bool:
     lowered_path = source_path.lower()
     path_parts = tuple(part.lower() for part in path.parts)
-    user_global_agents_path = _is_user_global_agents_path(path)
+    user_global_agents_path = source_scope == "user-global"
     return (
         (lowered_path in {"agents.md", "claude.md"} and not user_global_agents_path)
         or (
@@ -7248,7 +8611,10 @@ def _check_remote_url(
                 code="git.remote_url_mismatch",
                 message=f"Configured URL for remote '{name}' differs from local Git.",
                 path=f"{path}.url",
-                detail={"configured": expected_url, "actual": actual_url},
+                detail={
+                    "configured": _public_url_projection(str(expected_url)),
+                    "actual": _public_url_projection(actual_url),
+                },
             )
         )
 
@@ -7266,65 +8632,79 @@ def _git_output(repo: Path, *args: str) -> str | None:
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     command = ["git", "-C", str(repo), *args]
+    return _default_command_runner(command, repo, 10.0)
+
+
+def _iter_candidate_paths(
+    repo: Path,
+    budget: _OperationBudget,
+) -> Iterable[tuple[Path, _BoundRepository]]:
     try:
-        return subprocess.run(
-            command,
-            check=False,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(command, 124, "", str(exc))
-    except FileNotFoundError as exc:
-        return subprocess.CompletedProcess(command, 127, "", str(exc))
-
-
-def _iter_candidate_paths(repo: Path) -> Iterable[Path]:
-    roots = [
-        repo / "AGENTS.md",
-        repo / "CLAUDE.md",
-        repo / "docs" / "agents",
-        repo / "docs" / "adr",
-        repo / "docs" / "maintainers",
-        repo / ".agents",
-        repo / ".codex",
-    ]
-    for root in roots:
-        if root.is_file():
-            yield root
-        elif root.is_dir():
-            for path in root.rglob("*"):
-                if not path.is_file():
-                    continue
-                relative_parts = path.relative_to(root).parts
-                if any(part in _CANDIDATE_SCAN_SKIP_DIRS for part in relative_parts[:-1]):
-                    continue
-                if path.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
-                    yield path
-
-
-def _read_text(path: Path) -> str:
-    try:
-        return path.read_text(errors="ignore")
+        bound_repo = _bind_repository(repo)
     except OSError:
-        return ""
-
-
-def _read_bytes(path: Path) -> bytes:
+        budget.mark_incomplete("scan.root_open_failed", str(repo))
+        return
+    budget.root_count += 1
+    paths: list[Path] = []
     try:
-        return path.read_bytes()
-    except OSError:
-        return b""
-
-
-def _file_sha256(path: Path) -> str:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return ""
+        seen_directories: set[tuple[int, int]] = set()
+        for relative_root in (
+            Path("AGENTS.md"),
+            Path("CLAUDE.md"),
+            Path("docs/agents"),
+            Path("docs/adr"),
+            Path("docs/maintainers"),
+            Path(".agents"),
+            Path(".codex"),
+        ):
+            try:
+                root_stat = _bound_lstat(bound_repo, relative_root)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                budget.mark_incomplete("scan.root_stat_failed", relative_root.as_posix())
+                continue
+            if stat.S_ISLNK(root_stat.st_mode):
+                budget.mark_incomplete("scan.symlink_rejected", relative_root.as_posix())
+            elif stat.S_ISREG(root_stat.st_mode):
+                if relative_root.suffix.lower() in _CANDIDATE_FILE_SUFFIXES:
+                    paths.append(relative_root)
+            elif stat.S_ISDIR(root_stat.st_mode):
+                for path in _scan_bound_directory(
+                    bound_repo,
+                    relative_root,
+                    budget=budget,
+                    suffixes=_CANDIDATE_FILE_SUFFIXES,
+                    skip_dirs=_CANDIDATE_SCAN_SKIP_DIRS,
+                    depth=len(relative_root.parts),
+                    seen_directories=seen_directories,
+                ):
+                    paths.append(path)
+                if any(
+                    reason["code"].startswith("limit.")
+                    for reason in budget.incomplete_reasons
+                ):
+                    return
+            else:
+                budget.mark_incomplete("scan.special_file_rejected", relative_root.as_posix())
+        if not _repository_path_has_identity(bound_repo):
+            budget.mark_incomplete("scan.root_changed", str(repo))
+            paths.clear()
+        for path in paths:
+            if not _repository_path_has_identity(bound_repo):
+                budget.mark_incomplete("scan.root_changed", str(repo))
+                return
+            yield path, bound_repo
+            if not _repository_path_has_identity(bound_repo):
+                budget.mark_incomplete("scan.root_changed", str(repo))
+                return
+    finally:
+        if not _repository_path_has_identity(bound_repo):
+            budget.mark_incomplete("scan.root_changed", str(repo))
+        try:
+            bound_repo.close()
+        except OSError:
+            budget.mark_incomplete("scan.root_close_failed", str(repo))
 
 
 def _fork_signals(text: str) -> list[str]:
@@ -7494,7 +8874,11 @@ def _extract_remote_url_facts(text: str) -> list[dict[str, str]]:
         remote_name = _remote_name_for_line(line)
         if not remote_name:
             continue
-        for url in _extract_urls(line):
+        raw_urls = re.findall(r"https?://[^\s<)]+", line, flags=re.IGNORECASE)
+        for raw_url in raw_urls:
+            if _url_has_credentials(raw_url):
+                continue
+            url = _public_url_projection(raw_url)
             if not _github_repo_root_slug_from_url(url):
                 continue
             suggested_config = "fork_remotes.url" if remote_name == "origin" else "upstreams.url"

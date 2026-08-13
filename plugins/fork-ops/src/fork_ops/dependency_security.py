@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
+import tempfile
+import threading
+import time
+import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -25,6 +32,8 @@ DEPENDENCY_EVIDENCE_SCHEMA_VERSION: Final = "2.0"
 DEPENDENCY_PROVENANCE_SCHEMA_VERSION: Final = "1.0"
 MAX_OBSERVATION_VALIDITY: Final = timedelta(minutes=15)
 UV_AUDIT_TIMEOUT_SECONDS: Final = 120
+UV_AUDIT_MAX_OUTPUT_BYTES: Final = 8 * 1024 * 1024
+UV_AUDIT_MAX_INPUT_BYTES: Final = 16 * 1024 * 1024
 UvAuditRunner = Callable[[list[str], Path], subprocess.CompletedProcess[str]]
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -191,6 +200,7 @@ def collect_uv_audit_evidence(
     producer_identity: Mapping[str, object] | None = None,
     observation_epoch: str | None = None,
     runner: UvAuditRunner | None = None,
+    uv_executable: str | Path | None = None,
 ) -> VerifiedDependencyEvidence | dict[str, object]:
     """Run four locked audits using each interpreter's package-scope inventory."""
     observation_started = datetime.now(UTC)
@@ -220,15 +230,43 @@ def collect_uv_audit_evidence(
         return _uv_evidence_failure(
             "A canonical dependency observation epoch is required."
         )
-    repo = Path(repo_path).expanduser().resolve()
+    repo = Path(os.path.abspath(Path(repo_path).expanduser()))
+    if runner is not None and uv_executable is not None:
+        return _uv_evidence_failure(
+            "An injected audit runner and explicit uv executable cannot be combined."
+        )
+    trusted_uv: Path | None = None
+    if runner is None:
+        try:
+            _validate_uv_audit_project(repo)
+            trusted_uv = _trusted_uv_executable(uv_executable)
+        except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+            return _uv_evidence_failure(f"uv audit project policy rejected the candidate: {exc}")
     execute = runner or _run_uv_audit
-    adapter_is_trusted = runner is None
     matrix_advisories: list[dict[str, object]] = []
     for python_version in SUPPORTED_PYTHON_VERSIONS:
         command = [
-            "uv",
+            str(trusted_uv) if trusted_uv is not None else "uv",
             "audit",
             "--locked",
+            *(
+                [
+                    "--frozen",
+                    "--no-config",
+                    "--no-sources",
+                    "--no-build",
+                    "--default-index",
+                    "https://pypi.org/simple",
+                    "--index-strategy",
+                    "first-index",
+                    "--keyring-provider",
+                    "disabled",
+                    "--service-url",
+                    "https://api.osv.dev/v1/querybatch",
+                ]
+                if trusted_uv is not None
+                else []
+            ),
             "--output-format",
             "json",
             "--python-platform",
@@ -242,7 +280,7 @@ def collect_uv_audit_evidence(
             return _uv_evidence_failure(
                 f"uv audit timed out for Python {python_version}."
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError, UnicodeError):
             return _uv_evidence_failure(
                 f"uv audit could not be executed for Python {python_version}."
             )
@@ -279,7 +317,7 @@ def collect_uv_audit_evidence(
         "source_observation": {
             "provider": "osv",
             "source_identity": "osv.dev:uv-audit",
-            "authenticated": adapter_is_trusted,
+            "authenticated": False,
             "pagination_complete": True,
             "page_count": len(SUPPORTED_PYTHON_VERSIONS),
             "item_count": len(merged_advisories),
@@ -290,25 +328,232 @@ def collect_uv_audit_evidence(
         },
     }
     payload = _uv_evidence("available", merged_advisories, [], provenance=provenance)
-    if not adapter_is_trusted:
-        return payload
-    return VerifiedDependencyEvidence._from_adapter(payload, seal=_OBSERVATION_SEAL)
+    return payload
+
+
+def _trusted_uv_executable(requested: str | Path | None) -> Path:
+    if requested is None:
+        raise ValueError("an explicit trusted uv executable is required")
+    selected = os.fspath(requested)
+    if not Path(selected).expanduser().is_absolute():
+        raise ValueError("the trusted uv executable must be an absolute path")
+    executable = Path(selected).expanduser().resolve(strict=True)
+    metadata = executable.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
+        raise ValueError("uv must be an executable regular file")
+    return executable
+
+
+def _read_regular_input(path: Path) -> bytes:
+    lexical = path.lstat()
+    if not stat.S_ISREG(lexical.st_mode) or lexical.st_size > UV_AUDIT_MAX_INPUT_BYTES:
+        raise ValueError(f"{path.name} must be a bounded regular file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        if opened.st_dev != lexical.st_dev or opened.st_ino != lexical.st_ino:
+            raise ValueError(f"{path.name} changed before its no-follow read")
+        content = source.read(UV_AUDIT_MAX_INPUT_BYTES + 1)
+        finished = os.fstat(source.fileno())
+    if (
+        len(content) > UV_AUDIT_MAX_INPUT_BYTES
+        or finished.st_size != opened.st_size
+        or finished.st_mtime_ns != opened.st_mtime_ns
+        or finished.st_ctime_ns != opened.st_ctime_ns
+    ):
+        raise ValueError(f"{path.name} changed or exceeded its bounded read")
+    return content
+
+
+def _validate_uv_audit_project(repo: Path) -> None:
+    metadata = repo.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or repo.is_symlink():
+        raise ValueError("repository must be a plain directory")
+    for name in ("uv.toml", ".uv.toml"):
+        try:
+            (repo / name).lstat()
+        except FileNotFoundError:
+            continue
+        raise ValueError(f"candidate {name} configuration is not permitted")
+    _read_regular_input(repo / "uv.lock")
+    project = tomllib.loads(_read_regular_input(repo / "pyproject.toml").decode("utf-8"))
+    tool = project.get("tool", {})
+    if not isinstance(tool, dict):
+        raise ValueError("project tool configuration must be a table")
+    uv = tool.get("uv", {})
+    if not isinstance(uv, dict):
+        raise ValueError("project uv configuration must be a table")
+    forbidden_uv_keys = {
+        "index",
+        "index-url",
+        "extra-index-url",
+        "find-links",
+        "keyring-provider",
+        "allow-insecure-host",
+        "config-settings",
+    }
+    if forbidden_uv_keys.intersection(uv):
+        raise ValueError("candidate index, transport, or build configuration is not permitted")
+    sources = uv.get("sources", {})
+    if not isinstance(sources, dict) or any(
+        not isinstance(value, dict) or value != {"workspace": True}
+        for value in sources.values()
+    ):
+        raise ValueError("candidate URL, VCS, or path sources are not permitted")
+    workspace = uv.get("workspace", {})
+    if not isinstance(workspace, dict):
+        raise ValueError("candidate workspace configuration must be a table")
+    members = workspace.get("members", [])
+    if not isinstance(members, list) or any(
+        not isinstance(member, str)
+        or Path(member).is_absolute()
+        or ".." in Path(member).parts
+        for member in members
+    ):
+        raise ValueError("candidate workspace members must stay within the repository")
+    dependency_values: list[object] = []
+    project_table = project.get("project", {})
+    if not isinstance(project_table, dict) or "dynamic" in project_table:
+        raise ValueError("dynamic project metadata is not permitted")
+    dependency_values.extend(project_table.get("dependencies", []))
+    optional = project_table.get("optional-dependencies", {})
+    groups = project.get("dependency-groups", {})
+    for collection in (optional, groups):
+        if not isinstance(collection, dict):
+            raise ValueError("dependency groups must be tables")
+        for values in collection.values():
+            if not isinstance(values, list):
+                raise ValueError("dependency groups must be arrays")
+            dependency_values.extend(values)
+    for dependency in dependency_values:
+        if not isinstance(dependency, str) or re.search(
+            r"(?:\s@\s|https?://|git\+|file:|ssh:)",
+            dependency,
+            re.IGNORECASE,
+        ):
+            raise ValueError("direct URL, VCS, and path dependencies are not permitted")
 
 
 def _run_uv_audit(
     command: list[str],
     cwd: Path,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    if os.name != "posix":
+        raise OSError("The secure uv audit adapter requires POSIX process-group isolation")
+    with tempfile.TemporaryDirectory(prefix="fork-ops-uv-audit-") as temp_dir:
+        root = Path(temp_dir)
+        home = root / "home"
+        cache = root / "cache"
+        scratch = root / "tmp"
+        for directory in (home, cache, scratch):
+            directory.mkdir(mode=0o700)
+        environment = {
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": os.defpath,
+            "TMPDIR": str(scratch),
+            "UV_CACHE_DIR": str(cache),
+            "UV_DEFAULT_INDEX": "https://pypi.org/simple",
+            "UV_INDEX_STRATEGY": "first-index",
+            "UV_KEYRING_PROVIDER": "disabled",
+            "UV_NO_BUILD": "1",
+            "UV_NO_CONFIG": "1",
+            "UV_NO_PROGRESS": "1",
+            "UV_NO_SOURCES": "1",
+            "UV_PYTHON_DOWNLOADS": "never",
+        }
+        stdout, stderr, returncode = _run_bounded_uv_process(
+            command,
+            cwd=cwd,
+            environment=environment,
+        )
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout.decode("utf-8"),
+        stderr.decode("utf-8"),
+    )
+
+
+def _terminate_uv_process_group(process: subprocess.Popen[bytes]) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(process.pid, 15)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=0.5)
+    if process.poll() is None:
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, 9)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0.5)
+
+
+def _run_bounded_uv_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> tuple[bytes, bytes, int]:
+    process = subprocess.Popen(
         command,
         cwd=cwd,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=UV_AUDIT_TIMEOUT_SECONDS,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    if process.stdout is None or process.stderr is None:
+        _terminate_uv_process_group(process)
+        raise OSError("uv audit output pipes were unavailable")
+    streams = (process.stdout, process.stderr)
+    buffers = (bytearray(), bytearray())
+    counts = [0, 0]
+    total = 0
+    lock = threading.Lock()
+    overflow = threading.Event()
+
+    def drain(index: int) -> None:
+        nonlocal total
+        with streams[index]:
+            while chunk := streams[index].read(64 * 1024):
+                with lock:
+                    counts[index] += len(chunk)
+                    remaining = UV_AUDIT_MAX_OUTPUT_BYTES - total
+                    total += len(chunk)
+                    if remaining > 0:
+                        buffers[index].extend(chunk[:remaining])
+                    if total > UV_AUDIT_MAX_OUTPUT_BYTES:
+                        overflow.set()
+
+    readers = [threading.Thread(target=drain, args=(index,), daemon=True) for index in range(2)]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + UV_AUDIT_TIMEOUT_SECONDS
+    timed_out = False
+    while process.poll() is None:
+        if overflow.is_set():
+            _terminate_uv_process_group(process)
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _terminate_uv_process_group(process)
+            break
+        time.sleep(0.01)
+    returncode = process.poll()
+    for reader in readers:
+        reader.join(timeout=1)
+    if any(reader.is_alive() for reader in readers):
+        _terminate_uv_process_group(process)
+        raise subprocess.SubprocessError("uv audit descendant retained an output pipe")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, UV_AUDIT_TIMEOUT_SECONDS)
+    if overflow.is_set():
+        raise subprocess.SubprocessError("uv audit exceeded the combined output limit")
+    if returncode is None:
+        raise subprocess.SubprocessError("uv audit did not reach a terminal state")
+    return bytes(buffers[0]), bytes(buffers[1]), returncode
 
 
 def _normalize_uv_audit_output(

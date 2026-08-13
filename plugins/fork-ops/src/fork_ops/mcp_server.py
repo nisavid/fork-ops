@@ -13,6 +13,7 @@ from typing import Any, cast
 from .core import (
     CONFIG_RELATIVE_PATH,
     ForkOpsError,
+    _validate_bounded_object,
     assess_migration,
     build_equipment_migration_preflight,
     build_plugin_health_report,
@@ -129,6 +130,7 @@ def fork_ops_equipment_migration_preflight(
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
     """Build a read-only equipment migration preflight for onboarding."""
+    _validate_bounded_object(source_roots or [], label="MCP source roots")
     return build_equipment_migration_preflight(
         repo_path,
         source_roots,
@@ -151,15 +153,21 @@ def fork_ops_migration_dry_run(
     """Preview a migration plan without mutating the repository."""
     if migration_plan is not None and scan_profile != "custom":
         raise ForkOpsError("scan_profile cannot be used with migration_plan.")
+    if migration_plan is not None:
+        _validate_bounded_object(migration_plan, label="MCP migration plan")
     return dry_run_migration(repo_path, plan=migration_plan, scan_profile=scan_profile)
 
 
 @_tool
 def fork_ops_migration_execute(
-    repo_path: str = "",
+    repo_path: str | None = None,
     migration_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply a validated migration plan through guarded operations."""
+    if repo_path is None or not repo_path.strip():
+        raise ForkOpsError("Mutation requires an explicit non-empty repository path.")
+    if migration_plan is not None:
+        _validate_bounded_object(migration_plan, label="MCP migration plan")
     return execute_migration(repo_path, plan=migration_plan)
 
 
@@ -169,6 +177,7 @@ def fork_ops_migration_blocker_resolution(
     blocker_code: str | None = None,
 ) -> dict[str, Any]:
     """Explain a migration blocker from structured workflow output."""
+    _validate_bounded_object(workflow_output, label="MCP workflow output")
     return explain_migration_blocker(workflow_output, blocker_code)
 
 
@@ -196,6 +205,7 @@ def fork_ops_workflow_migration_inventory(
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
     """Build a read-only workflow migration inventory from source roots."""
+    _validate_bounded_object(source_roots or [], label="MCP source roots")
     return build_workflow_migration_inventory(source_roots, scan_profile=scan_profile)
 
 
