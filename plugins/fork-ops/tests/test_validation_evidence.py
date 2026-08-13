@@ -339,6 +339,33 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             source_commands = {
                 check["id"]: check["command"] for check in source_evidence["checks"]
             }
+            source_container_commands = {
+                check_id: command
+                for check_id, command in source_commands.items()
+                if command[0:2] == ["docker", "run"]
+                and any(
+                    argument.startswith("python:") and "@sha256:" in argument
+                    for argument in command
+                )
+            }
+            self.assertEqual(
+                set(source_container_commands),
+                {
+                    "cli_surface_inventory",
+                    "workflow_catalog",
+                    "ruff",
+                    "pytest",
+                    "pyrefly_strict",
+                    "schema_parity",
+                },
+            )
+            for command in source_container_commands.values():
+                image = next(
+                    argument
+                    for argument in command
+                    if argument.startswith("python:") and "@sha256:" in argument
+                )
+                self.assertEqual(image, source_image)
             for check_id in ("cli_surface_inventory", "workflow_catalog", "pytest"):
                 workspace_mount = next(
                     argument
@@ -358,7 +385,6 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if argument.startswith("python:") and "@sha256:" in argument
                 )
                 self.assertEqual(command[image_index + 1], f"/opt/fork-ops/bin/{tool}")
-                self.assertEqual(command[image_index], source_image)
             self.assertEqual(
                 source_commands["pyrefly_strict"][-2:],
                 ["--site-package-path", "/opt/fork-ops/site-packages"],
