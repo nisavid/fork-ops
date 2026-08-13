@@ -643,6 +643,88 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 evidence["identity"]["test_contract"],
             )
 
+    def test_workflow_pinned_uv_projects_universal_lock_markers_per_minor(self) -> None:
+        uv = shutil.which("uv")
+        if uv is None:
+            self.skipTest("The candidate container intentionally does not contain uv")
+        version = subprocess.run(
+            [uv, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if version.returncode != 0 or version.stdout.strip().split()[:2] != ["uv", "0.12.3"]:
+            self.skipTest("This integration regression requires workflow-pinned uv 0.12.3")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            locked = root / "runtime-locked.txt"
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": os.defpath,
+                "UV_CACHE_DIR": str(root / "cache"),
+                "UV_DEFAULT_INDEX": "https://pypi.org/simple",
+                "UV_INDEX_STRATEGY": "first-index",
+                "UV_KEYRING_PROVIDER": "disabled",
+                "UV_NO_CONFIG": "1",
+                "UV_NO_PROGRESS": "1",
+                "UV_PYTHON_DOWNLOADS": "never",
+            }
+            export = subprocess.run(
+                [
+                    uv,
+                    "export",
+                    "--locked",
+                    "--package",
+                    "fork-ops",
+                    "--no-dev",
+                    "--no-default-groups",
+                    "--no-emit-project",
+                    "--no-emit-workspace",
+                    "--no-annotate",
+                    "--no-header",
+                    "--output-file",
+                    str(locked),
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(export.returncode, 0, export.stderr)
+            for minor in ("3.11", "3.12", "3.13", "3.14"):
+                with self.subTest(minor=minor):
+                    projected = root / f"runtime-{minor}.txt"
+                    compile_result = subprocess.run(
+                        [
+                            uv,
+                            "pip",
+                            "compile",
+                            str(locked),
+                            "--python-version",
+                            minor,
+                            "--python-platform",
+                            "linux",
+                            "--no-deps",
+                            "--no-header",
+                            "--no-annotate",
+                            "--generate-hashes",
+                            "--output-file",
+                            str(projected),
+                        ],
+                        cwd=REPOSITORY_ROOT,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+                    includes_typing_extensions = "typing-extensions==" in projected.read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertEqual(includes_typing_extensions, minor in {"3.11", "3.12"})
+
     def test_child_failure_still_emits_terminal_aggregate_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
