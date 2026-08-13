@@ -2062,6 +2062,10 @@ def _validate_closed_workspace_project(repo: Path) -> dict[str, object]:
     uv = root_tool.get("uv")
     if not isinstance(uv, dict) or set(uv) != {"package", "default-groups", "sources", "workspace"}:
         raise ValueError("Closed workspace requires the closed uv contract")
+    if uv.get("package") is not False:
+        raise ValueError("Closed workspace requires the non-package root project")
+    if uv.get("default-groups") != ["test", "development"]:
+        raise ValueError("Closed workspace default groups are unsupported")
     if uv.get("sources") != {"fork-ops": {"workspace": True}}:
         raise ValueError("Closed workspace permits only the fork-ops workspace source")
     if uv.get("workspace") != {"members": ["plugins/fork-ops"]}:

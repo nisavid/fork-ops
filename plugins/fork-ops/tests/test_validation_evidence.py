@@ -358,6 +358,11 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
     def test_locked_workspace_modes_reject_unsafe_sources_before_uv(self) -> None:
         unsafe_project_replacements = {
+            "package-mode": ("package = false", "package = true"),
+            "default-groups": (
+                'default-groups = ["test", "development"]',
+                'default-groups = ["build"]',
+            ),
             "tool-source": (
                 'fork-ops = { workspace = true }',
                 'fork-ops = { git = "https://example.invalid/fork-ops" }',
