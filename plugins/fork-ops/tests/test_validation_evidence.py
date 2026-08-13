@@ -528,8 +528,14 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertTrue(all("--python" not in command for command in scope_exports))
             self.assertEqual(len(marker_projections), 20)
             self.assertEqual(
-                {command[command.index("--python-version") + 1] for command in marker_projections},
-                {"3.11", "3.12", "3.13", "3.14"},
+                {
+                    minor: sum(
+                        command[command.index("--python-version") + 1] == minor
+                        for command in marker_projections
+                    )
+                    for minor in ("3.11", "3.12", "3.13", "3.14")
+                },
+                {"3.11": 5, "3.12": 5, "3.13": 5, "3.14": 5},
             )
             self.assertTrue(
                 all(check["required_ids"] for check in evidence["checks"]),
@@ -718,6 +724,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         check=False,
                         capture_output=True,
                         text=True,
+                        timeout=120,
                     )
                     self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
                     includes_typing_extensions = "typing-extensions==" in projected.read_text(
