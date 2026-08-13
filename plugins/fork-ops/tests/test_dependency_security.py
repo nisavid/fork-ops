@@ -1173,6 +1173,23 @@ class DependencySecurityTests(unittest.TestCase):
             if not isinstance(source, dict):
                 self.fail("source observation must be an object")
             self.assertIs(source["authenticated"], False)
+            evaluated = evaluate_dependency_security(
+                result,
+                _verified_evidence("dependabot", []),
+                _inventory(),
+                evaluation_context=_trusted_evaluation(),
+            )
+            self.assertEqual(evaluated["status"], "failed")
+            diagnostics = evaluated["diagnostics"]
+            if not isinstance(diagnostics, list):
+                self.fail("diagnostics must be a list")
+            self.assertTrue(
+                any(
+                    diagnostic.get("code") == "evidence.unverified"
+                    for diagnostic in diagnostics
+                    if isinstance(diagnostic, dict)
+                )
+            )
             records = [json.loads(line) for line in observations.read_text().splitlines()]
             self.assertEqual(len(records), 4)
             for record in records:
@@ -1184,6 +1201,26 @@ class DependencySecurityTests(unittest.TestCase):
                 self.assertNotIn("GITHUB_TOKEN", environment)
                 self.assertEqual(environment["UV_NO_CONFIG"], "1")
                 self.assertEqual(environment["UV_KEYRING_PROVIDER"], "disabled")
+
+    def test_uv_adapter_does_not_publish_host_paths_from_inspection_errors(self) -> None:
+        secret_path = "/home/operator/private/worktree/pyproject.toml"
+        with mock.patch.object(
+            dependency_security_module,
+            "_validate_uv_audit_project",
+            side_effect=OSError(secret_path),
+        ):
+            result = dependency_security_module.collect_uv_audit_evidence(
+                Path("/repo"),
+                package_scopes_by_python=_package_scopes_by_python(),
+                package_versions_by_python=_package_versions_by_python(),
+                candidate_identity=_candidate_identity(),
+                producer_identity=_producer_identity(),
+                observation_epoch="d" * 64,
+                uv_executable="/trusted/uv",
+            )
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn(secret_path, json.dumps(result))
 
     def test_default_uv_adapter_rejects_candidate_config_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

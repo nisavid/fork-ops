@@ -2073,6 +2073,25 @@ def test_generated_guide_contract_hash_and_golden_vectors_cannot_drift() -> None
     assert "bootstrap" not in guide.lower()
 
 
+def test_projection_generator_rejects_unknown_response_clock_units() -> None:
+    namespace = runpy.run_path(str(PROJECTION_SCRIPT), run_name="projection_units_test")
+    render_guide = namespace["_render_guide"]
+    contract = json.loads(
+        (
+            REPOSITORY_ROOT
+            / "plugins"
+            / "fork-ops"
+            / "src"
+            / "fork_ops"
+            / "security-exception-contract-1.0.json"
+        ).read_text(encoding="utf-8")
+    )
+    contract["response_clock"]["triage"]["critical"]["kind"] = "unknown_unit"
+
+    with pytest.raises(ValueError, match="unknown response-clock unit"):
+        render_guide(contract, "0" * 64)
+
+
 def test_projection_generator_refuses_a_symlink_destination(tmp_path: Path) -> None:
     projection_root = tmp_path / "repo"
     guide_parent = projection_root / "docs" / "agents"

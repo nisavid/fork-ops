@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, get_args
 from unittest.mock import patch
 
+from fork_ops import cli as cli_module
 from fork_ops import core as core_module
 from fork_ops import mcp_server
 from fork_ops.cli import main as cli_main
@@ -180,6 +181,21 @@ def _mark_equipment_reviewed_retain(plan: dict[str, Any], source_path: str) -> N
 
 
 class ForkOpsCoreTests(unittest.TestCase):
+    def test_cli_json_stdin_reads_bounded_utf8_bytes(self) -> None:
+        cases = (
+            (b"{}   ", 4, "exceeds the file byte limit"),
+            (b"\xff", 4, "not valid UTF-8 text"),
+        )
+        for payload, byte_limit, expected in cases:
+            with self.subTest(expected=expected):
+                stdin = type("BinaryStdin", (), {"buffer": io.BytesIO(payload)})()
+                with (
+                    patch.object(cli_module.sys, "stdin", stdin),
+                    patch.object(cli_module, "MAX_FILE_BYTES", byte_limit),
+                    self.assertRaisesRegex(ForkOpsError, expected),
+                ):
+                    cli_module._read_json_object("-", "Migration plan")
+
     def test_migration_plan_rejects_cyclic_object_before_copy(self) -> None:
         plan: dict[str, Any] = {"operation": "migration-plan"}
         plan["cycle"] = plan

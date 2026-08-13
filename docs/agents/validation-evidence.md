@@ -4,7 +4,7 @@
 entrypoint. Every invocation requires an explicit mode and interpreter. The
 producer resolves that interpreter once before mode execution, records its
 absolute executable identity, and uses only that resolved path for every check.
-emits one terminal `validation_evidence_result` with schema version `1.0`.
+It emits one terminal `validation_evidence_result` with schema version `1.0`.
 `--execution-boundary container` is the fail-closed hosted boundary.
 `--execution-boundary local-observational` is the default for usable local
 diagnostics and never carries security authority.
@@ -69,7 +69,10 @@ digests. Full bounded JSON is parsed privately; display tails never become
 authority. The local uv/OSV transport is explicitly unauthenticated and the
 result remains observational. Candidate objects, serialized JSON, and `to_dict`
 projections cannot acquire the collector's in-process capability. These are
-observed graph memberships, not claims that one scope is another.
+observed graph memberships, not claims that one scope is another. An
+authenticated Dependabot provider adapter remains follow-up work; until it
+exists, serialized collector output must fail the dependency evaluator's trust
+boundary.
 
 Source evidence also discovers the public argparse leaf commands and the
 workflow catalog from the running package. The CLI inventory is an exact

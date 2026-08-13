@@ -201,7 +201,7 @@ def collect_uv_audit_evidence(
     observation_epoch: str | None = None,
     runner: UvAuditRunner | None = None,
     uv_executable: str | Path | None = None,
-) -> VerifiedDependencyEvidence | dict[str, object]:
+) -> dict[str, object]:
     """Run four locked audits using each interpreter's package-scope inventory."""
     observation_started = datetime.now(UTC)
     inventories = _package_scope_inventories(package_scopes_by_python)
@@ -240,8 +240,12 @@ def collect_uv_audit_evidence(
         try:
             _validate_uv_audit_project(repo)
             trusted_uv = _trusted_uv_executable(uv_executable)
-        except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+        except ValueError as exc:
             return _uv_evidence_failure(f"uv audit project policy rejected the candidate: {exc}")
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return _uv_evidence_failure(
+                "uv audit project policy could not safely inspect the candidate."
+            )
     execute = runner or _run_uv_audit
     matrix_advisories: list[dict[str, object]] = []
     for python_version in SUPPORTED_PYTHON_VERSIONS:
