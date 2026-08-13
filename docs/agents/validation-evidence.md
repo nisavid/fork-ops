@@ -7,7 +7,9 @@ absolute executable identity, and uses only that resolved path for every check.
 It emits one terminal `validation_evidence_result` with schema version `1.0`.
 `--execution-boundary container` is the fail-closed hosted boundary.
 `--execution-boundary local-observational` is the default for usable local
-diagnostics and never carries security authority.
+diagnostics. Its candidate-facing subprocesses receive an explicit minimal
+environment with no inherited GitHub, Actions, or credential variables, but
+the result never carries security authority.
 
 The modes are:
 
