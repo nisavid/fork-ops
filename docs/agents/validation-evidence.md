@@ -28,8 +28,9 @@ The modes are:
   The refreshed lock never replaces the checked-in lock.
 - `build`: exports the exact `build` dependency group with hashes, audits that
   build-only scope, installs only those binary dependencies, and executes the
-  PEP 517 backend in a private writable source copy inside the isolated
-  container. Only the explicit output directory is writable from the host.
+  PEP 517 backend in a private writable tmpfs copy made from a read-only source
+  mount inside the isolated container. Only the explicit output directory is a
+  writable host bind.
   The build must produce exactly one wheel and one source distribution; any
   additional file, directory, or symlink makes the candidate fail closed.
 - `release-preflight`: uses a read-only Actions token in a repository verifier
@@ -236,9 +237,11 @@ namespace override, a numeric non-root user,
 private size-bounded tmpfs paths, and an explicit environment. Installed
 validation mounts only the prepared site-packages tree and expected schema
 read-only. Source validation additionally mounts the verified candidate source
-read-only and an explicit coverage scratch directory. Build validation mounts
-only a private writable source copy, read-only build dependencies, and the
-explicit artifact output. No lane mounts the trusted verifier, final evidence,
+read-only, mounts pinned Ruff and Pyrefly binaries read-only, and exposes an
+explicit coverage scratch directory. Build validation mounts verified source
+and build dependencies read-only, copies source into private container tmpfs,
+and exposes only the explicit artifact output as a writable host bind. No lane
+mounts the trusted verifier, final evidence,
 runner temporary root, Docker socket, key, token, or host secret. The artifact
 directory is a closed set containing only the one recorded wheel and one
 recorded source distribution. A run ID alone is not release provenance.
@@ -246,7 +249,9 @@ recorded source distribution. A run ID alone is not release provenance.
 Containers with writable bind mounts use UID 65532 and the runner's numeric
 non-root primary group. The producer first verifies each private mount tree is
 symlink-free and runner-owned, then grants that group access without granting
-world access. Candidate Python disables automatic site hooks, omits the current
+world access. Read-only source mounts are likewise verified and made
+group-readable and traversable without becoming group-writable. Candidate
+Python disables automatic site hooks, omits the current
 working directory from module search, and searches trusted tool dependencies
 before candidate source. Host-side reads of candidate outputs retain no-follow
 semantics after the container exits.
