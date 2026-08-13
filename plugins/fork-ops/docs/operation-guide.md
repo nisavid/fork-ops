@@ -46,6 +46,10 @@ If post-create verification fails,
 the command preserves any extant target because portable filesystems do not
 provide an atomic identity-conditioned delete. It reports `applied_unverified`
 for operator review and never infers rollback from pathname absence.
+The mutating path requires the explicit `--repo` selection and does not derive
+authored remote URLs from mutable Git metadata. Generate-only config output may
+show credential-free projected remotes, but `--write` uses the supplied owner
+and repository arguments as its authority input.
 
 MCP tools expose the same surface for agents:
 

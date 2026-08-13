@@ -180,6 +180,148 @@ def _mark_equipment_reviewed_retain(plan: dict[str, Any], source_path: str) -> N
 
 
 class ForkOpsCoreTests(unittest.TestCase):
+    def test_migration_plan_rejects_cyclic_object_before_copy(self) -> None:
+        plan: dict[str, Any] = {"operation": "migration-plan"}
+        plan["cycle"] = plan
+
+        with self.assertRaisesRegex(ForkOpsError, "cyclic or aliased"):
+            dry_run_migration_plan(plan)
+
+    def test_mcp_plan_rejects_aggregate_object_bytes_before_copy(self) -> None:
+        plan = {"operation": "migration-plan", "values": ["x" * 1024] * 4097}
+
+        with self.assertRaisesRegex(ForkOpsError, "aggregate object byte limit"):
+            fork_ops_migration_execute(".", migration_plan=plan)
+
+    def test_migration_scan_charges_nested_url_results(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "AGENTS.md"
+            source_path.write_text(
+                "upstream sync\n" + "\n".join(f"https://example.com/{index}" for index in range(5))
+            )
+            with patch.object(core_module, "MAX_RESULT_ITEMS", 4):
+                assessment = assess_migration(repo_path)
+
+        self.assertFalse(assessment["complete"])
+        self.assertEqual(assessment["candidates"], [])
+        self.assertIn(
+            "limit.results",
+            {
+                reason["code"]
+                for reason in assessment["scan_accounting"]["incomplete_reasons"]
+            },
+        )
+
+    def test_migration_execution_rejects_false_scan_accounting_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["complete"] = False
+            plan["scan_accounting"]["complete"] = False
+            plan["blockers"] = list[dict[str, Any]]()
+
+            result = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(
+            "migration_execution.scan_accounting_incomplete",
+            {blocker["code"] for blocker in result["blockers"]},
+        )
+
+    def test_cli_plan_reader_rejects_symlink_and_oversized_input(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            plan = root_path / "plan.json"
+            link = root_path / "plan-link.json"
+            plan.write_text('{"operation":"migration-plan"}')
+            link.symlink_to(plan)
+            with self.assertRaisesRegex(ForkOpsError, "could not be opened"):
+                core_module._read_absolute_regular_file(link)
+            with patch.object(core_module, "MAX_FILE_BYTES", 4):
+                plan.write_bytes(b"12345")
+                with self.assertRaisesRegex(ForkOpsError, "byte limit"):
+                    core_module._read_absolute_regular_file(plan)
+
+    def test_config_reader_rejects_root_parent_and_final_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            actual_repo = root_path / "actual"
+            actual_repo.mkdir()
+            config = actual_repo / CONFIG_RELATIVE_PATH
+            config.parent.mkdir()
+            config.write_text(TRACK_AWARE_CONFIG)
+
+            repo_link = root_path / "repo-link"
+            repo_link.symlink_to(actual_repo, target_is_directory=True)
+            with self.assertRaisesRegex(ForkOpsError, "root_open_failed"):
+                core_module.load_raw_config(repo_link)
+
+            outside = root_path / "outside"
+            outside.mkdir()
+            (outside / "fork-ops.toml").write_text(TRACK_AWARE_CONFIG)
+            other_repo = root_path / "other"
+            other_repo.mkdir()
+            (other_repo / ".agents").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ForkOpsError, "parent_open_failed"):
+                core_module.load_raw_config(other_repo)
+
+            config.unlink()
+            config.symlink_to(outside / "fork-ops.toml")
+            with self.assertRaisesRegex(ForkOpsError, "open_failed"):
+                core_module.load_raw_config(actual_repo)
+
+    def test_cli_and_mcp_reports_reject_repository_root_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            outside = root_path / "outside"
+            outside.mkdir()
+            config = outside / CONFIG_RELATIVE_PATH
+            config.parent.mkdir()
+            config.write_text(TRACK_AWARE_CONFIG)
+            link = root_path / "repo-link"
+            link.symlink_to(outside, target_is_directory=True)
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main(["config", "show", "--repo", str(link), "--format", "json"])
+            mcp_report = fork_ops_migration_plan(str(link))
+
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("nisavid", output.getvalue())
+        self.assertFalse(mcp_report["complete"])
+        self.assertEqual(mcp_report["summary"]["candidate_count"], 0)
+
+    def test_config_reader_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            path = Path(repo) / CONFIG_RELATIVE_PATH
+            path.parent.mkdir()
+            os.mkfifo(path)
+
+            with self.assertRaisesRegex(ForkOpsError, "special_file"):
+                core_module.load_raw_config(repo)
+
+    def test_config_reader_allows_exact_byte_limit_and_rejects_limit_plus_one(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            path = Path(repo) / CONFIG_RELATIVE_PATH
+            path.parent.mkdir()
+            with patch.object(core_module, "MAX_FILE_BYTES", 4):
+                path.write_bytes(b"abcd")
+                self.assertEqual(core_module.load_raw_config(repo), "abcd")
+                path.write_bytes(b"abcde")
+                with self.assertRaisesRegex(ForkOpsError, "limit.file_bytes"):
+                    core_module.load_raw_config(repo)
+
+    def test_config_reader_rejects_explicit_path_outside_selected_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.NamedTemporaryFile() as outside:
+            with self.assertRaisesRegex(ForkOpsError, "stay inside"):
+                core_module.load_raw_config(repo, outside.name)
+
     def test_workflow_catalog_defines_intent_level_contracts(self) -> None:
         catalog = workflow_catalog()
 
@@ -633,8 +775,10 @@ class ForkOpsCoreTests(unittest.TestCase):
         checks = {check["id"]: check for check in report["checks"]}
         trusted_cwd = Path(mcp_server.__file__).resolve().parent
         self.assertEqual(checks["cli_execution"]["status"], "ready")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "ready")
-        self.assertEqual([cwd for _, cwd in launches], [trusted_cwd, trusted_cwd])
+        self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+        self.assertEqual([cwd for _, cwd in launches], [trusted_cwd])
+        self.assertEqual(checks["skill_discovery"]["status"], "uninspectable")
+        self.assertEqual(checks["mcp_config_resolution"]["status"], "uninspectable")
         self.assertTrue(
             all(str(plugin_root) not in argument for command, _ in launches for argument in command)
         )
@@ -788,21 +932,27 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(checks["cli_execution"]["evidence"]["workflows_type"], "NoneType")
 
     def test_plugin_health_default_runner_decodes_with_replacement(self) -> None:
-        captured_kwargs: dict[str, Any] = {}
+        completed = _default_command_runner(
+            [sys.executable, "-c", "import os; os.write(1, b'ok\\xff')"],
+            Path("."),
+            1.0,
+        )
 
-        def fake_run(
-            command: list[str],
-            **kwargs: Any,
-        ) -> subprocess.CompletedProcess[str]:
-            captured_kwargs.update(kwargs)
-            return subprocess.CompletedProcess(command, 0, "ok", "")
+        self.assertEqual(completed.stdout, "ok\ufffd")
 
-        with patch("fork_ops.core.subprocess.run", side_effect=fake_run):
-            completed = _default_command_runner(["probe"], Path("."), 1.0)
+    def test_plugin_health_default_runner_times_out_after_child_closes_pipes(self) -> None:
+        completed = _default_command_runner(
+            [
+                sys.executable,
+                "-c",
+                "import os,time; os.close(1); os.close(2); time.sleep(1)",
+            ],
+            Path("."),
+            0.05,
+        )
 
-        self.assertEqual(completed.stdout, "ok")
-        self.assertEqual(captured_kwargs["encoding"], "utf-8")
-        self.assertEqual(captured_kwargs["errors"], "replace")
+        self.assertEqual(completed.returncode, 124)
+        self.assertIn("wall-time limit", completed.stderr)
 
     def test_plugin_health_report_isolates_invalid_utf8_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -1510,20 +1660,24 @@ uncertainty_destination = "ask-human-operator"
             runtime_schema.parent.mkdir(parents=True)
             docs_schema.write_text(schema_json())
             runtime_schema.write_text(schema_json())
-            original_read_bytes = Path.read_bytes
+            original_reader = core_module._read_file_within_root
 
-            def unreadable(path: Path) -> bytes:
-                if path == docs_schema:
-                    raise PermissionError("permission denied")
-                return original_read_bytes(path)
+            def unreadable(
+                root: str | Path,
+                relative_path: str | Path,
+                **kwargs: Any,
+            ) -> bytes:
+                if Path(relative_path) == Path("schema/fork-ops.schema.json"):
+                    raise core_module._BoundedReadError("read.open_failed", "denied")
+                return original_reader(root, relative_path, **kwargs)
 
-            with patch.object(Path, "read_bytes", unreadable):
+            with patch("fork_ops.core._read_file_within_root", side_effect=unreadable):
                 report = schema_artifact_report(plugin_root)
 
         artifacts = {artifact["path"]: artifact for artifact in report["artifacts"]}
         self.assertFalse(report["ok"])
         self.assertFalse(artifacts["schema/fork-ops.schema.json"]["matches_runtime_schema"])
-        self.assertEqual(artifacts["schema/fork-ops.schema.json"]["error"], "permission denied")
+        self.assertEqual(artifacts["schema/fork-ops.schema.json"]["error"], "read.open_failed")
         self.assertTrue(artifacts["src/fork_ops/fork-ops.schema.json"]["matches_runtime_schema"])
 
     def test_normalize_config_accepts_toml_datetime_values(self) -> None:
@@ -1657,6 +1811,57 @@ uncertainty_destination = "ask-human-operator"
         )
         self.assertIsNone(
             _github_repo_root_slug_from_url("https://github.com/owner/repo/releases")
+        )
+
+    def test_url_evidence_is_projected_without_credentials_query_or_fragment(self) -> None:
+        urls = core_module._extract_urls(
+            "See HTTPS://user:secret@Example.COM:8443/docs?a=token#private"
+        )
+
+        self.assertEqual(urls, ["https://example.com:8443/docs"])
+        self.assertNotIn("secret", json.dumps(urls))
+        self.assertNotIn("token", json.dumps(urls))
+
+    def test_proposed_config_rejects_credential_bearing_git_remote_url(self) -> None:
+        credentialed = "https://user:secret@github.com/fork/repo.git?token=value#private"
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            _run_git(repo_path, "init")
+            _run_git(repo_path, "remote", "add", "origin", credentialed)
+
+            proposal = propose_migration_config_patch(repo_path)
+
+        serialized = json.dumps(proposal)
+        self.assertNotIn("url", proposal["config"]["fork_remotes"][0])
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("token=value", serialized)
+
+    def test_credential_bearing_github_url_does_not_infer_repository_authority(self) -> None:
+        credentialed = "https://token@github.com/secret-owner/secret-repo.git"
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            _run_git(repo_path, "init")
+            _run_git(repo_path, "remote", "add", "origin", credentialed)
+
+            proposal = propose_migration_config_patch(repo_path)
+
+        serialized = json.dumps(proposal)
+        self.assertEqual(proposal["config"]["repository"]["owner"], "OWNER")
+        self.assertEqual(proposal["config"]["repository"]["name"], "REPO")
+        self.assertNotIn("secret-owner", serialized)
+        self.assertNotIn("secret-repo", serialized)
+
+    def test_proposed_config_projects_supported_ssh_git_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            _run_git(repo_path, "init")
+            _run_git(repo_path, "remote", "add", "origin", "git@github.com:fork/repo.git")
+
+            proposal = propose_migration_config_patch(repo_path)
+
+        self.assertEqual(
+            proposal["config"]["fork_remotes"][0]["url"],
+            "https://github.com/fork/repo.git",
         )
 
     def test_upstream_stable_track_does_not_require_release_channel_evidence(self) -> None:
@@ -2315,7 +2520,7 @@ uncertainty_destination = "ask-human-operator"
 
             plan = generate_migration_plan(repo_path)
             dry_run = dry_run_migration_plan(plan)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertEqual(source_path.read_text(), UPSTREAM_REF_PRESSURE_TEXT)
             self.assertEqual(config_path.read_text(), TRACK_AWARE_CONFIG)
@@ -2540,7 +2745,7 @@ uncertainty_destination = "ask-human-operator"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
             plan["migration_review_artifact"]["entries"].append(
-                dict(plan["migration_review_artifact"]["entries"][0])
+                copy.deepcopy(plan["migration_review_artifact"]["entries"][0])
             )
 
             with self.assertRaisesRegex(
@@ -2600,7 +2805,7 @@ uncertainty_destination = "ask-human-operator"
             _mark_reviewed_retain(plan, "docs/agents/lemonade-local-policy.md")
 
             dry_run = dry_run_migration_plan(plan)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertEqual(
@@ -3081,8 +3286,9 @@ uncertainty_destination = "ask-human-operator"
             def swap_repo_after_blockers(
                 repo: Path,
                 preview: dict[str, Any],
+                **kwargs: Any,
             ) -> list[dict[str, Any]]:
-                blockers = original_blockers(repo, preview)
+                blockers = original_blockers(repo, preview, **kwargs)
                 repo_path.rename(displaced_repo)
                 repo_path.symlink_to(Path(outside), target_is_directory=True)
                 return blockers
@@ -3136,10 +3342,11 @@ uncertainty_destination = "ask-human-operator"
                     upstream_name="demo",
                 )
 
-            self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
-            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+            self.assertFalse((replacement_repo / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
     def test_config_initialization_rejects_repository_replaced_after_root_open(
         self,
@@ -3670,7 +3877,7 @@ uncertainty_destination = "ask-human-operator"
                 )
                 if path == CONFIG_RELATIVE_PATH.name and dir_fd is not None:
                     target_name_stats += 1
-                    if target_name_stats == 2:
+                    if target_name_stats == 3:
                         content = target_path.read_bytes()
                         target_path.write_bytes(b"Y" + content[1:])
                 return result
@@ -3872,7 +4079,7 @@ uncertainty_destination = "ask-human-operator"
                     upstream_name="demo",
                 )
 
-            self.assertTrue(target_path.is_file())
+            self.assertTrue(target_path.is_file(), result)
             self.assertIn('owner = "nisavid"', target_path.read_text())
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
@@ -4105,15 +4312,22 @@ uncertainty_destination = "ask-human-operator"
             runtime_schema.parent.mkdir(parents=True)
             docs_schema.write_text(schema_json())
             runtime_schema.write_text(schema_json())
-            original_read_bytes = Path.read_bytes
+            original_reader = core_module._read_file_within_root
             output = io.StringIO()
 
-            def unreadable(path: Path) -> bytes:
-                if path == docs_schema:
-                    raise PermissionError("permission denied")
-                return original_read_bytes(path)
+            def unreadable(
+                root: str | Path,
+                relative_path: str | Path,
+                **kwargs: Any,
+            ) -> bytes:
+                if Path(relative_path) == Path("schema/fork-ops.schema.json"):
+                    raise core_module._BoundedReadError("read.open_failed", "denied")
+                return original_reader(root, relative_path, **kwargs)
 
-            with patch.object(Path, "read_bytes", unreadable), redirect_stdout(output):
+            with patch(
+                "fork_ops.core._read_file_within_root",
+                side_effect=unreadable,
+            ), redirect_stdout(output):
                 exit_code = cli_main(["schema", "check", "--plugin-root", str(plugin_root)])
 
         self.assertEqual(exit_code, 1)
@@ -4398,7 +4612,7 @@ equipment = "not-a-table"
             source_path.write_text(source_text)
             plan = generate_migration_plan(repo_path)
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertEqual(source_path.read_text(), source_text)
@@ -4513,7 +4727,7 @@ equipment = "not-a-table"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             config_path = repo_path / CONFIG_RELATIVE_PATH
             self.assertTrue(config_path.exists())
@@ -4566,7 +4780,7 @@ equipment = "not-a-table"
             source_path.write_bytes(source_bytes)
 
             plan = generate_migration_plan(repo_path)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertEqual(
                 plan["retained_source_materials"][0]["content_sha256"],
@@ -4589,7 +4803,7 @@ equipment = "not-a-table"
             plan["blockers"] = empty_blockers
             original_config = config_path.read_text()
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertEqual(config_path.read_text(), original_config)
 
@@ -4605,7 +4819,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             plan["proposed_config_patch"]["target_path"] = ".agents/not-fork-ops.toml"
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / ".agents/not-fork-ops.toml").exists())
 
@@ -4624,7 +4838,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             plan["proposed_config_patch"]["target_path"] = ".agents\\fork-ops.toml"
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4652,7 +4866,7 @@ equipment = "not-a-table"
                 return original_open(path, flags, mode, dir_fd=dir_fd)
 
             with patch("fork_ops.core.os.open", side_effect=late_target_create):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4671,7 +4885,7 @@ equipment = "not-a-table"
             target_path.symlink_to(repo_path / "missing-target")
 
             dry_run = dry_run_migration_plan(plan)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
         self.assertFalse(dry_run["can_execute"])
         self.assertEqual(result["status"], "blocked")
@@ -4686,7 +4900,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             (repo_path / ".agents").symlink_to(outside, target_is_directory=True)
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((Path(outside) / "fork-ops.toml").exists())
 
@@ -4702,7 +4916,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             (repo_path / ".agents").write_text("not a directory\n")
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(
@@ -4729,7 +4943,7 @@ equipment = "not-a-table"
                 "fork_ops.core._open_or_create_agents_parent",
                 side_effect=parent_unavailable,
             ):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4750,7 +4964,7 @@ equipment = "not-a-table"
             plan["proposed_config_patch"]["config"] = parse_config_text(IDENTIFIED_CONFIG)
 
             dry_run = dry_run_migration_plan(plan)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4772,7 +4986,7 @@ equipment = "not-a-table"
             plan["validation_requirements"] = no_validation_requirements
 
             dry_run = dry_run_migration_plan(plan)
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4798,7 +5012,7 @@ equipment = "not-a-table"
                 }
             )
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4817,7 +5031,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             plan["validation_requirements"] = plan["validation_requirements"][:1]
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4837,7 +5051,7 @@ equipment = "not-a-table"
             patch_config = plan["proposed_config_patch"]["config"]
             patch_config["repository"]["owner"] = "reviewed-owner"
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4856,7 +5070,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT + "\nChanged after plan.\n")
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4884,7 +5098,7 @@ equipment = "not-a-table"
                 return original_read_bytes(path)
 
             with patch.object(Path, "read_bytes", unreadable):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4903,7 +5117,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             del plan["retained_source_materials"][0]["content_sha256"]
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4922,7 +5136,7 @@ equipment = "not-a-table"
             plan = generate_migration_plan(repo_path)
             plan["retained_source_materials"][0]["path"] = "../outside.md"
 
-            result = execute_migration_plan(plan)
+            result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
@@ -4959,7 +5173,7 @@ equipment = "not-a-table"
                 "fork_ops.core.os.open",
                 side_effect=concurrent_target_then_create_failure,
             ):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertEqual(target_path.read_text(), "created by another process")
 
@@ -4987,7 +5201,7 @@ equipment = "not-a-table"
                 return original_open(path, flags, mode, dir_fd=dir_fd)
 
             with patch("fork_ops.core.os.open", side_effect=target_appeared):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertTrue((repo_path / ".agents").is_dir())
@@ -5015,7 +5229,7 @@ equipment = "not-a-table"
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
-    def test_execute_migration_uses_embedded_repo_path_for_supplied_plan(self) -> None:
+    def test_execute_migration_rejects_missing_selected_repo_for_supplied_plan(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
@@ -5023,11 +5237,13 @@ equipment = "not-a-table"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            result = execute_migration("", plan=plan)
+            with self.assertRaisesRegex(
+                ForkOpsError,
+                "explicit non-empty repository path",
+            ):
+                execute_migration(plan=plan)
 
-            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
-
-        self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
     def test_execute_migration_plan_rejects_repository_replaced_during_preflight(
         self,
@@ -5041,22 +5257,23 @@ equipment = "not-a-table"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
             displaced_repo = root_path / "repo-original"
-            original_dry_run = core_module.dry_run_migration_plan
+            original_dry_run = core_module._dry_run_migration_plan
 
             def replace_repo_after_preflight(
                 migration_plan: dict[str, Any],
                 selected_repo_path: str | Path | None = None,
+                **kwargs: Any,
             ) -> dict[str, Any]:
-                preview = original_dry_run(migration_plan, selected_repo_path)
+                preview = original_dry_run(migration_plan, selected_repo_path, **kwargs)
                 repo_path.rename(displaced_repo)
                 repo_path.mkdir()
                 return preview
 
             with patch(
-                "fork_ops.core.dry_run_migration_plan",
+                "fork_ops.core._dry_run_migration_plan",
                 side_effect=replace_repo_after_preflight,
             ):
-                result = execute_migration_plan(plan)
+                result = execute_migration_plan(plan, repo_path)
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
@@ -5103,24 +5320,374 @@ equipment = "not-a-table"
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
-    def test_mcp_migration_execution_defaults_to_current_directory(self) -> None:
-        original_cwd = Path.cwd()
+    def test_migration_verification_blocker_is_canonical_applied_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
             source_path.parent.mkdir(parents=True)
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            with patch(
+                "fork_ops.core._verify_migration_execution",
+                return_value=([], [{"code": "test.verification_failed"}]),
+            ):
+                result = execute_migration_plan(plan, repo_path)
 
-            try:
-                os.chdir(repo_path)
-                result = fork_ops_migration_execute()
-            finally:
-                os.chdir(original_cwd)
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
-            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
+    def test_migration_post_write_exception_is_canonical_applied_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            with patch(
+                "fork_ops.core._verify_migration_execution",
+                side_effect=RuntimeError("injected post-write failure"),
+            ):
+                result = execute_migration_plan(plan, repo_path)
 
-        self.assertEqual(result["status"], "applied")
-        self.assertEqual(result["repo_path"], str(repo_path.resolve()))
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+        self.assertEqual(result["blockers"][0]["code"], "migration_execution.post_write_error")
+
+    def test_migration_result_failure_is_canonical_applied_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            original_result = core_module._migration_execution_result
+
+            def fail_applied_result(**kwargs: Any) -> dict[str, Any]:
+                if kwargs.get("applied_edits"):
+                    raise RuntimeError("injected result failure")
+                return original_result(**kwargs)
+
+            with patch(
+                "fork_ops.core._migration_execution_result",
+                side_effect=fail_applied_result,
+            ):
+                result = execute_migration_plan(plan, repo_path)
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_migration_descriptor_close_failure_is_applied_unverified(self) -> None:
+        for close_target in ("target", "parent", "root"):
+            with self.subTest(close_target=close_target), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+                source_path.parent.mkdir(parents=True)
+                source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+                plan = generate_migration_plan(repo_path)
+                target_path = repo_path / CONFIG_RELATIVE_PATH
+                original_close = os.close
+                injected = False
+
+                def close_then_fail(
+                    descriptor: int,
+                    *,
+                    selected_target_path: Path = target_path,
+                    selected_close_target: str = close_target,
+                    selected_repo_path: Path = repo_path,
+                    real_close: Any = original_close,
+                ) -> None:
+                    nonlocal injected
+                    descriptor_stat = os.fstat(descriptor)
+                    should_fail = False
+                    if selected_target_path.exists():
+                        expected_path = (
+                            selected_target_path
+                            if selected_close_target == "target"
+                            else (
+                                selected_target_path.parent
+                                if selected_close_target == "parent"
+                                else selected_repo_path
+                            )
+                        )
+                        expected_stat = os.stat(expected_path, follow_symlinks=False)
+                        should_fail = (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+                            expected_stat.st_dev,
+                            expected_stat.st_ino,
+                        )
+                    real_close(descriptor)
+                    if should_fail and not injected:
+                        injected = True
+                        raise OSError("injected descriptor close failure")
+
+                with (
+                    patch("fork_ops.core.os.close", side_effect=close_then_fail),
+                    patch(
+                        "fork_ops.core._verify_migration_execution",
+                        return_value=([], []),
+                    ),
+                ):
+                    result = execute_migration_plan(plan, repo_path)
+
+                self.assertTrue(target_path.is_file())
+                self.assertTrue(injected)
+                self.assertEqual(result["status"], "applied_unverified")
+                self.assertEqual(
+                    result["applied_edits"][0]["status"],
+                    "applied_unverified",
+                )
+
+    def test_config_initialization_root_close_failure_is_applied_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            original_close = core_module._BoundRepository.close
+            injected = False
+
+            def close_root_then_fail(bound_repo: Any) -> None:
+                nonlocal injected
+                should_fail = (
+                    target_path.exists()
+                    and not injected
+                    and bound_repo.path == repo_path
+                )
+                original_close(bound_repo)
+                if should_fail and not injected:
+                    injected = True
+                    raise OSError("injected root descriptor close failure")
+
+            status_report: dict[str, Any] = {
+                "capability": {
+                    "levels": {"track-aware": {"available": True}},
+                    "highest_available": "track-aware",
+                },
+                "diagnostics": [],
+            }
+            with (
+                patch("fork_ops.core.build_status_report", return_value=status_report),
+                patch.object(
+                    core_module._BoundRepository,
+                    "close",
+                    side_effect=close_root_then_fail,
+                    autospec=True,
+                ),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="owner",
+                    repository_name="repo",
+                )
+
+            self.assertTrue(target_path.is_file(), result)
+            self.assertTrue(injected, result)
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_migration_scan_discards_evidence_when_root_identity_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            source_path = repo_path / "docs/agents/upstream.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            displaced_repo = root_path / "repo-original"
+            original_scan = core_module._scan_bound_directory
+            swapped = False
+
+            def scan_then_swap(*args: Any, **kwargs: Any) -> Any:
+                nonlocal swapped
+                yield from original_scan(*args, **kwargs)
+                bound_repo = args[0]
+                if not swapped and bound_repo.path == repo_path:
+                    swapped = True
+                    repo_path.rename(displaced_repo)
+                    repo_path.mkdir()
+
+            with patch(
+                "fork_ops.core._scan_bound_directory",
+                side_effect=scan_then_swap,
+            ):
+                result = assess_migration(repo_path)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result["candidates"], [])
+
+        self.assertFalse(result["complete"])
+        self.assertIn(
+            "scan.root_changed",
+            {reason["code"] for reason in result["scan_accounting"]["incomplete_reasons"]},
+        )
+
+    def test_migration_execution_uses_bound_repo_for_aba_preflight_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            relative_source = Path("docs/agents/upstream.md")
+            source_path = repo_path / relative_source
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            source_path.write_text(f"{UPSTREAM_REF_PRESSURE_TEXT}\nchanged after planning\n")
+
+            replacement_repo = root_path / "repo-replacement"
+            replacement_source = replacement_repo / relative_source
+            replacement_source.parent.mkdir(parents=True)
+            replacement_source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            displaced_repo = root_path / "repo-original"
+            original_retained_blockers = core_module._retained_source_material_blockers
+            swapped = False
+
+            def swap_to_decoy_and_back(
+                repo: Path,
+                retained_materials: list[dict[str, Any]],
+                **kwargs: Any,
+            ) -> list[dict[str, Any]]:
+                nonlocal swapped
+                swapped = True
+                repo_path.rename(displaced_repo)
+                replacement_repo.rename(repo_path)
+                try:
+                    return original_retained_blockers(repo, retained_materials, **kwargs)
+                finally:
+                    repo_path.rename(replacement_repo)
+                    displaced_repo.rename(repo_path)
+
+            with patch(
+                "fork_ops.core._retained_source_material_blockers",
+                side_effect=swap_to_decoy_and_back,
+            ):
+                result = execute_migration_plan(plan, repo_path)
+
+            self.assertTrue(swapped)
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(
+            "migration_execution.repository_identity_changed",
+            {blocker["code"] for blocker in result["blockers"]},
+        )
+
+    def test_workflow_directory_scan_marks_root_swap_during_yield_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            source_root = root_path / "source"
+            source_root.mkdir()
+            (source_root / "policy.md").write_text(
+                "Policy: upstream sync requires a mutation gate.\n"
+            )
+            displaced_root = root_path / "source-original"
+            original_entry = core_module._workflow_inventory_entry
+            swapped = False
+
+            def swap_during_entry(*args: Any, **kwargs: Any) -> Any:
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    source_root.rename(displaced_root)
+                    source_root.mkdir()
+                return original_entry(*args, **kwargs)
+
+            with patch(
+                "fork_ops.core._workflow_inventory_entry",
+                side_effect=swap_during_entry,
+            ):
+                result = build_workflow_migration_inventory([source_root])
+
+            self.assertTrue(swapped)
+
+        self.assertFalse(result["complete"])
+        self.assertIn(
+            "scan.root_changed",
+            {reason["code"] for reason in result["scan_accounting"]["incomplete_reasons"]},
+        )
+
+    def test_workflow_single_file_scan_rejects_replaced_root_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            source_root = root_path / "policy.md"
+            source_root.write_text("Policy: upstream sync requires a mutation gate.\n")
+            replacement = root_path / "replacement.md"
+            replacement.write_text("Policy: replacement content.\n")
+            original_bind = core_module._bind_repository
+            swapped = False
+
+            def swap_before_parent_bind(path: Path) -> Any:
+                nonlocal swapped
+                if path == root_path and not swapped:
+                    swapped = True
+                    replacement.replace(source_root)
+                return original_bind(path)
+
+            with patch(
+                "fork_ops.core._bind_repository",
+                side_effect=swap_before_parent_bind,
+            ):
+                result = build_workflow_migration_inventory([source_root])
+
+            self.assertTrue(swapped)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["entries"], [])
+        self.assertIn(
+            "scan.root_changed",
+            {reason["code"] for reason in result["scan_accounting"]["incomplete_reasons"]},
+        )
+
+    def test_config_initialization_post_create_exception_is_applied_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            with patch(
+                "fork_ops.core._verify_created_target",
+                side_effect=RuntimeError("injected verification failure"),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="owner",
+                    repository_name="repo",
+                )
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_config_initialization_result_exception_is_applied_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            with patch(
+                "fork_ops.core._config_initialization_result",
+                side_effect=RuntimeError("injected result failure"),
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="owner",
+                    repository_name="repo",
+                )
+
+        self.assertEqual(result["status"], "applied_unverified")
+        self.assertTrue(result["mutation"]["occurred"])
+        self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_mcp_migration_execution_rejects_missing_selected_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            with self.assertRaisesRegex(
+                ForkOpsError,
+                "explicit non-empty repository path",
+            ):
+                fork_ops_migration_execute(migration_plan=plan)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
     def test_cli_exposes_migration_execute(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -5138,7 +5705,7 @@ equipment = "not-a-table"
         self.assertEqual(payload["operation"], "migration-execution")
         self.assertEqual(payload["status"], "applied")
 
-    def test_cli_accepts_migration_plan_file_for_execute(self) -> None:
+    def test_cli_requires_repo_with_migration_plan_file_for_execute(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
@@ -5146,15 +5713,14 @@ equipment = "not-a-table"
             source_path.parent.mkdir(parents=True)
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan_path.write_text(json.dumps(generate_migration_plan(repo_path)))
-            output = io.StringIO()
+            error = io.StringIO()
 
-            with redirect_stdout(output):
-                exit_code = cli_main(["migration", "execute", "--plan", str(plan_path)])
+            with redirect_stderr(error), self.assertRaises(SystemExit) as raised:
+                cli_main(["migration", "execute", "--plan", str(plan_path)])
 
-        payload = json.loads(output.getvalue())
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["operation"], "migration-execution")
-        self.assertEqual(payload["status"], "applied")
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--repo", error.getvalue())
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
     def test_cli_migration_execute_plan_rejects_repo_path_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:

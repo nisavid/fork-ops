@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from .core import (
+    MAX_FILE_BYTES,
     SCAN_PROFILES,
     ForkOpsError,
+    _read_absolute_regular_file,
+    _validate_bounded_object,
     assess_migration,
     build_equipment_migration_preflight,
     build_plugin_health_report,
@@ -71,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.set_defaults(func=cmd_config_validate)
 
     init = config_subcommands.add_parser("init", help="Generate a starter Fork Ops config.")
-    _add_repo_arg(init)
+    init.add_argument("--repo", help="Repository root to inspect or mutate.")
     init.add_argument("--repository-owner", default="OWNER")
     init.add_argument("--repository-name", default="REPO")
     init.add_argument("--upstream-owner", default="UPSTREAM_OWNER")
@@ -140,7 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
         "execute",
         help="Apply a validated migration plan through guarded operations.",
     )
-    execute.add_argument("--repo", help="Repository root to inspect or confirm.")
+    execute.add_argument(
+        "--repo",
+        required=True,
+        help="Explicit repository root to mutate and confirm against the plan.",
+    )
     execute.add_argument(
         "--plan",
         help="Read an existing migration plan JSON file instead of generating one from --repo.",
@@ -296,7 +303,7 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 def cmd_config_init(args: argparse.Namespace) -> int:
     if not args.write:
         text = create_initial_config_text(
-            args.repo,
+            args.repo or ".",
             repository_owner=args.repository_owner,
             repository_name=args.repository_name,
             upstream_owner=args.upstream_owner,
@@ -306,7 +313,7 @@ def cmd_config_init(args: argparse.Namespace) -> int:
         print(text, end="")
         return 0
     result = initialize_config(
-        args.repo,
+        args.repo or "",
         repository_owner=args.repository_owner,
         repository_name=args.repository_name,
         upstream_owner=args.upstream_owner,
@@ -436,9 +443,9 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
 
 def cmd_migration_execute(args: argparse.Namespace) -> int:
     if args.plan:
-        result = execute_migration(args.repo or "", plan=_read_json_plan(args.plan))
+        result = execute_migration(args.repo, plan=_read_json_plan(args.plan))
     else:
-        result = execute_migration(args.repo or ".")
+        result = execute_migration(args.repo)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "applied" else 1
 
@@ -553,14 +560,22 @@ def _read_json_workflow_output(path: str) -> dict[str, Any]:
 
 def _read_json_object(path: str, label: str) -> dict[str, Any]:
     try:
-        raw = sys.stdin.read() if path == "-" else Path(path).expanduser().read_text()
+        if path == "-":
+            raw = sys.stdin.read(MAX_FILE_BYTES + 1)
+            if len(raw.encode("utf-8")) > MAX_FILE_BYTES:
+                raise ForkOpsError(f"{label} exceeds the file byte limit.")
+        else:
+            raw = _read_absolute_regular_file(path).decode("utf-8")
         parsed = json.loads(raw)
+    except UnicodeDecodeError as exc:
+        raise ForkOpsError(f"{label} is not valid UTF-8 text.") from exc
     except OSError as exc:
         raise ForkOpsError(f"{label} read failed: {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ForkOpsError(f"{label} JSON parse failed for {path}: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ForkOpsError(f"{label} JSON must parse to an object.")
+    _validate_bounded_object(parsed, label=label)
     return parsed
 
 

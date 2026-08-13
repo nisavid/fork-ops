@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import unicodedata
 import uuid
 from collections.abc import Mapping
@@ -22,6 +24,7 @@ CONTRACT_FILENAME: Final = "security-exception-contract-1.0.json"
 EXPECTED_CONTRACT_SHA256: Final = (
     "b060b477b1fdcc9155a34939e607a7794ccb82f5d544816cfb95a3f6392f34f4"
 )
+MAX_CONTRACT_BYTES: Final = 1_048_576
 
 
 class SecurityExceptionContractError(ValueError):
@@ -1466,7 +1469,34 @@ def load_security_exception_contract(
     """Load contract 1.0 only after verifying its exact packaged bytes."""
     contract_path = Path(path) if path is not None else Path(__file__).with_name(CONTRACT_FILENAME)
     try:
-        payload = contract_path.read_bytes()
+        descriptor = os.open(
+            contract_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError("contract is not a regular file")
+            payload = os.read(descriptor, MAX_CONTRACT_BYTES + 1)
+            if len(payload) > MAX_CONTRACT_BYTES or os.read(descriptor, 1):
+                raise OSError("contract exceeds the byte limit")
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) or after.st_size != len(payload):
+                raise OSError("contract changed while being read")
+        finally:
+            os.close(descriptor)
     except OSError as error:
         raise SecurityExceptionContractError(
             "Security Exception contract 1.0 is unavailable."

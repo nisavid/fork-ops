@@ -1,7 +1,9 @@
 # Validation evidence contract
 
 `scripts/produce_validation_evidence.py` is the repository-owned validation
-entrypoint. Every invocation requires an explicit mode and interpreter and
+entrypoint. Every invocation requires an explicit mode and interpreter. The
+producer resolves that interpreter once before mode execution, records its
+absolute executable identity, and uses only that resolved path for every check.
 emits one terminal `validation_evidence_result` with schema version `1.0`.
 `--execution-boundary container` is the fail-closed hosted boundary.
 `--execution-boundary local-observational` is the default for usable local
@@ -14,10 +16,14 @@ The modes are:
   with locked `uv` execution. In the container boundary, every candidate
   import, CLI discovery, test, lint, type, coverage, and schema process runs in
   the isolated container.
-- `fresh-source`: copies the repository to a temporary snapshot, performs a
-  fresh resolution and four-minor normalized dependency audit there, then runs
-  the source contract against the refreshed lock. It does not rewrite the
-  checked-in lock.
+- `fresh-source`: copies the verified repository into a private temporary
+  snapshot, rejects candidate index, direct-source, dynamic-metadata, and build
+  controls, then resolves with the exact hashed uv executable in a digest-pinned
+  networked container. The resolver has a fixed PyPI-only policy, no host
+  credentials, no Docker socket, a non-root user, and explicit process, CPU,
+  memory, and output bounds. Trusted host code validates the generated lock and
+  collects a closed four-minor audit matrix without importing candidate Python.
+  The refreshed lock never replaces the checked-in lock.
 - `build`: exports the exact `build` dependency group with hashes, audits that
   build-only scope, installs only those binary dependencies, and executes the
   PEP 517 backend in a private writable source copy inside the isolated
@@ -56,11 +62,14 @@ package names, and records both the locked export and resolved-scope digests.
 Every minor has runtime, optional, build, test, and development graphs; the
 optional scope is the `mcp` extra delta over the base runtime graph. Names are
 normalized and marker-dependent membership remains per minor. Fresh-source
-validation passes this exact map to
-`collect_uv_audit_evidence`, fails closed if an advisory package is absent from
-the matching minor, and records the normalized empty-advisory result and its
-digest. These are observed graph memberships, not claims that one scope is
-another.
+validation passes this exact map to a verifier-owned collector, fails closed if
+any request, result, package tuple, scope, version, provider status, or Python
+minor is missing or ambiguous, and binds the raw response and normalized matrix
+digests. Full bounded JSON is parsed privately; display tails never become
+authority. The local uv/OSV transport is explicitly unauthenticated and the
+result remains observational. Candidate objects, serialized JSON, and `to_dict`
+projections cannot acquire the collector's in-process capability. These are
+observed graph memberships, not claims that one scope is another.
 
 Source evidence also discovers the public argparse leaf commands and the
 workflow catalog from the running package. The CLI inventory is an exact
@@ -74,10 +83,14 @@ The evidence identity binds the commit, a deterministic source snapshot digest,
 lock digest, candidate artifact hashes, interpreter, platform, and validation
 test contract. The source snapshot covers tracked and non-ignored untracked
 files while excluding declared evidence and candidate outputs plus standard
-caches. Regular files contribute their bytes and executable state; symlinks
-contribute only their target text, so validation never follows repository
-symlinks outside the source tree. This lets unchanged dirty local source build
-and validate exactly.
+caches. Regular files contribute their bytes and executable state. Candidate
+symlinks and special files fail before execution, so the source digest describes
+the exact executable tree. The producer walks a bound repository descriptor,
+opens every parent and file without following symlinks, and creates the private
+snapshot from the same bounded reads that feed its digest. It enforces per-file,
+aggregate-byte, file-count, subprocess
+output, subprocess time, and overall-work limits before candidate execution.
+This lets unchanged dirty local source build and validate exactly.
 The producer reads `uv.lock` as a regular non-symlink with no-follow semantics,
 binds those exact bytes into the source and lock digests, and creates a private
 verified project snapshot from them. Every uv command consumes that private
@@ -106,6 +119,12 @@ and dependencies are mounted read-only, while coverage scratch and build
 output are the only writable bind mounts. Candidate processes have no network,
 host credentials, Actions or OIDC tokens, checkout credentials, Docker socket,
 or access to the trusted verifier and final evidence paths.
+
+Every host-side repository query uses one absolute, hash-stable Git executable
+under a minimal environment. Repository and global configuration cannot enable
+fsmonitor, hooks, credential helpers, pagers, external diffs, textconv,
+attributes, or user-supplied protocols. Diff commands explicitly disable
+external diff and text conversion.
 
 This event has an intentional bootstrap boundary: a newly added or changed
 `pull_request_target` workflow does not run from the pull request head. The

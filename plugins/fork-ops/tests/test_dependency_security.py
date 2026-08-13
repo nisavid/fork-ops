@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
 import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 from fork_ops import dependency_security as dependency_security_module
 from fork_ops.dependency_security import (
@@ -1106,6 +1111,229 @@ class DependencySecurityTests(unittest.TestCase):
         self.assertEqual(observation["page_count"], 4)
         self.assertEqual(observation["item_count"], 1)
         self.assertEqual(result["payload_sha256"], _payload_sha256(dict(result)))
+
+    def test_default_uv_adapter_uses_explicit_binary_and_minimal_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / "pyproject.toml").write_text(
+                "[project]\nname='fixture'\nversion='1'\ndependencies=[]\n",
+                encoding="utf-8",
+            )
+            (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            observations = root / "observations.jsonl"
+            fake_uv = root / "trusted-uv"
+            fake_uv.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import os
+                    import pathlib
+                    import sys
+
+                    record = {{"argv": sys.argv, "environment": dict(os.environ)}}
+                    with pathlib.Path({str(observations)!r}).open("a", encoding="utf-8") as output:
+                        output.write(json.dumps(record, sort_keys=True) + "\\n")
+                    print(json.dumps({{"vulnerabilities": [], "adverse_statuses": []}}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            inventories = _package_scopes_by_python()
+            versions = {
+                python_version: {
+                    package: _package_versions().get(package, "1.0.0")
+                    for package in scopes
+                }
+                for python_version, scopes in inventories.items()
+            }
+            host_secret = "must-not-cross-collector-boundary"
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": host_secret}):
+                result = dependency_security_module.collect_uv_audit_evidence(
+                    repo,
+                    package_scopes_by_python=inventories,
+                    package_versions_by_python=versions,
+                    candidate_identity=_candidate_identity_for_inventories(
+                        inventories,
+                        versions,
+                    ),
+                    producer_identity=_producer_identity(),
+                    observation_epoch="d" * 64,
+                    uv_executable=fake_uv,
+                )
+
+            self.assertIsInstance(result, dict)
+            provenance = result["provenance"]
+            if not isinstance(provenance, dict):
+                self.fail("provenance must be an object")
+            source = provenance["source_observation"]
+            if not isinstance(source, dict):
+                self.fail("source observation must be an object")
+            self.assertIs(source["authenticated"], False)
+            records = [json.loads(line) for line in observations.read_text().splitlines()]
+            self.assertEqual(len(records), 4)
+            for record in records:
+                self.assertEqual(record["argv"][0], str(fake_uv))
+                self.assertIn("--no-config", record["argv"])
+                self.assertIn("--no-sources", record["argv"])
+                self.assertIn("--no-build", record["argv"])
+                environment = record["environment"]
+                self.assertNotIn("GITHUB_TOKEN", environment)
+                self.assertEqual(environment["UV_NO_CONFIG"], "1")
+                self.assertEqual(environment["UV_KEYRING_PROVIDER"], "disabled")
+
+    def test_default_uv_adapter_rejects_candidate_config_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            (repo / "pyproject.toml").write_text(
+                "[project]\nname='fixture'\nversion='1'\ndependencies=[]\n",
+                encoding="utf-8",
+            )
+            (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (repo / "uv.toml").write_text(
+                'default-index = "http://169.254.169.254/latest"\n',
+                encoding="utf-8",
+            )
+            executable = repo / "trusted-uv"
+            sentinel = repo / "executed"
+            executable.write_text(
+                f"#!{sys.executable}\nfrom pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('executed')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            inventories = _package_scopes_by_python()
+            versions = {
+                python_version: {
+                    package: _package_versions().get(package, "1.0.0")
+                    for package in scopes
+                }
+                for python_version, scopes in inventories.items()
+            }
+
+            result = dependency_security_module.collect_uv_audit_evidence(
+                repo,
+                package_scopes_by_python=inventories,
+                package_versions_by_python=versions,
+                candidate_identity=_candidate_identity_for_inventories(
+                    inventories,
+                    versions,
+                ),
+                producer_identity=_producer_identity(),
+                observation_epoch="d" * 64,
+                uv_executable=executable,
+            )
+
+            if not isinstance(result, dict):
+                self.fail("local uv audit evidence must remain observational")
+            self.assertEqual(result["status"], "unavailable")
+            self.assertFalse(sentinel.exists())
+
+    def test_default_uv_adapter_never_selects_uv_from_ambient_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            (repo / "pyproject.toml").write_text(
+                "[project]\nname='fixture'\nversion='1'\ndependencies=[]\n",
+                encoding="utf-8",
+            )
+            (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            sentinel = repo / "executed"
+            executable = repo / "uv"
+            executable.write_text(
+                f"#!{sys.executable}\nfrom pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('executed')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            inventories = _package_scopes_by_python()
+            versions = {
+                python_version: {
+                    package: _package_versions().get(package, "1.0.0")
+                    for package in scopes
+                }
+                for python_version, scopes in inventories.items()
+            }
+
+            with mock.patch.dict(os.environ, {"PATH": str(repo)}):
+                result = dependency_security_module.collect_uv_audit_evidence(
+                    repo,
+                    package_scopes_by_python=inventories,
+                    package_versions_by_python=versions,
+                    candidate_identity=_candidate_identity_for_inventories(
+                        inventories,
+                        versions,
+                    ),
+                    producer_identity=_producer_identity(),
+                    observation_epoch="d" * 64,
+                )
+
+            if not isinstance(result, dict):
+                self.fail("local uv audit evidence must remain observational")
+            self.assertEqual(result["status"], "unavailable")
+            self.assertFalse(sentinel.exists())
+
+    def test_default_uv_adapter_caps_combined_process_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            (repo / "pyproject.toml").write_text(
+                "[project]\nname='fixture'\nversion='1'\ndependencies=[]\n",
+                encoding="utf-8",
+            )
+            (repo / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            executable = repo / "trusted-uv"
+            executable.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import sys
+                    import threading
+
+                    def flood(stream):
+                        stream.write(b"x" * (5 * 1024 * 1024))
+                        stream.flush()
+
+                    threads = [
+                        threading.Thread(target=flood, args=(sys.stdout.buffer,)),
+                        threading.Thread(target=flood, args=(sys.stderr.buffer,)),
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            inventories = _package_scopes_by_python()
+            versions = {
+                python_version: {
+                    package: _package_versions().get(package, "1.0.0")
+                    for package in scopes
+                }
+                for python_version, scopes in inventories.items()
+            }
+
+            result = dependency_security_module.collect_uv_audit_evidence(
+                repo,
+                package_scopes_by_python=inventories,
+                package_versions_by_python=versions,
+                candidate_identity=_candidate_identity_for_inventories(
+                    inventories,
+                    versions,
+                ),
+                producer_identity=_producer_identity(),
+                observation_epoch="d" * 64,
+                uv_executable=executable,
+            )
+
+            if not isinstance(result, dict):
+                self.fail("local uv audit evidence must remain observational")
+            self.assertEqual(result["status"], "unavailable")
+            self.assertLess(len(json.dumps(result)), 4096)
 
     def test_uv_adapter_uses_only_the_matching_python_inventory(self) -> None:
         inventories = _package_scopes_by_python()

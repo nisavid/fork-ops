@@ -16,13 +16,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -113,11 +115,20 @@ else:
 """
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 600.0
 DEFAULT_OVERALL_TIMEOUT_SECONDS = 720.0
+MAX_SUBPROCESS_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_EVIDENCE_INPUT_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_FILE_BYTES = 32 * 1024 * 1024
+MAX_SOURCE_FILES = 20_000
+MAX_SOURCE_BYTES = 512 * 1024 * 1024
 RELEASE_EVIDENCE_MAX_AGE_SECONDS = 24 * 60 * 60
 RELEASE_PREFLIGHT_KEY_BYTES = 32
 RELEASE_PREFLIGHT_RECEIPT_VERSION = "1.0"
 _COMMAND_TIMEOUT_SECONDS = DEFAULT_COMMAND_TIMEOUT_SECONDS
 _VALIDATION_DEADLINE: float | None = None
+_TRUSTED_UV_EXECUTABLE: Path | None = None
+_TRUSTED_UV_SHA256 = ""
+_TRUSTED_GIT_EXECUTABLE: Path | None = None
+_TRUSTED_GIT_SHA256 = ""
 SOURCE_SNAPSHOT_EXCLUDES = {
     ".mypy_cache",
     ".pyrefly_cache",
@@ -143,6 +154,19 @@ class ValidationDeadlineExceeded(RuntimeError):
     """The producer's overall validation-work budget was exhausted."""
 
 
+class SubprocessOutputLimitExceeded(RuntimeError):
+    """A child process exceeded the verifier's captured-output budget."""
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    stdout_bytes: int
+    stderr_bytes: int
+
+
 def _deadline_checkpoint() -> None:
     if _VALIDATION_DEADLINE is not None and time.monotonic() >= _VALIDATION_DEADLINE:
         raise ValidationDeadlineExceeded("Validation overall deadline was exhausted.")
@@ -161,6 +185,201 @@ def _effective_timeout(limit: float | None = None) -> float:
     if _VALIDATION_DEADLINE is not None:
         timeout = min(timeout, max(_VALIDATION_DEADLINE - time.monotonic(), 0.001))
     return timeout
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "posix":
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, 15)
+    else:
+        if process.poll() is not None:
+            return
+        with contextlib.suppress(OSError):
+            process.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=0.5)
+    if process.poll() is None:
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                os.killpg(process.pid, 9)
+        else:
+            with contextlib.suppress(OSError):
+                process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0.5)
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout: float,
+    max_output_bytes: int = MAX_SUBPROCESS_OUTPUT_BYTES,
+) -> BoundedProcessResult:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    streams = (process.stdout, process.stderr)
+    if any(stream is None for stream in streams):
+        _terminate_process_tree(process)
+        raise RuntimeError("Bounded subprocess pipes were unavailable")
+    overflow = threading.Event()
+    byte_lock = threading.Lock()
+    total_bytes = 0
+    stream_bytes = [0, 0]
+    buffers = (bytearray(), bytearray())
+
+    def drain(index: int) -> None:
+        nonlocal total_bytes
+        stream = streams[index]
+        assert stream is not None
+        with stream:
+            while chunk := stream.read(64 * 1024):
+                with byte_lock:
+                    stream_bytes[index] += len(chunk)
+                    remaining = max_output_bytes - total_bytes
+                    total_bytes += len(chunk)
+                    if remaining > 0:
+                        buffers[index].extend(chunk[:remaining])
+                    if total_bytes > max_output_bytes:
+                        overflow.set()
+
+    readers = [threading.Thread(target=drain, args=(index,), daemon=True) for index in range(2)]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while process.poll() is None:
+        if overflow.is_set():
+            _terminate_process_tree(process)
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _terminate_process_tree(process)
+            break
+        time.sleep(0.01)
+    returncode = process.poll()
+    for reader in readers:
+        reader.join(timeout=0.1)
+    if any(reader.is_alive() for reader in readers):
+        _terminate_process_tree(process)
+        for reader in readers:
+            reader.join(timeout=0.5)
+        raise SubprocessOutputLimitExceeded("A child process retained a captured-output pipe")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout)
+    if overflow.is_set():
+        raise SubprocessOutputLimitExceeded(
+            f"Combined subprocess output exceeded {max_output_bytes} bytes"
+        )
+    if returncode is None:
+        raise RuntimeError("Subprocess did not reach a terminal state")
+    return BoundedProcessResult(
+        returncode,
+        bytes(buffers[0]),
+        bytes(buffers[1]),
+        stream_bytes[0],
+        stream_bytes[1],
+    )
+
+
+def _trusted_git_executable() -> Path:
+    global _TRUSTED_GIT_EXECUTABLE, _TRUSTED_GIT_SHA256
+    if _TRUSTED_GIT_EXECUTABLE is None:
+        executable = _trusted_executable("git")
+        _TRUSTED_GIT_EXECUTABLE = executable
+        _TRUSTED_GIT_SHA256 = _sha256(executable)
+    if _sha256(_TRUSTED_GIT_EXECUTABLE) != _TRUSTED_GIT_SHA256:
+        raise RuntimeError("Trusted Git executable changed during validation")
+    return _TRUSTED_GIT_EXECUTABLE
+
+
+def _trusted_executable(command: str) -> Path:
+    selected = shutil.which(command)
+    if selected is None:
+        candidate = Path(command).expanduser()
+        if not candidate.is_absolute():
+            raise FileNotFoundError(f"{command} is not available on PATH")
+        selected = str(candidate)
+    executable = Path(selected).resolve(strict=True)
+    metadata = executable.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
+        raise ValueError(f"{command} must resolve to an executable regular file")
+    return executable
+
+
+def _trusted_uv_executable() -> Path:
+    if _TRUSTED_UV_EXECUTABLE is None or not _TRUSTED_UV_SHA256:
+        raise RuntimeError("Trusted uv identity was not established")
+    if _sha256(_TRUSTED_UV_EXECUTABLE) != _TRUSTED_UV_SHA256:
+        raise RuntimeError("Trusted uv executable changed during validation")
+    return _TRUSTED_UV_EXECUTABLE
+
+
+@contextlib.contextmanager
+def _trusted_git_environment() -> Iterator[dict[str, str]]:
+    with tempfile.TemporaryDirectory(prefix="fork-ops-trusted-git-") as temp_dir:
+        home = Path(temp_dir) / "home"
+        home.mkdir(mode=0o700)
+        environment = {
+            "GIT_ASKPASS": "",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_EXTERNAL_DIFF": "",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PAGER": "cat",
+            "PATH": os.defpath,
+        }
+        if os.name == "nt":
+            for name in ("COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"):
+                if value := os.environ.get(name):
+                    environment[name] = value
+        yield environment
+
+
+def _trusted_git_command(arguments: list[str]) -> list[str]:
+    return [
+        str(_trusted_git_executable()),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "diff.external=",
+        "-c",
+        "protocol.allow=never",
+        *arguments,
+    ]
+
+
+def _run_trusted_git(repo: Path, arguments: list[str]) -> BoundedProcessResult:
+    with _trusted_git_environment() as environment:
+        return _run_bounded_process(
+            _trusted_git_command(arguments),
+            cwd=repo,
+            env=environment,
+            timeout=_effective_timeout(),
+        )
 
 
 @contextlib.contextmanager
@@ -202,15 +421,19 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_bytes(path: Path) -> bytes:
+def _read_bytes(path: Path, *, max_bytes: int = MAX_EVIDENCE_INPUT_BYTES) -> bytes:
     _deadline_checkpoint()
     chunks: list[bytes] = []
     with _open_regular_nofollow(path) as source:
+        if os.fstat(source.fileno()).st_size > max_bytes:
+            raise ValueError(f"{path} exceeds the {max_bytes}-byte input limit")
         bytes_read = 0
         while chunk := source.read(1024 * 1024):
             _deadline_checkpoint()
             chunks.append(chunk)
             bytes_read += len(chunk)
+            if bytes_read > max_bytes:
+                raise ValueError(f"{path} exceeds the {max_bytes}-byte input limit")
         if bytes_read != os.fstat(source.fileno()).st_size:
             raise RuntimeError(f"{path} changed during its no-follow read")
     return b"".join(chunks)
@@ -432,175 +655,177 @@ def _consume_release_preflight_key(path: Path, repo: Path) -> bytes:
     return key
 
 
-def _source_snapshot_digest(
-    repo: Path,
-    excluded_paths: list[Path],
-    *,
-    verified_files: dict[str, bytes] | None = None,
-) -> str:
-    _deadline_checkpoint()
-    lexical_repo = Path(os.path.abspath(repo))
-    excluded = [Path(os.path.abspath(path)) for path in excluded_paths]
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        timeout=_effective_timeout(),
-    ).stdout.split(b"\0")
-    digest = hashlib.sha256()
-    for raw_path in sorted(raw for raw in listed if raw):
-        _deadline_checkpoint()
-        relative_text = os.fsdecode(raw_path)
-        relative = Path(relative_text)
-        absolute = Path(os.path.abspath(lexical_repo / relative))
-        try:
-            absolute.relative_to(lexical_repo)
-        except ValueError:
-            continue
-        if any(absolute == path or path in absolute.parents for path in excluded):
-            continue
-        if SOURCE_SNAPSHOT_EXCLUDES.intersection(relative.parts):
-            continue
-        try:
-            entry_stat = absolute.lstat()
-        except FileNotFoundError:
-            continue
-        mode = entry_stat.st_mode
-        if stat.S_ISREG(mode):
-            entry_kind = b"file"
-            verified_content = (verified_files or {}).get(relative.as_posix())
-            if verified_content is not None:
-                content = verified_content
-                content_size = len(content)
-                source = None
-                encoded_path = os.fsencode(relative.as_posix())
-                digest.update(len(entry_kind).to_bytes(8, "big"))
-                digest.update(entry_kind)
-                executable = b"executable" if mode & 0o111 else b"non-executable"
-                digest.update(len(executable).to_bytes(8, "big"))
-                digest.update(executable)
-                digest.update(len(encoded_path).to_bytes(8, "big"))
-                digest.update(encoded_path)
-                digest.update(content_size.to_bytes(8, "big"))
-                digest.update(content)
-                continue
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            try:
-                descriptor = os.open(absolute, flags)
-            except FileNotFoundError:
-                continue
-            source = os.fdopen(descriptor, "rb")
-            opened_stat = os.fstat(source.fileno())
-            if not stat.S_ISREG(opened_stat.st_mode):
-                source.close()
-                continue
-            mode = opened_stat.st_mode
-            content_size = opened_stat.st_size
-            content: bytes | None = None
-        elif stat.S_ISLNK(mode):
-            entry_kind = b"symlink"
-            content = os.fsencode(os.readlink(absolute))
-            content_size = len(content)
-            source = None
-        else:
-            continue
-        encoded_path = os.fsencode(relative.as_posix())
-        digest.update(len(entry_kind).to_bytes(8, "big"))
-        digest.update(entry_kind)
-        executable = b"executable" if mode & 0o111 else b"non-executable"
-        digest.update(len(executable).to_bytes(8, "big"))
-        digest.update(executable)
-        digest.update(len(encoded_path).to_bytes(8, "big"))
-        digest.update(encoded_path)
-        digest.update(content_size.to_bytes(8, "big"))
-        if source is None:
-            assert content is not None
-            digest.update(content)
-        else:
-            bytes_read = 0
-            with source:
-                while chunk := source.read(1024 * 1024):
-                    _deadline_checkpoint()
-                    bytes_read += len(chunk)
-                    digest.update(chunk)
-            if bytes_read != content_size:
-                raise RuntimeError(f"Source changed while snapshotting {relative_text!r}")
-    return digest.hexdigest()
-
-
 @contextlib.contextmanager
 def _verified_execution_snapshot(
     repo: Path,
     lock_bytes: bytes,
     excluded_paths: list[Path],
-) -> Iterator[Path]:
+    *,
+    bound_root_descriptor: int | None = None,
+) -> Iterator[tuple[Path, str]]:
     lexical_repo = Path(os.path.abspath(repo))
     excluded = [Path(os.path.abspath(path)) for path in excluded_paths]
-
-    def ignore_snapshot_paths(directory: str, names: list[str]) -> set[str]:
-        _deadline_checkpoint()
-        directory_path = Path(os.path.abspath(directory))
-        ignored: set[str] = set()
-        for name in names:
-            candidate = directory_path / name
-            if name == ".git" or name in SOURCE_SNAPSHOT_EXCLUDES:
-                ignored.add(name)
-            elif candidate == lexical_repo / "uv.lock":
-                ignored.add(name)
-            elif any(candidate == path or path in candidate.parents for path in excluded):
-                ignored.add(name)
-        return ignored
-
-    def copy_snapshot_file(source: str, destination: str) -> str:
-        _deadline_checkpoint()
-        copied = shutil.copy2(source, destination, follow_symlinks=False)
-        _deadline_checkpoint()
-        return copied
-
+    if os.name != "posix":
+        raise ValueError("Verified execution snapshots require POSIX no-follow descriptors")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor = (
+        os.dup(bound_root_descriptor)
+        if bound_root_descriptor is not None
+        else os.open(lexical_repo, directory_flags)
+    )
+    root_identity = os.fstat(root_descriptor)
     with tempfile.TemporaryDirectory(prefix="fork-ops-verified-") as temp_dir:
         snapshot = Path(temp_dir) / "repository"
-        shutil.copytree(
-            repo,
-            snapshot,
-            symlinks=True,
-            ignore=ignore_snapshot_paths,
-            copy_function=copy_snapshot_file,
-        )
-        # Symlink target text remains identity evidence, but no symlink is an
-        # executable project input. This private tree is not concurrently writable.
-        for directory, directory_names, file_names in os.walk(
-            snapshot,
-            topdown=True,
-            followlinks=False,
-        ):
-            for name in list(directory_names):
-                candidate = Path(directory) / name
-                if candidate.is_symlink():
-                    candidate.unlink()
-                    directory_names.remove(name)
-            for name in file_names:
-                candidate = Path(directory) / name
-                if candidate.is_symlink():
-                    candidate.unlink()
-        lock_path = snapshot / "uv.lock"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o400)
+        snapshot.mkdir(mode=0o700)
         try:
-            view = memoryview(lock_bytes)
-            while view:
+            descriptor_repo = Path(f"/proc/self/fd/{root_descriptor}")
+            listed = _run_trusted_git(
+                descriptor_repo,
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            )
+            if listed.returncode != 0:
+                raise subprocess.CalledProcessError(listed.returncode, "git ls-files")
+            digest = hashlib.sha256()
+            copied_files = 0
+            copied_bytes = 0
+            lock_written = False
+            for raw_path in sorted(raw for raw in listed.stdout.split(b"\0") if raw):
                 _deadline_checkpoint()
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("Could not persist the verified uv.lock snapshot")
-                view = view[written:]
-            os.fsync(descriptor)
+                relative = Path(os.fsdecode(raw_path))
+                if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                    raise ValueError(f"Git returned an unsafe source path: {relative!s}")
+                absolute = lexical_repo / relative
+                if any(absolute == path or path in absolute.parents for path in excluded):
+                    continue
+                if SOURCE_SNAPSHOT_EXCLUDES.intersection(relative.parts):
+                    continue
+                parent_descriptor = os.dup(root_descriptor)
+                try:
+                    for component in relative.parts[:-1]:
+                        child_descriptor = os.open(
+                            component,
+                            directory_flags,
+                            dir_fd=parent_descriptor,
+                        )
+                        os.close(parent_descriptor)
+                        parent_descriptor = child_descriptor
+                    metadata = os.stat(
+                        relative.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise ValueError(f"Source snapshot rejects symlink: {relative!s}")
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ValueError(f"Source snapshot rejects special file: {relative!s}")
+                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    source_descriptor = os.open(
+                        relative.name,
+                        flags,
+                        dir_fd=parent_descriptor,
+                    )
+                finally:
+                    os.close(parent_descriptor)
+                with os.fdopen(source_descriptor, "rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if (
+                        opened.st_dev != metadata.st_dev
+                        or opened.st_ino != metadata.st_ino
+                        or opened.st_mode != metadata.st_mode
+                        or opened.st_size != metadata.st_size
+                    ):
+                        raise RuntimeError(f"Source changed before copying {relative!s}")
+                    content_size = opened.st_size
+                    if content_size > MAX_SOURCE_FILE_BYTES:
+                        raise ValueError(f"Source file exceeds size limit: {relative!s}")
+                    copied_files += 1
+                    copied_bytes += content_size
+                    if copied_files > MAX_SOURCE_FILES or copied_bytes > MAX_SOURCE_BYTES:
+                        raise ValueError(
+                            "Source snapshot exceeds file-count or aggregate-byte limit"
+                        )
+                    destination = snapshot / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    destination_flags |= getattr(os, "O_NOFOLLOW", 0)
+                    destination_descriptor = os.open(
+                        destination,
+                        destination_flags,
+                        0o600,
+                    )
+                    encoded_path = os.fsencode(relative.as_posix())
+                    executable = (
+                        b"executable" if opened.st_mode & 0o111 else b"non-executable"
+                    )
+                    for field in (b"file", executable, encoded_path):
+                        digest.update(len(field).to_bytes(8, "big"))
+                        digest.update(field)
+                    digest.update(content_size.to_bytes(8, "big"))
+                    bytes_written = 0
+                    try:
+                        while chunk := source.read(1024 * 1024):
+                            _deadline_checkpoint()
+                            bytes_written += len(chunk)
+                            if bytes_written > content_size:
+                                raise RuntimeError(f"Source changed while copying {relative!s}")
+                            digest.update(chunk)
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(destination_descriptor, view)
+                                if written <= 0:
+                                    raise OSError(f"Could not copy source file {relative!s}")
+                                view = view[written:]
+                        os.fsync(destination_descriptor)
+                    finally:
+                        os.close(destination_descriptor)
+                    finished = os.fstat(source.fileno())
+                    if (
+                        bytes_written != content_size
+                        or finished.st_size != opened.st_size
+                        or finished.st_mtime_ns != opened.st_mtime_ns
+                        or finished.st_ctime_ns != opened.st_ctime_ns
+                    ):
+                        raise RuntimeError(f"Source changed while copying {relative!s}")
+                    os.chmod(destination, 0o500 if opened.st_mode & 0o111 else 0o400)
+                    if relative.as_posix() == "uv.lock":
+                        if _read_bytes(destination) != lock_bytes:
+                            raise RuntimeError(
+                                "Verified uv.lock snapshot differs from the no-follow read"
+                            )
+                        lock_written = True
+            current_root = os.stat(lexical_repo, follow_symlinks=False)
+            if (
+                current_root.st_dev != root_identity.st_dev
+                or current_root.st_ino != root_identity.st_ino
+            ):
+                raise RuntimeError("Candidate repository root changed while snapshotting")
+            if not lock_written:
+                raise RuntimeError("Verified snapshot did not include uv.lock")
+            yield snapshot, digest.hexdigest()
         finally:
-            os.close(descriptor)
-        if _read_bytes(lock_path) != lock_bytes:
-            raise RuntimeError("Verified uv.lock snapshot differs from the no-follow read")
-        yield snapshot
+            os.close(root_descriptor)
+
+
+def _bind_candidate_repository(repo: Path) -> tuple[int, Path, os.stat_result]:
+    if os.name != "posix":
+        raise ValueError("Candidate repository binding requires POSIX descriptors")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(repo, flags)
+    identity = os.fstat(descriptor)
+    return descriptor, Path(f"/proc/self/fd/{descriptor}"), identity
+
+
+def _verify_candidate_repository_binding(
+    repo: Path,
+    descriptor: int,
+    identity: os.stat_result,
+) -> None:
+    current_descriptor = os.fstat(descriptor)
+    current_path = os.stat(repo, follow_symlinks=False)
+    for current in (current_descriptor, current_path):
+        if current.st_dev != identity.st_dev or current.st_ino != identity.st_ino:
+            raise RuntimeError("Candidate repository root changed during validation")
 
 
 def _run_command(
@@ -611,8 +836,14 @@ def _run_command(
     *,
     cwd: Path,
     env: dict[str, str] | None = None,
+    allowed_returncodes: frozenset[int] = frozenset({0}),
 ) -> dict[str, Any]:
     started = time.monotonic()
+    execution_command = (
+        [str(_trusted_uv_executable()), *command[1:]]
+        if command[:1] == ["uv"]
+        else command
+    )
     if _VALIDATION_DEADLINE is not None and time.monotonic() >= _VALIDATION_DEADLINE:
         return {
             "id": check_id,
@@ -626,29 +857,23 @@ def _run_command(
             "stdout_tail": "",
             "stderr_tail": "Validation overall deadline was exhausted.",
             "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "output_limit_exceeded": False,
             "timed_out": True,
         }
     command_timeout = _effective_timeout()
     try:
-        completed = subprocess.run(
-            command,
+        completed = _run_bounded_process(
+            execution_command,
             cwd=cwd,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=command_timeout,
             env=env,
+            timeout=command_timeout,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         duration_ms = round((time.monotonic() - started) * 1000)
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
+        stdout = ""
+        stderr = ""
         return {
             "id": check_id,
             "behavior_classes": behavior_classes,
@@ -663,45 +888,76 @@ def _run_command(
                 stderr[-3800:] + f"\nCommand timed out after {command_timeout:g} seconds."
             ).lstrip(),
             "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "output_limit_exceeded": False,
             "timed_out": True,
         }
-    except OSError as exc:
+    except (OSError, SubprocessOutputLimitExceeded) as exc:
         duration_ms = round((time.monotonic() - started) * 1000)
         return {
             "id": check_id,
             "behavior_classes": behavior_classes,
             "required_ids": required_ids,
             "status": "failed",
-            "exit_code": 127,
+            "exit_code": 126 if isinstance(exc, SubprocessOutputLimitExceeded) else 127,
             "duration_ms": duration_ms,
             "command": command,
             "command_cwd": str(cwd),
             "stdout_tail": "",
             "stderr_tail": str(exc),
             "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "output_limit_exceeded": isinstance(exc, SubprocessOutputLimitExceeded),
             "timed_out": False,
         }
     duration_ms = round((time.monotonic() - started) * 1000)
-    if completed.returncode != 0:
-        if completed.stdout:
-            print(completed.stdout, file=sys.stderr, end="")
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
     return {
         "id": check_id,
         "behavior_classes": behavior_classes,
         "required_ids": required_ids,
-        "status": "passed" if completed.returncode == 0 else "failed",
+        "status": "passed" if completed.returncode in allowed_returncodes else "failed",
         "exit_code": completed.returncode,
         "duration_ms": duration_ms,
         "command": command,
         "command_cwd": str(cwd),
-        "stdout_tail": completed.stdout[-4000:],
-        "stderr_tail": completed.stderr[-4000:],
-        "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
+        "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+        "stdout_bytes": completed.stdout_bytes,
+        "stderr_bytes": completed.stderr_bytes,
+        "output_limit_exceeded": False,
         "timed_out": False,
+        "_stdout_complete": stdout,
         **({"environment_policy": "explicit_minimal"} if env is not None else {}),
     }
+
+
+def _run_git_check(
+    check_id: str,
+    behavior_classes: list[str],
+    required_ids: list[str],
+    arguments: list[str],
+    *,
+    cwd: Path,
+) -> dict[str, Any]:
+    with _trusted_git_environment() as environment:
+        return _run_command(
+            check_id,
+            behavior_classes,
+            required_ids,
+            _trusted_git_command(arguments),
+            cwd=cwd,
+            env=environment,
+        )
+
+
+def _discard_private_check_payloads(checks: list[dict[str, Any]]) -> None:
+    for check in checks:
+        check.pop("_stdout_complete", None)
 
 
 @contextlib.contextmanager
@@ -718,7 +974,10 @@ def _minimal_subprocess_environment(root: Path) -> Iterator[dict[str, str]]:
         "UV_CACHE_DIR": str(cache),
         "UV_DEFAULT_INDEX": "https://pypi.org/simple",
         "UV_INDEX_STRATEGY": "first-index",
+        "UV_KEYRING_PROVIDER": "disabled",
+        "UV_NO_BUILD": "1",
         "UV_NO_CONFIG": "1",
+        "UV_NO_SOURCES": "1",
         "UV_PYTHON_DOWNLOADS": "never",
     }
     if os.name == "nt":
@@ -972,16 +1231,26 @@ def _prepare_source_candidate_container(
 
 def _untracked_whitespace_check(repo: Path) -> dict[str, Any]:
     started = time.monotonic()
-    command = ["git", "ls-files", "-z", "--others", "--exclude-standard"]
+    command = _trusted_git_command(
+        ["ls-files", "-z", "--others", "--exclude-standard"]
+    )
     try:
-        listed = subprocess.run(
-            command,
-            cwd=repo,
-            check=True,
-            capture_output=True,
-            timeout=_effective_timeout(),
-        ).stdout.split(b"\0")
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        with _trusted_git_environment() as environment:
+            result = _run_bounded_process(
+                command,
+                cwd=repo,
+                env=environment,
+                timeout=_effective_timeout(),
+            )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, command)
+        listed = result.stdout.split(b"\0")
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        SubprocessOutputLimitExceeded,
+    ) as exc:
         return {
             "id": "diff_untracked",
             "behavior_classes": ["source_diff_hygiene"],
@@ -1052,29 +1321,35 @@ def _untracked_whitespace_check(repo: Path) -> dict[str, Any]:
 
 def _diff_hygiene_check(repo: Path, diff_base: str | None) -> dict[str, Any]:
     parts = [
-        _run_command(
+        _run_git_check(
             "diff_unstaged",
             ["source_diff_hygiene"],
             ["diff.unstaged"],
-            ["git", "diff", "--check"],
+            ["diff", "--no-ext-diff", "--no-textconv", "--check"],
             cwd=repo,
         ),
-        _run_command(
+        _run_git_check(
             "diff_staged",
             ["source_diff_hygiene"],
             ["diff.staged"],
-            ["git", "diff", "--cached", "--check"],
+            ["diff", "--no-ext-diff", "--no-textconv", "--cached", "--check"],
             cwd=repo,
         ),
         _untracked_whitespace_check(repo),
     ]
     if diff_base:
         parts.append(
-            _run_command(
+            _run_git_check(
                 "diff_committed_range",
                 ["source_diff_hygiene"],
                 ["diff.committed_candidate_range"],
-                ["git", "diff", "--check", f"{diff_base}...HEAD"],
+                [
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--check",
+                    f"{diff_base}...HEAD",
+                ],
                 cwd=repo,
             )
         )
@@ -1165,7 +1440,7 @@ def _cli_surface_inventory_check(
     if check["status"] != "passed":
         return check
     try:
-        payload = json.loads(check["stdout_tail"])
+        payload = json.loads(check["_stdout_complete"])
         leaves = payload["leaves"]
         if not isinstance(leaves, list) or not all(isinstance(leaf, str) for leaf in leaves):
             raise TypeError("CLI leaves must be an array of strings")
@@ -1206,7 +1481,7 @@ def _workflow_catalog_check(
     if check["status"] != "passed":
         return check
     try:
-        payload = json.loads(check["stdout_tail"])
+        payload = json.loads(check["_stdout_complete"])
         records = payload["contracts"]
         if not isinstance(records, list):
             raise TypeError("workflow contracts must be an array")
@@ -1595,51 +1870,228 @@ def _source_checks_in_boundary(
 
 def _python_minor(interpreter: str) -> str:
     version_script = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    completed = subprocess.run(
-        [interpreter, "-c", version_script],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
+    executable = _trusted_executable(interpreter)
+    completed = _run_bounded_process(
+        [str(executable), "-I", "-S", "-c", version_script],
+        cwd=Path.cwd(),
+        env=None,
         timeout=_effective_timeout(),
     )
-    return completed.stdout.strip()
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, str(executable))
+    return completed.stdout.decode("ascii", errors="strict").strip()
 
 
-DEPENDENCY_AUDIT_CLIENT = r"""
-import json
-import sys
-from pathlib import Path
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
-repo = Path.cwd()
-sys.path.insert(0, str(repo / "plugins" / "fork-ops" / "src"))
-from fork_ops.dependency_security import collect_uv_audit_evidence
 
-scopes = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-versions = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-candidate = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
-producer = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
-evidence_path = Path(sys.argv[5])
-verified = collect_uv_audit_evidence(
-    repo,
-    package_scopes_by_python=scopes,
-    package_versions_by_python=versions,
-    candidate_identity=candidate,
-    producer_identity=producer,
-    observation_epoch=sys.argv[6],
-)
-evidence = verified.to_dict() if hasattr(verified, "to_dict") else verified
-rendered = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
-evidence_path.write_text(rendered, encoding="utf-8")
-advisories = evidence.get("advisories")
-passed = hasattr(verified, "to_dict") and evidence.get("status") == "available" and advisories == []
-print(json.dumps({
-    "advisory_count": len(advisories) if isinstance(advisories, list) else None,
-    "status": evidence.get("status"),
-    "verified_adapter": hasattr(verified, "to_dict"),
-}, sort_keys=True))
-raise SystemExit(0 if passed else 1)
-"""
+def _dependency_matrix(
+    scopes_by_python: dict[str, dict[str, list[str]]],
+    versions_by_python: dict[str, dict[str, str]],
+) -> dict[str, object]:
+    if (
+        set(scopes_by_python) != set(SUPPORTED_PYTHON_MINORS)
+        or set(versions_by_python) != set(SUPPORTED_PYTHON_MINORS)
+    ):
+        raise ValueError("Dependency matrix must cover every supported Python minor")
+    package_tuples: list[dict[str, object]] = []
+    for minor in SUPPORTED_PYTHON_MINORS:
+        scopes = scopes_by_python[minor]
+        versions = versions_by_python[minor]
+        if not scopes or set(scopes) != set(versions):
+            raise ValueError(f"Python {minor} dependency matrix is incomplete")
+        covered: set[str] = set()
+        for package in sorted(scopes):
+            selected_scopes = scopes[package]
+            version = versions[package]
+            ordered = [scope for scope in DEPENDENCY_SCOPES if scope in selected_scopes]
+            if (
+                re.sub(r"[-_.]+", "-", package).lower() != package
+                or not version
+                or version != version.strip()
+                or selected_scopes != ordered
+                or len(selected_scopes) != len(set(selected_scopes))
+            ):
+                raise ValueError("Dependency matrix contains a noncanonical package tuple")
+            covered.update(selected_scopes)
+            package_tuples.append(
+                {
+                    "python_version": minor,
+                    "package": package,
+                    "locked_version": version,
+                    "dependency_scopes": selected_scopes,
+                }
+            )
+        if covered != set(DEPENDENCY_SCOPES):
+            raise ValueError(f"Python {minor} dependency scopes are incomplete")
+    return {
+        "platform": "linux",
+        "python_versions": list(SUPPORTED_PYTHON_MINORS),
+        "package_tuples": package_tuples,
+    }
+
+
+def _normalize_audit_advisory(
+    value: object,
+    minor: str,
+    scopes: dict[str, list[str]],
+    versions: dict[str, str],
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "id",
+        "aliases",
+        "dependency",
+        "fix_versions",
+    }:
+        raise ValueError("Provider advisory has an unsupported shape")
+    dependency = value.get("dependency")
+    if not isinstance(dependency, dict) or set(dependency) != {"name", "version"}:
+        raise ValueError("Provider advisory dependency has an unsupported shape")
+    raw_package = dependency.get("name")
+    locked_version = dependency.get("version")
+    advisory_id = value.get("id")
+    aliases = value.get("aliases")
+    fix_versions = value.get("fix_versions")
+    package = re.sub(r"[-_.]+", "-", raw_package).lower() if isinstance(raw_package, str) else ""
+    if not (
+        package in scopes
+        and isinstance(locked_version, str)
+        and versions.get(package) == locked_version
+        and isinstance(advisory_id, str)
+        and advisory_id
+        and isinstance(aliases, list)
+        and all(isinstance(alias, str) and alias for alias in aliases)
+        and isinstance(fix_versions, list)
+        and all(isinstance(version, str) and version for version in fix_versions)
+    ):
+        raise ValueError("Provider advisory does not bind an exact locked package tuple")
+    return {
+        "advisory_id": advisory_id,
+        "aliases": sorted(set(aliases).difference({advisory_id})),
+        "package": package,
+        "locked_version": locked_version,
+        "affected": True,
+        "affected_range": "",
+        "fixed_versions": sorted(set(fix_versions)),
+        "dependency_scopes": scopes[package],
+        "python_versions": [minor],
+    }
+
+
+def _merge_audit_advisories(
+    advisories: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[bytes, dict[str, object]] = {}
+    for advisory in advisories:
+        identity = _canonical_json_bytes(
+            {key: value for key, value in advisory.items() if key != "python_versions"}
+        )
+        selected = merged.setdefault(identity, {**advisory, "python_versions": []})
+        selected_versions = selected.get("python_versions")
+        advisory_versions = advisory.get("python_versions")
+        if not isinstance(selected_versions, list) or not isinstance(advisory_versions, list):
+            raise ValueError("Normalized advisory Python coverage is malformed")
+        selected_versions.extend(advisory_versions)
+        selected["python_versions"] = [
+            minor for minor in SUPPORTED_PYTHON_MINORS if minor in selected_versions
+        ]
+    return sorted(
+        merged.values(),
+        key=_normalized_advisory_sort_key,
+    )
+
+
+def _normalized_advisory_sort_key(item: dict[str, object]) -> tuple[str, str, str]:
+    return (
+        str(item["package"]),
+        str(item["locked_version"]),
+        str(item["advisory_id"]),
+    )
+
+
+def _validate_fresh_resolution_project(repo: Path) -> dict[str, object]:
+    root = tomllib.loads(_read_text(repo / "pyproject.toml"))
+    package = tomllib.loads(_read_text(repo / "plugins" / "fork-ops" / "pyproject.toml"))
+    if set(root) - {"project", "dependency-groups", "tool"}:
+        raise ValueError("Fresh resolution root project has unsupported top-level tables")
+    root_tool = root.get("tool")
+    if not isinstance(root_tool, dict):
+        raise ValueError("Fresh resolution requires the workspace tool table")
+    uv = root_tool.get("uv")
+    if not isinstance(uv, dict) or set(uv) != {"package", "default-groups", "sources", "workspace"}:
+        raise ValueError("Fresh resolution requires the closed workspace uv contract")
+    if uv.get("sources") != {"fork-ops": {"workspace": True}}:
+        raise ValueError("Fresh resolution permits only the fork-ops workspace source")
+    if uv.get("workspace") != {"members": ["plugins/fork-ops"]}:
+        raise ValueError("Fresh resolution workspace membership is unsupported")
+    if set(package) - {"build-system", "project", "dependency-groups", "tool"}:
+        raise ValueError("Fresh resolution package has unsupported top-level tables")
+    if package.get("build-system") != {
+        "requires": ["setuptools>=69", "wheel"],
+        "build-backend": "setuptools.build_meta",
+    }:
+        raise ValueError("Fresh resolution package build contract is unsupported")
+    package_tool = package.get("tool")
+    if not isinstance(package_tool, dict) or "uv" in package_tool:
+        raise ValueError("Fresh resolution package tool configuration is unsupported")
+    for relative in ("uv.toml", ".uv.toml"):
+        if (repo / relative).exists():
+            raise ValueError(f"Fresh resolution rejects candidate uv config {relative}")
+    dependencies: list[str] = []
+    for project in (root.get("project"), package.get("project")):
+        if not isinstance(project, dict):
+            raise ValueError("Fresh resolution project metadata is malformed")
+        if "dynamic" in project:
+            raise ValueError("Fresh resolution rejects dynamic project metadata")
+        raw_dependencies = project.get("dependencies", [])
+        if not isinstance(raw_dependencies, list):
+            raise ValueError("Fresh resolution dependencies must be arrays")
+        dependencies.extend(raw_dependencies)
+        optional = project.get("optional-dependencies", {})
+        if not isinstance(optional, dict):
+            raise ValueError("Fresh resolution optional dependencies must be a table")
+        for values in optional.values():
+            if not isinstance(values, list):
+                raise ValueError("Fresh resolution optional dependency groups must be arrays")
+            dependencies.extend(values)
+    for project in (root, package):
+        groups = project.get("dependency-groups", {})
+        if not isinstance(groups, dict):
+            raise ValueError("Fresh resolution dependency groups must be a table")
+        for values in groups.values():
+            if not isinstance(values, list):
+                raise ValueError("Fresh resolution dependency groups must be arrays")
+            dependencies.extend(values)
+    for dependency in dependencies:
+        if not isinstance(dependency, str) or not dependency.strip():
+            raise ValueError("Fresh resolution dependencies must be nonempty strings")
+        lowered = dependency.lower()
+        if (
+            " @ " in dependency
+            or "git+" in lowered
+            or "http://" in lowered
+            or "https://" in lowered
+            or "file:" in lowered
+            or "ssh:" in lowered
+        ):
+            raise ValueError("Fresh resolution rejects URL, VCS, path, and direct sources")
+    policy: dict[str, object] = {
+        "index": "https://pypi.org/simple",
+        "sources": "registry-only-plus-exact-workspace-member",
+        "uv_config": "disabled",
+        "dependency_declaration_sha256": hashlib.sha256(
+            _canonical_json_bytes(dependencies)
+        ).hexdigest(),
+    }
+    policy["policy_sha256"] = hashlib.sha256(_canonical_json_bytes(policy)).hexdigest()
+    return policy
 
 
 def _dependency_audit_matrix_check(
@@ -1657,83 +2109,367 @@ def _dependency_audit_matrix_check(
             [f"audit.osv.python.{minor}" for minor in SUPPORTED_PYTHON_MINORS],
             "Trusted GitHub Actions producer identity is required for sealed audit evidence.",
         )
-    with tempfile.TemporaryDirectory(prefix="fork-ops-dependency-audit-") as temp_dir:
-        root = Path(temp_dir)
-        scopes_path = root / "package-scopes.json"
-        versions_path = root / "package-versions.json"
-        candidate_path = root / "candidate-identity.json"
-        producer_path = root / "producer-identity.json"
-        evidence_path = root / "normalized-osv-evidence.json"
-        scopes_path.write_text(
-            json.dumps(package_scopes_by_python, sort_keys=True),
-            encoding="utf-8",
-        )
-        versions_path.write_text(
-            json.dumps(package_versions_by_python, sort_keys=True),
-            encoding="utf-8",
-        )
-        candidate_path.write_text(json.dumps(candidate_identity), encoding="utf-8")
-        producer_path.write_text(json.dumps(producer_identity), encoding="utf-8")
-        observation_epoch = os.urandom(32).hex()
-        check = _run_command(
+    del interpreter
+    started = time.monotonic()
+    required_ids = [f"audit.osv.python.{minor}" for minor in SUPPORTED_PYTHON_MINORS]
+    observation_epoch = os.urandom(32).hex()
+    observation_started = _utc_now()
+    try:
+        matrix = _dependency_matrix(package_scopes_by_python, package_versions_by_python)
+    except ValueError as exc:
+        return _blocked_check(
             "dependency_audit_matrix",
             ["dependency_audit"],
-            [f"audit.osv.python.{minor}" for minor in SUPPORTED_PYTHON_MINORS],
-            [
-                "uv",
-                "run",
-                "--locked",
-                "--exact",
-                "--python",
-                interpreter,
-                "--package",
-                "fork-ops",
-                "--extra",
-                "mcp",
-                "python",
-                "-c",
-                DEPENDENCY_AUDIT_CLIENT,
-                str(scopes_path),
-                str(versions_path),
-                str(candidate_path),
-                str(producer_path),
-                str(evidence_path),
-                observation_epoch,
-            ],
-            cwd=repo,
+            required_ids,
+            str(exc),
         )
-        check["command"] = [
-            "uv",
-            "run",
-            "--locked",
-            "--exact",
-            "--python",
-            interpreter,
-            "--package",
-            "fork-ops",
-            "--extra",
-            "mcp",
-            "python",
-            "<dependency-audit-client>",
-        ]
+    inventory_digest = hashlib.sha256(
+        _canonical_json_bytes({"package_tuples": matrix["package_tuples"]})
+    ).hexdigest()
+    matrix_package_tuples = matrix["package_tuples"]
+    if not isinstance(matrix_package_tuples, list):
+        return _blocked_check(
+            "dependency_audit_matrix",
+            ["dependency_audit"],
+            required_ids,
+            "Dependency matrix package tuples are malformed.",
+        )
+    if candidate_identity.get("package_scope_inventory_sha256") != inventory_digest:
+        return _blocked_check(
+            "dependency_audit_matrix",
+            ["dependency_audit"],
+            required_ids,
+            "Candidate identity does not bind the exact dependency matrix.",
+        )
+    child_checks: list[dict[str, Any]] = []
+    normalized_advisories: list[dict[str, object]] = []
+    provider_requests: list[dict[str, object]] = []
+    with tempfile.TemporaryDirectory(prefix="fork-ops-dependency-audit-") as temp_dir:
+        with _minimal_subprocess_environment(Path(temp_dir)) as environment:
+            for minor in SUPPORTED_PYTHON_MINORS:
+                check = _run_command(
+                    f"dependency_audit:{minor}",
+                    ["dependency_audit"],
+                    [f"audit.osv.python.{minor}"],
+                    [
+                        str(_trusted_uv_executable()),
+                        "audit",
+                        "--locked",
+                        "--frozen",
+                        "--no-config",
+                        "--no-sources",
+                        "--no-build",
+                        "--default-index",
+                        "https://pypi.org/simple",
+                        "--index-strategy",
+                        "first-index",
+                        "--keyring-provider",
+                        "disabled",
+                        "--service-url",
+                        "https://api.osv.dev/v1/querybatch",
+                        "--output-format",
+                        "json",
+                        "--python-platform",
+                        "linux",
+                        "--python-version",
+                        minor,
+                    ],
+                    cwd=repo,
+                    env=environment,
+                    allowed_returncodes=frozenset({0, 1}),
+                )
+                child_checks.append(check)
+                if check["status"] != "passed":
+                    continue
+                try:
+                    raw = json.loads(check["_stdout_complete"])
+                    if not isinstance(raw, dict) or set(raw) != {
+                        "vulnerabilities",
+                        "adverse_statuses",
+                    }:
+                        raise ValueError("Provider response has an unsupported root shape")
+                    vulnerabilities = raw["vulnerabilities"]
+                    adverse = raw["adverse_statuses"]
+                    if not isinstance(vulnerabilities, list) or not isinstance(adverse, list):
+                        raise ValueError("Provider response collections are malformed")
+                    if adverse:
+                        raise ValueError("Provider reported adverse package statuses")
+                    normalized_advisories.extend(
+                        _normalize_audit_advisory(
+                            advisory,
+                            minor,
+                            package_scopes_by_python[minor],
+                            package_versions_by_python[minor],
+                        )
+                        for advisory in vulnerabilities
+                    )
+                    tuples = [
+                        item
+                        for item in matrix_package_tuples
+                        if isinstance(item, dict) and item.get("python_version") == minor
+                    ]
+                    request: dict[str, object] = {
+                        "provider": "osv.dev:uv-audit",
+                        "python_version": minor,
+                        "package_tuple_count": len(tuples),
+                        "package_tuples_sha256": hashlib.sha256(
+                            _canonical_json_bytes(tuples)
+                        ).hexdigest(),
+                        "response_sha256": check["stdout_sha256"],
+                        "advisory_count": len(vulnerabilities),
+                        "complete": True,
+                    }
+                    request["request_sha256"] = hashlib.sha256(
+                        _canonical_json_bytes(
+                            {
+                                "provider": request["provider"],
+                                "python_version": minor,
+                                "package_tuples": tuples,
+                                "observation_epoch": observation_epoch,
+                            }
+                        )
+                    ).hexdigest()
+                    provider_requests.append(request)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    check["status"] = "failed"
+                    check["exit_code"] = 1
+                    check["stderr_tail"] = f"Trusted provider response validation failed: {exc}"
+    failures = [check for check in child_checks if check["status"] != "passed"]
+    if len(provider_requests) != len(SUPPORTED_PYTHON_MINORS):
+        failures.append(
+            _blocked_check(
+                "dependency_audit_completeness",
+                ["dependency_audit"],
+                required_ids,
+                "Provider observations are incomplete for the supported Python matrix.",
+            )
+        )
+    merged_advisories = _merge_audit_advisories(normalized_advisories)
+    evidence: dict[str, object] = {
+        "artifact_kind": "normalized_dependency_vulnerability_evidence",
+        "schema_version": "2.0",
+        "source": "osv",
+        "status": "available" if not failures else "unavailable",
+        "platforms": ["linux"],
+        "dependency_scopes": list(DEPENDENCY_SCOPES),
+        "python_versions": list(SUPPORTED_PYTHON_MINORS),
+        "advisories": merged_advisories,
+        "diagnostics": [] if not failures else [
+            {
+                "code": "evidence.incomplete",
+                "source": "osv",
+                "message": "The verifier did not obtain four complete provider observations.",
+            }
+        ],
+        "provenance": {
+            "schema_version": "1.0",
+            "candidate": candidate_identity,
+            "matrix": matrix,
+            "producer": producer_identity,
+            "source_observation": {
+                "provider": "osv",
+                "source_identity": "osv.dev:uv-audit",
+                "authenticated": False,
+                "pagination_complete": not failures,
+                "page_count": len(provider_requests),
+                "item_count": len(merged_advisories),
+                "observation_epoch": observation_epoch,
+                "started_at": observation_started,
+                "completed_at": _utc_now(),
+                "valid_until": (
+                    datetime.now(UTC) + timedelta(minutes=15)
+                ).isoformat().replace("+00:00", "Z"),
+            },
+        },
+    }
+    evidence["payload_sha256"] = hashlib.sha256(_canonical_json_bytes(evidence)).hexdigest()
+    stdout = "".join(check["stdout_tail"] for check in child_checks)
+    stderr = "".join(check["stderr_tail"] for check in failures)
+    return {
+        "id": "dependency_audit_matrix",
+        "behavior_classes": ["dependency_audit"],
+        "required_ids": required_ids,
+        "status": "failed" if failures or merged_advisories else "passed",
+        "exit_code": failures[0]["exit_code"] if failures else (1 if merged_advisories else 0),
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "command": ["uv", "audit", "<trusted-four-minor-provider-matrix>"],
+        "commands": [check["command"] for check in child_checks],
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
+        "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+        "timed_out": any(check["timed_out"] for check in child_checks),
+        "environment_policy": "explicit_minimal",
+        "evidence": evidence,
+        "evidence_sha256": hashlib.sha256(_canonical_json_bytes(evidence)).hexdigest(),
+        "provider_requests": provider_requests,
+        "provider_requests_sha256": hashlib.sha256(
+            _canonical_json_bytes(provider_requests)
+        ).hexdigest(),
+    }
+
+
+def _validate_resolved_snapshot_tree(snapshot: Path) -> None:
+    for directory, directory_names, file_names in os.walk(
+        snapshot,
+        topdown=True,
+        followlinks=False,
+    ):
+        _deadline_checkpoint()
+        for name in [*directory_names, *file_names]:
+            entry = Path(directory) / name
+            mode = entry.lstat().st_mode
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise ValueError(
+                    f"Fresh resolver produced an unsupported filesystem entry: {entry}"
+                )
+
+
+def _fresh_resolution_check(
+    snapshot: Path,
+    interpreter: str,
+    *,
+    candidate_container: bool,
+) -> dict[str, Any]:
+    try:
+        policy = _validate_fresh_resolution_project(snapshot)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValueError) as exc:
+        return _blocked_check(
+            "fresh_resolution",
+            ["dependency_resolution", "candidate_isolation"],
+            ["resolution.closed_registry_policy"],
+            str(exc),
+        )
+    input_manifest_sha256 = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "root_pyproject_sha256": _sha256(snapshot / "pyproject.toml"),
+                "package_pyproject_sha256": _sha256(
+                    snapshot / "plugins" / "fork-ops" / "pyproject.toml"
+                ),
+                "input_lock_sha256": _sha256(snapshot / "uv.lock"),
+            }
+        )
+    ).hexdigest()
+    protected_inputs = {
+        relative: _read_bytes(snapshot / relative)
+        for relative in (
+            "pyproject.toml",
+            "plugins/fork-ops/pyproject.toml",
+        )
+    }
+    command = [
+        "uv",
+        "lock",
+        "--upgrade",
+        "--refresh",
+        "--no-config",
+        "--no-sources",
+        "--no-build",
+        "--default-index",
+        "https://pypi.org/simple",
+        "--python",
+        interpreter,
+    ]
+    if candidate_container:
+        minor = _python_minor(interpreter)
+        image = PYTHON_CONTAINER_IMAGES.get(minor)
+        if image is None or os.name != "posix":
+            return _blocked_check(
+                "fresh_resolution",
+                ["dependency_resolution", "candidate_isolation"],
+                ["resolution.digest_pinned_container"],
+                f"No digest-pinned resolver container is available for Python {minor}.",
+            )
         try:
-            evidence = json.loads(_read_text(evidence_path))
-        except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeError) as exc:
-            if check["status"] == "passed":
-                check["status"] = "failed"
-                check["exit_code"] = 1
-            check["stderr_tail"] = (
-                check["stderr_tail"] + f"\nNormalized audit evidence unavailable: {exc}"
-            ).lstrip()
-            return check
-        normalized = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
-        check["evidence"] = evidence
-        check["evidence_sha256"] = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        advisories = evidence.get("advisories")
-        if evidence.get("status") != "available" or advisories != []:
+            user = _host_group_container_user()
+            _make_private_tree_group_writable(snapshot)
+        except ValueError as exc:
+            return _blocked_check(
+                "fresh_resolution",
+                ["dependency_resolution", "candidate_isolation"],
+                ["resolution.private_writable_snapshot"],
+                str(exc),
+            )
+        base = [
+            argument
+            for argument in _candidate_container_base(user=user)
+            if argument != "--network=none"
+        ]
+        uv_executable = _trusted_uv_executable()
+        with tempfile.TemporaryDirectory(prefix="fork-ops-resolver-host-") as host_dir:
+            with _minimal_subprocess_environment(Path(host_dir)) as host_environment:
+                check = _run_command(
+                    "fresh_resolution",
+                    ["dependency_resolution", "candidate_isolation"],
+                    [
+                        "resolution.closed_registry_policy",
+                        "resolution.digest_pinned_container",
+                        "resolution.no_host_credentials",
+                        "resolution.private_writable_snapshot",
+                    ],
+                    [
+                        *base,
+                        "--network=bridge",
+                        "--workdir=/workspace",
+                        "--env=UV_NO_CONFIG=1",
+                        "--env=UV_DEFAULT_INDEX=https://pypi.org/simple",
+                        "--env=UV_INDEX_STRATEGY=first-index",
+                        "--env=UV_PYTHON_DOWNLOADS=never",
+                        f"--mount=type=bind,src={snapshot},dst=/workspace",
+                        f"--mount=type=bind,src={uv_executable},dst=/opt/fork-ops/uv,readonly",
+                        image,
+                        "/opt/fork-ops/uv",
+                        *command[1:-1],
+                        minor,
+                    ],
+                    cwd=snapshot,
+                    env=host_environment,
+                )
+        check["environment_policy"] = "networked_resolver_container_explicit_minimal"
+    else:
+        with tempfile.TemporaryDirectory(prefix="fork-ops-fresh-resolution-") as temp_dir:
+            with _minimal_subprocess_environment(Path(temp_dir)) as environment:
+                check = _run_command(
+                    "fresh_resolution",
+                    ["dependency_resolution"],
+                    ["resolution.closed_registry_policy"],
+                    command,
+                    cwd=snapshot,
+                    env=environment,
+                )
+    check["resolution_policy"] = policy
+    check["resolver"] = {
+        "uv_executable_sha256": _TRUSTED_UV_SHA256,
+        "input_manifest_sha256": input_manifest_sha256,
+        "container_image": PYTHON_CONTAINER_IMAGES.get(_python_minor(interpreter), "")
+        if candidate_container
+        else "",
+    }
+    if check["status"] == "passed":
+        try:
+            _validate_resolved_snapshot_tree(snapshot)
+            for relative, expected in protected_inputs.items():
+                if _read_bytes(snapshot / relative) != expected:
+                    raise ValueError(f"Fresh resolver changed protected input {relative}")
+            for relative in ("uv.toml", ".uv.toml"):
+                if (snapshot / relative).exists():
+                    raise ValueError(f"Fresh resolver created forbidden config {relative}")
+            check["resolver"]["output_lock_sha256"] = _sha256(snapshot / "uv.lock")
+        except (OSError, ValueError, RuntimeError) as exc:
             check["status"] = "failed"
-            check["exit_code"] = check["exit_code"] or 1
-        return check
+            check["exit_code"] = 1
+            check["stderr_tail"] = f"Fresh resolver output validation failed: {exc}"
+    check["resolver"]["receipt_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "policy": policy,
+                "resolver": check["resolver"],
+                "command": check["command"],
+                "exit_code": check["exit_code"],
+            }
+        )
+    ).hexdigest()
+    return check
 
 
 def _fresh_source_checks(
@@ -1764,12 +2500,22 @@ def _fresh_source_checks(
         return ignored_names.intersection(names)
 
     def copy_snapshot_file(source: str, destination: str) -> str:
+        nonlocal copied_files, copied_bytes
         _deadline_checkpoint()
+        metadata = os.lstat(source)
+        if metadata.st_size > MAX_SOURCE_FILE_BYTES:
+            raise ValueError(f"Fresh source file exceeds size limit: {source}")
+        copied_files += 1
+        copied_bytes += metadata.st_size
+        if copied_files > MAX_SOURCE_FILES or copied_bytes > MAX_SOURCE_BYTES:
+            raise ValueError("Fresh source snapshot exceeds file-count or aggregate-byte limit")
         copied = shutil.copy2(source, destination)
         _deadline_checkpoint()
         return copied
 
     with tempfile.TemporaryDirectory(prefix="fork-ops-fresh-") as temp_dir:
+        copied_files = 0
+        copied_bytes = 0
         snapshot = Path(temp_dir) / "repository"
         _deadline_checkpoint()
         shutil.copytree(
@@ -1784,28 +2530,31 @@ def _fresh_source_checks(
         (snapshot / "uv.lock").chmod(0o600)
         _deadline_checkpoint()
         checks = [
-            _run_command(
-                "fresh_resolution",
-                ["dependency_resolution"],
-                ["resolution.fresh_snapshot"],
-                [
-                    "uv",
-                    "lock",
-                    "--upgrade",
-                    "--refresh",
-                    "--python",
-                    interpreter,
-                ],
-                cwd=snapshot,
+            _fresh_resolution_check(
+                snapshot,
+                interpreter,
+                candidate_container=candidate_container,
             )
         ]
-        scope_inventory = _package_scope_inventory_check(snapshot)
+        if checks[0]["status"] != "passed":
+            return checks, _sha256(snapshot / "uv.lock"), {}
+        with tempfile.TemporaryDirectory(prefix="fork-ops-fresh-inventory-") as inventory_dir:
+            with _minimal_subprocess_environment(Path(inventory_dir)) as environment:
+                scope_inventory = _package_scope_inventory_check(
+                    snapshot,
+                    subprocess_env=environment,
+                )
         lock_digest = _sha256(snapshot / "uv.lock")
+        matrix = _dependency_matrix(scope_inventory[1], scope_inventory[2])
+        matrix_digest = hashlib.sha256(
+            _canonical_json_bytes({"package_tuples": matrix["package_tuples"]})
+        ).hexdigest()
         candidate_identity = {
             "commit_sha": commit_sha,
             "source_snapshot_sha256": source_snapshot_sha256,
             "uv_lock_sha256": lock_digest,
-            "package_scope_inventory_sha256": scope_inventory[3],
+            "package_scope_inventory_sha256": matrix_digest,
+            "package_scope_collection_sha256": scope_inventory[3],
         }
         checks.append(
             _dependency_audit_matrix_check(
@@ -2691,7 +3440,7 @@ def _installed_checks_in_environment(
             )
             if container_identity["status"] == "passed":
                 try:
-                    observed_minor = json.loads(container_identity["stdout_tail"])["minor"]
+                    observed_minor = json.loads(container_identity["_stdout_complete"])["minor"]
                 except (json.JSONDecodeError, KeyError, TypeError):
                     observed_minor = ""
                 if observed_minor != python_minor:
@@ -2735,7 +3484,7 @@ def _installed_checks_in_environment(
     )
     if graph_check["status"] == "passed":
         try:
-            graph_payload = json.loads(graph_check["stdout_tail"])
+            graph_payload = json.loads(graph_check["_stdout_complete"])
             distributions = graph_payload["distributions"]
             if not isinstance(distributions, list) or not all(
                 isinstance(item, str) for item in distributions
@@ -2864,7 +3613,7 @@ def _installed_checks_in_environment(
     )
     if mcp_check["status"] == "passed":
         try:
-            protocol = json.loads(mcp_check["stdout_tail"])
+            protocol = json.loads(mcp_check["_stdout_complete"])
             if not isinstance(protocol, dict):
                 raise TypeError("MCP protocol result must be an object")
         except (json.JSONDecodeError, TypeError):
@@ -3745,42 +4494,36 @@ def _interpreter_identity(interpreter: str) -> dict[str, str]:
         "print(json.dumps({'executable':sys.executable,'implementation':platform.python_implementation(),"
         "'version':platform.python_version(),'abi':sysconfig.get_config_var('SOABI') or ''}))"
     )
-    completed = subprocess.run(
-        [interpreter, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
+    executable = _trusted_executable(interpreter)
+    completed = _run_bounded_process(
+        [str(executable), "-I", "-S", "-c", script],
+        cwd=Path.cwd(),
+        env=None,
         timeout=_effective_timeout(),
     )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, str(executable))
     identity = json.loads(completed.stdout)
     identity["requested"] = interpreter
+    identity["resolved"] = str(executable)
+    identity["executable_sha256"] = _sha256(executable)
     return identity
 
 
 def _git_commit(repo: Path) -> str:
-    completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=_effective_timeout(),
-    )
-    return completed.stdout.strip()
+    completed = _run_trusted_git(repo, ["rev-parse", "--verify", "HEAD^{commit}"])
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, "git rev-parse")
+    return completed.stdout.decode("ascii", errors="strict").strip()
 
 
 def _git_tree_state(repo: Path) -> str:
-    completed = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=_effective_timeout(),
+    completed = _run_trusted_git(
+        repo,
+        ["status", "--porcelain", "--untracked-files=all"],
     )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, "git status")
     return "clean" if not completed.stdout else "dirty"
 
 
@@ -3821,23 +4564,23 @@ def _dependency_producer_identity() -> dict[str, Any] | None:
 
 
 def _uv_identity() -> dict[str, str]:
-    executable = shutil.which("uv")
-    if executable is None:
-        raise FileNotFoundError("uv is not available on PATH")
-    completed = subprocess.run(
-        [executable, "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    global _TRUSTED_UV_EXECUTABLE, _TRUSTED_UV_SHA256
+    executable = _trusted_executable("uv")
+    completed = _run_bounded_process(
+        [str(executable), "--version"],
+        cwd=Path.cwd(),
+        env=None,
         timeout=_effective_timeout(),
     )
-    resolved = Path(executable).resolve()
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, str(executable))
+    digest = _sha256(executable)
+    _TRUSTED_UV_EXECUTABLE = executable
+    _TRUSTED_UV_SHA256 = digest
     return {
-        "version": completed.stdout.strip(),
-        "executable": str(resolved),
-        "executable_sha256": _sha256(resolved),
+        "version": completed.stdout.decode("utf-8", errors="replace").strip(),
+        "executable": str(executable),
+        "executable_sha256": digest,
     }
 
 
@@ -3983,28 +4726,35 @@ def main(argv: list[str] | None = None) -> int:
     resources = contextlib.ExitStack()
     try:
         uv_identity = _uv_identity()
-        identity["commit_sha"] = _git_commit(repo)
-        identity["source_tree"] = _git_tree_state(repo)
+        interpreter_identity = _interpreter_identity(args.interpreter)
+        identity["interpreter"] = interpreter_identity
+        resolved_interpreter = interpreter_identity["resolved"]
+        candidate_descriptor, candidate_repo, candidate_root_identity = (
+            _bind_candidate_repository(repo)
+        )
+        resources.callback(os.close, candidate_descriptor)
+        identity["commit_sha"] = _git_commit(candidate_repo)
+        identity["source_tree"] = _git_tree_state(candidate_repo)
         excluded_paths = [path for path in (artifact_dir, args.output) if path is not None]
         if args.build_evidence is not None:
             excluded_paths.append(args.build_evidence.resolve())
         if args.release_preflight_evidence is not None:
             excluded_paths.append(args.release_preflight_evidence.resolve())
-        lock_bytes = _read_bytes(repo / "uv.lock")
-        identity["source_snapshot_sha256"] = _source_snapshot_digest(
-            repo,
-            excluded_paths,
-            verified_files={"uv.lock": lock_bytes},
-        )
+        lock_bytes = _read_bytes(candidate_repo / "uv.lock")
         identity["lock_sha256"] = hashlib.sha256(lock_bytes).hexdigest()
-        execution_repo = resources.enter_context(
-            _verified_execution_snapshot(repo, lock_bytes, excluded_paths)
+        execution_repo, identity["source_snapshot_sha256"] = resources.enter_context(
+            _verified_execution_snapshot(
+                repo,
+                lock_bytes,
+                excluded_paths,
+                bound_root_descriptor=candidate_descriptor,
+            )
         )
         if args.mode == "locked-source":
             checks, scope_provenance = _source_checks(
                 execution_repo,
-                args.interpreter,
-                diff_repo=repo,
+                resolved_interpreter,
+                diff_repo=candidate_repo,
                 diff_base=args.diff_base or None,
                 candidate_container=args.execution_boundary == "container",
             )
@@ -4012,9 +4762,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "fresh-source":
             checks, identity["lock_sha256"], scope_provenance = _fresh_source_checks(
                 execution_repo,
-                args.interpreter,
+                resolved_interpreter,
                 args.diff_base or None,
-                diff_repo=repo,
+                diff_repo=candidate_repo,
                 commit_sha=identity["commit_sha"],
                 source_snapshot_sha256=identity["source_snapshot_sha256"],
                 producer_identity=_dependency_producer_identity(),
@@ -4024,7 +4774,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "build" and artifact_dir is not None:
             checks, build_provenance = _build_checks(
                 execution_repo,
-                args.interpreter,
+                resolved_interpreter,
                 artifact_dir,
                 candidate_container=args.execution_boundary == "container",
             )
@@ -4054,7 +4804,7 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             else:
                 trust_check = _release_trust_check(
-                    repo,
+                    candidate_repo,
                     args.build_evidence.resolve(),
                     run_id=args.trusted_main_run_id,
                     run_attempt=args.trusted_main_run_attempt,
@@ -4073,7 +4823,7 @@ def main(argv: list[str] | None = None) -> int:
                     dependency_provenance["release"] = trust_check["provenance"]
                     checks.append(
                         _candidate_identity_check(
-                            repo,
+                            candidate_repo,
                             artifact_dir,
                             args.build_evidence.resolve(),
                             identity["source_snapshot_sha256"],
@@ -4117,7 +4867,7 @@ def main(argv: list[str] | None = None) -> int:
                     ]
                 else:
                     preflight_check, release_provenance = _release_preflight_evidence_check(
-                        repo,
+                        candidate_repo,
                         artifact_dir,
                         args.release_preflight_evidence.resolve(),
                         args.release_preflight_key_file,
@@ -4133,7 +4883,7 @@ def main(argv: list[str] | None = None) -> int:
                         dependency_provenance["release"] = release_provenance
             if (not checks or checks[0]["status"] == "passed") and args.build_evidence:
                 identity_check = _candidate_identity_check(
-                    repo,
+                    candidate_repo,
                     artifact_dir,
                     args.build_evidence.resolve(),
                     identity["source_snapshot_sha256"],
@@ -4142,7 +4892,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.build_evidence is None and args.release_preflight_evidence is None:
                 installed_checks, runtime_provenance = _installed_checks(
                     execution_repo,
-                    args.interpreter,
+                    resolved_interpreter,
                     artifact_dir,
                     release_container=args.execution_boundary == "container",
                 )
@@ -4153,7 +4903,7 @@ def main(argv: list[str] | None = None) -> int:
                 if checks[-1]["status"] == "passed":
                     installed_checks, runtime_provenance = _installed_checks(
                         execution_repo,
-                        args.interpreter,
+                        resolved_interpreter,
                         artifact_dir,
                         release_container=(
                             args.execution_boundary == "container"
@@ -4165,9 +4915,13 @@ def main(argv: list[str] | None = None) -> int:
                         dependency_provenance["runtime"] = runtime_provenance
         else:
             raise ValueError(f"--mode {args.mode} requires --artifact-dir")
+        _verify_candidate_repository_binding(
+            repo,
+            candidate_descriptor,
+            candidate_root_identity,
+        )
         _deadline_checkpoint()
         identity["artifacts"] = _artifact_records(artifact_dir)
-        identity["interpreter"] = _interpreter_identity(args.interpreter)
         outcome = "passed" if all(check["status"] == "passed" for check in checks) else "failed"
         exit_code = 0 if outcome == "passed" else 1
         if args.mode == "release-preflight" and outcome == "passed":
@@ -4250,6 +5004,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         outcome = "failed"
         exit_code = 124
+    _discard_private_check_payloads(checks)
     evidence = {
         "artifact_kind": ARTIFACT_KIND,
         "schema_version": SCHEMA_VERSION,
