@@ -73,7 +73,7 @@ result remains observational. Candidate objects, serialized JSON, and `to_dict`
 projections cannot acquire the collector's in-process capability. These are
 observed graph memberships, not claims that one scope is another. An
 authenticated Dependabot provider adapter remains follow-up work; until it
-exists, serialized collector output must fail the dependency evaluator's trust
+exists, unverified collector output must fail the dependency evaluator's trust
 boundary.
 
 Source evidence also discovers the public argparse leaf commands and the
