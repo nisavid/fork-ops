@@ -577,7 +577,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
             original_lock = (repo / "uv.lock").read_text(encoding="utf-8")
-            fake_bin = self._create_fake_uv(fixture_root)
+            fake_bin = self._create_fake_uv(fixture_root, assert_clean_environment=True)
             output_path = fixture_root / "validation-evidence.json"
             env = os.environ.copy()
             env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
@@ -590,6 +590,9 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     "GITHUB_WORKFLOW_SHA": self._git_commit(repo),
                     "GITHUB_RUN_ID": "12345",
                     "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_TOKEN": "must-not-cross-fresh-source-boundary",
+                    "ACTIONS_RUNTIME_TOKEN": "must-not-cross-fresh-source-boundary",
+                    "SERVICE_SECRET": "must-not-cross-fresh-source-boundary",
                 }
             )
 
@@ -648,6 +651,15 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(audit["evidence"]["status"], "available")
             self.assertEqual(audit["evidence"]["advisories"], [])
             self.assertEqual(len(audit["evidence_sha256"]), 64)
+            self.assertEqual(
+                [
+                    check["id"]
+                    for check in evidence["checks"]
+                    if check["id"] != "diff_hygiene"
+                    and check.get("environment_policy") != "explicit_minimal"
+                ],
+                [],
+            )
             self.assertEqual((repo / "uv.lock").read_text(encoding="utf-8"), original_lock)
             self.assertNotEqual(
                 evidence["identity"]["lock_sha256"],

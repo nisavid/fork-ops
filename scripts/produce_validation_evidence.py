@@ -1421,6 +1421,7 @@ def _cli_surface_inventory_check(
     repo: Path,
     uv_run: list[str],
     candidate_boundary: CandidateContainerBoundary | None = None,
+    subprocess_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     check = _run_command(
         "cli_surface_inventory",
@@ -1435,7 +1436,7 @@ def _cli_surface_inventory_check(
             else [*uv_run, "python", "-c", CLI_SURFACE_DISCOVERY_CLIENT]
         ),
         cwd=repo,
-        env=candidate_boundary.host_environment if candidate_boundary is not None else None,
+        env=subprocess_env,
     )
     if check["status"] != "passed":
         return check
@@ -1461,6 +1462,7 @@ def _workflow_catalog_check(
     repo: Path,
     uv_run: list[str],
     candidate_boundary: CandidateContainerBoundary | None = None,
+    subprocess_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     check = _run_command(
         "workflow_catalog",
@@ -1475,7 +1477,7 @@ def _workflow_catalog_check(
             else [*uv_run, "python", "-c", WORKFLOW_CATALOG_DISCOVERY_CLIENT]
         ),
         cwd=repo,
-        env=candidate_boundary.host_environment if candidate_boundary is not None else None,
+        env=subprocess_env,
     )
     check["coverage_kind"] = "catalog_contract_discovery_not_execution"
     if check["status"] != "passed":
@@ -1532,13 +1534,16 @@ def _source_checks(
     candidate_container: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not candidate_container:
-        return _source_checks_in_boundary(
-            repo,
-            interpreter,
-            diff_repo=diff_repo,
-            diff_base=diff_base,
-            scope_inventory=scope_inventory,
-        )
+        with tempfile.TemporaryDirectory(prefix="fork-ops-source-local-") as temp_dir:
+            with _minimal_subprocess_environment(Path(temp_dir)) as environment:
+                return _source_checks_in_boundary(
+                    repo,
+                    interpreter,
+                    diff_repo=diff_repo,
+                    diff_base=diff_base,
+                    scope_inventory=scope_inventory,
+                    subprocess_env=environment,
+                )
     with tempfile.TemporaryDirectory(prefix="fork-ops-source-container-") as temp_dir:
         isolation_check, boundary = _prepare_source_candidate_container(
             repo,
@@ -1572,7 +1577,15 @@ def _source_checks_in_boundary(
     ]
     | None = None,
     candidate_boundary: CandidateContainerBoundary | None = None,
+    subprocess_env: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if candidate_boundary is not None and subprocess_env is not None:
+        raise ValueError("Source checks accept exactly one execution environment")
+    process_environment = (
+        candidate_boundary.host_environment
+        if candidate_boundary is not None
+        else subprocess_env
+    )
     uv_run = [
         "uv",
         "run",
@@ -1596,29 +1609,31 @@ def _source_checks_in_boundary(
             ["lock.uv_locked"],
             ["uv", "lock", "--check", "--python", interpreter],
             cwd=repo,
-            env=(
-                candidate_boundary.host_environment
-                if candidate_boundary is not None
-                else None
-            ),
+            env=process_environment,
         ),
     ]
     inventory_check, package_scopes, package_versions, inventory_digest = (
         scope_inventory
         or _package_scope_inventory_check(
             repo,
-            subprocess_env=(
-                candidate_boundary.host_environment
-                if candidate_boundary is not None
-                else None
-            ),
+            subprocess_env=process_environment,
         )
     )
     checks.extend(
         [
             inventory_check,
-            _cli_surface_inventory_check(repo, uv_run, candidate_boundary),
-            _workflow_catalog_check(repo, uv_run, candidate_boundary),
+            _cli_surface_inventory_check(
+                repo,
+                uv_run,
+                candidate_boundary,
+                process_environment,
+            ),
+            _workflow_catalog_check(
+                repo,
+                uv_run,
+                candidate_boundary,
+                process_environment,
+            ),
             _run_command(
                 "ruff",
                 ["source", "tests", "validation_entrypoint"],
@@ -1649,11 +1664,7 @@ def _source_checks_in_boundary(
                     ]
                 ),
                 cwd=repo,
-                env=(
-                    candidate_boundary.host_environment
-                    if candidate_boundary is not None
-                    else None
-                ),
+                env=process_environment,
             ),
         ]
     )
@@ -1703,11 +1714,7 @@ def _source_checks_in_boundary(
                 ]
             ),
             cwd=repo,
-            env=(
-                candidate_boundary.host_environment
-                if candidate_boundary is not None
-                else None
-            ),
+            env=process_environment,
         )
         if coverage_data.is_file():
             coverage_check = _run_command(
@@ -1740,11 +1747,7 @@ def _source_checks_in_boundary(
                     ]
                 ),
                 cwd=repo,
-                env=(
-                    candidate_boundary.host_environment
-                    if candidate_boundary is not None
-                    else None
-                ),
+                env=process_environment,
             )
             if coverage_check["status"] == "passed":
                 try:
@@ -1820,11 +1823,7 @@ def _source_checks_in_boundary(
                     else [*uv_run, "pyrefly", "check"]
                 ),
                 cwd=repo,
-                env=(
-                    candidate_boundary.host_environment
-                    if candidate_boundary is not None
-                    else None
-                ),
+                env=process_environment,
             ),
         ]
     )
@@ -1841,11 +1840,7 @@ def _source_checks_in_boundary(
             else [*uv_run, "fork-ops", "schema", "print"]
         ),
         cwd=repo,
-        env=(
-            candidate_boundary.host_environment
-            if candidate_boundary is not None
-            else None
-        ),
+        env=process_environment,
     )
     schema_paths = (
         repo / "plugins" / "fork-ops" / "schema" / "fork-ops.schema.json",
@@ -2859,6 +2854,8 @@ def _package_scope_inventory_check(
         "inventory_sha256": digest,
         "exports": export_records,
     }
+    if subprocess_env is not None:
+        aggregate["environment_policy"] = "explicit_minimal"
     return aggregate, inventory, version_inventory, digest
 
 
