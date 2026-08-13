@@ -2591,6 +2591,9 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         fake_bin = fixture_root / "bin"
         fake_bin.mkdir()
         fake_uv = fake_bin / "uv"
+        operation_sentinel_literal = repr(
+            str(operation_sentinel) if operation_sentinel is not None else ""
+        )
         fake_uv.write_text(
             textwrap.dedent(
                 f"""\
@@ -2598,9 +2601,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 import sys
                 import time
 
-                operation_sentinel = {
-                    str(operation_sentinel) if operation_sentinel is not None else ""!r
-                }
+                operation_sentinel = {operation_sentinel_literal}
                 if operation_sentinel and sys.argv[1:] != ["--version"]:
                     from pathlib import Path
 
