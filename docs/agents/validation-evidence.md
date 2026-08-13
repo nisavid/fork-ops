@@ -125,6 +125,16 @@ output are the only writable bind mounts. Candidate processes have no network,
 host credentials, Actions or OIDC tokens, checkout credentials, Docker socket,
 or access to the trusted verifier and final evidence paths.
 
+Locked source, build, and installed preparation first validate a closed project
+policy: the only permitted uv source is the exact `fork-ops` workspace member,
+workspace membership is fixed, candidate uv configuration and direct sources
+are forbidden, and build metadata is static and pinned. Those commands then
+honor that validated workspace mapping while retaining the fixed index,
+disabled keyring, no-build, no-config, no-download, and minimal-environment
+controls. Fresh resolution and provider audit remain explicitly
+`--no-sources` because they consume registry-only projections rather than the
+workspace-enabled lock identity.
+
 Every host-side repository query uses one absolute, hash-stable Git executable
 under a minimal environment. Repository and global configuration cannot enable
 fsmonitor, hooks, credential helpers, pagers, external diffs, textconv,
@@ -138,6 +148,14 @@ the default branch. Local contract tests and actionlint can validate the
 proposed shape before merge; the first post-merge pull request is the required
 hosted activation checkpoint. The introducing pull request must not claim a
 green hosted run from this new workflow.
+
+The same boundary applies to the trusted producer itself. A pull request that
+changes `produce_validation_evidence.py` is evaluated by the producer already
+on the base branch; executing the proposed producer would make candidate code
+the verifier. A repair to a broken base producer therefore uses local contract
+tests and independent review before merge, then treats the first exact-main run
+as its hosted activation checkpoint. Its pull-request run truthfully reports
+the base producer's behavior and is not represented as validation of the repair.
 
 Release lanes add a provenance gate before wheel execution. Using an `actions: read`
 token, a preflight process from a verifier checkout pinned to the immutable
