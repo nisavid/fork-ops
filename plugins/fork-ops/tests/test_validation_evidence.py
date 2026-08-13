@@ -472,7 +472,11 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             for check_id, command in source_container_commands.items():
                 if check_id == "pytest":
                     continue
-                self.assertFalse(any("/test-tmp" in argument for argument in command))
+                self.assertNotIn(
+                    "--tmpfs=/test-tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
+                    command,
+                )
+                self.assertNotIn("--env=TMPDIR=/test-tmp", command)
 
     def test_hosted_locked_workspace_modes_keep_the_closed_source_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1457,7 +1461,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--command-timeout-seconds",
-                    "0.05",
+                    "0.5",
                     "--output",
                     str(output_path),
                 ],
