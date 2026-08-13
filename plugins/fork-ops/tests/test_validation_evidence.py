@@ -16,6 +16,7 @@ import threading
 import time
 import tomllib
 import unittest
+import venv
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,6 +124,51 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout), {"value": "trusted"})
 
+    @unittest.skipIf(os.name == "nt", "This test requires a POSIX virtual environment.")
+    def test_isolated_child_projection_blocks_site_hooks_and_resolves_exact_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            environment = root / "environment"
+            dependencies = root / "dependencies"
+            source = root / "source"
+            (dependencies / "jsonschema").mkdir(parents=True)
+            (source / "fork_ops").mkdir(parents=True)
+            (dependencies / "jsonschema" / "__init__.py").write_text("", encoding="utf-8")
+            (source / "fork_ops" / "__init__.py").write_text("", encoding="utf-8")
+            (source / "sitecustomize.py").write_text(
+                "raise SystemExit('candidate site hook executed')\n",
+                encoding="utf-8",
+            )
+            venv.EnvBuilder(with_pip=False).create(environment)
+            python = environment / "bin" / "python"
+            minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+            standard_site = environment / "lib" / f"python{minor}" / "site-packages"
+            namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+            projection_text = namespace["_isolated_child_projection_text"]
+            target = namespace["ISOLATED_CHILD_TARGET"]
+            (standard_site / "fork_ops_validation.pth").write_text(
+                projection_text(str(dependencies), str(source)),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [str(python), "-I", "-c", target],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["fork_ops"], str(source / "fork_ops" / "__init__.py"))
+            self.assertEqual(
+                payload["jsonschema"],
+                str(dependencies / "jsonschema" / "__init__.py"),
+            )
+            self.assertFalse(payload["fork_ops_distribution_installed"])
+            self.assertTrue(payload["sitecustomize_is_verifier_placeholder"])
+            self.assertEqual(payload["workspace_paths"], [])
+
     def test_windows_advisory_writer_uses_native_paths_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -210,6 +256,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 "3.14": "python:3.14@sha256:"
                 "297cf11d0b98b38ac26a56136f0279df845314bcd0347c1f6383fee6e75125ee",
             }[f"{sys.version_info.major}.{sys.version_info.minor}"]
+            source_python_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
 
             env.update(
                 {
@@ -351,6 +398,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(
                 set(source_container_commands),
                 {
+                    "isolated_child_imports",
                     "cli_surface_inventory",
                     "workflow_catalog",
                     "ruff",
@@ -366,7 +414,23 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if argument.startswith("python:") and "@sha256:" in argument
                 )
                 self.assertEqual(image, source_image)
-            for check_id in ("cli_surface_inventory", "workflow_catalog", "pytest"):
+            for check_id in (
+                "isolated_child_imports",
+                "cli_surface_inventory",
+                "workflow_catalog",
+                "pytest",
+                "schema_parity",
+            ):
+                isolated_site_mount = next(
+                    argument
+                    for argument in source_commands[check_id]
+                    if "dst=/usr/local/lib/python" in argument
+                    and argument.endswith("/site-packages,readonly")
+                )
+                self.assertIn(
+                    f"dst=/usr/local/lib/python{source_python_minor}/site-packages,readonly",
+                    isolated_site_mount,
+                )
                 workspace_mount = next(
                     argument
                     for argument in source_commands[check_id]
@@ -2903,6 +2967,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         (schema_dir / "fork-ops.schema.json").write_text(schema, encoding="utf-8")
         (packaged_schema_dir / "fork-ops.schema.json").write_text(schema, encoding="utf-8")
         (packaged_schema_dir / "__init__.py").write_text("", encoding="utf-8")
+        (packaged_schema_dir.parent / "sitecustomize.py").write_text(
+            "raise SystemExit('candidate sitecustomize executed')\n",
+            encoding="utf-8",
+        )
         package_source_dir = REPOSITORY_ROOT / "plugins" / "fork-ops" / "src" / "fork_ops"
         for source_name in (
             "dependency_security.py",
@@ -3857,6 +3925,27 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 if "fork_ops_validation_container_bootstrap" not in isolated_python[4]:
                     print("candidate Python did not use the trusted bootstrap", file=sys.stderr)
                     raise SystemExit(98)
+                if any("dst=/opt/fork-ops/bin" in value for value in sys.argv):
+                    isolated_site_mount = next(
+                        value
+                        for value in sys.argv
+                        if "dst=/usr/local/lib/python" in value
+                        and value.endswith("/site-packages,readonly")
+                    )
+                    isolated_site = pathlib.Path(
+                        isolated_site_mount.split("src=", 1)[1].split(",dst=", 1)[0]
+                    )
+                    isolated_paths_file = isolated_site / "fork_ops_validation.pth"
+                    if isolated_paths_file.read_text(encoding="utf-8").splitlines() != [
+                        'import sys; sys.modules["sitecustomize"] = sys.modules["site"]',
+                        "/opt/fork-ops/site-packages",
+                        "/workspace/plugins/fork-ops/src",
+                    ]:
+                        print(
+                            "isolated child Python paths were not verifier-owned",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(98)
                 isolated_paths = json.loads(isolated_python[5])
                 if isolated_paths[:1] != ["/opt/fork-ops/site-packages"]:
                     print(
@@ -3952,6 +4041,17 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     print(json.dumps({{  # noqa: E501
                         "minor": f"{{sys.version_info.major}}.{{sys.version_info.minor}}"
                     }}))
+                elif (
+                    python_args[:1] == ["-c"]
+                    and "fork_ops_distribution_installed" in python_args[1]
+                ):
+                    print(json.dumps({{
+                        "fork_ops": "/workspace/plugins/fork-ops/src/fork_ops/__init__.py",
+                        "fork_ops_distribution_installed": False,
+                        "jsonschema": "/opt/fork-ops/site-packages/jsonschema/__init__.py",
+                        "sitecustomize_is_verifier_placeholder": True,
+                        "workspace_paths": ["/workspace/plugins/fork-ops/src"],
+                    }}, sort_keys=True))
                 elif python_args[:1] == ["-c"] and "importlib.metadata" in python_args[1]:
                     print(json.dumps({{  # noqa: E501
                         "distributions": ["fork-ops==0.1", "jsonschema==4.0", "mcp==1.29.0"]

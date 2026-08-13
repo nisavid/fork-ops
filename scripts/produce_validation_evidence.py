@@ -156,6 +156,8 @@ SOURCE_SNAPSHOT_EXCLUDES = {
 class CandidateContainerBoundary:
     source_repo: Path
     site_packages: Path
+    isolated_site_packages: Path
+    container_site_packages: str
     tools_bin: Path
     image: str
     host_environment: dict[str, str]
@@ -1129,6 +1131,16 @@ def _isolated_python_argv(paths: list[str], python_args: list[str]) -> list[str]
     ]
 
 
+def _isolated_child_projection_text(dependency_path: str, source_path: str) -> str:
+    if any("\n" in path or "\r" in path for path in (dependency_path, source_path)):
+        raise ValueError("Isolated child projection paths must each occupy one line")
+    return (
+        'import sys; sys.modules["sitecustomize"] = sys.modules["site"]\n'
+        f"{dependency_path}\n"
+        f"{source_path}\n"
+    )
+
+
 def _source_candidate_container_command(
     boundary: CandidateContainerBoundary,
     python_args: list[str],
@@ -1140,6 +1152,9 @@ def _source_candidate_container_command(
         "--workdir=/workspace",
         f"--mount=type=bind,src={boundary.source_repo},dst=/workspace,readonly",
         f"--mount=type=bind,src={boundary.site_packages},dst=/opt/fork-ops/site-packages,readonly",
+        "--mount=type=bind,"
+        f"src={boundary.isolated_site_packages},"
+        f"dst={boundary.container_site_packages},readonly",
         f"--mount=type=bind,src={boundary.tools_bin},dst=/opt/fork-ops/bin,readonly",
     ]
     if scratch is not None:
@@ -1311,14 +1326,26 @@ def _prepare_source_candidate_container(
     if failed or image is None:
         return aggregate, None
     site_packages = environment / "lib" / f"python{python_minor}" / "site-packages"
+    isolated_site_packages = root / "isolated-site-packages"
+    isolated_site_packages.mkdir(mode=0o700)
+    (isolated_site_packages / "fork_ops_validation.pth").write_text(
+        _isolated_child_projection_text(
+            "/opt/fork-ops/site-packages",
+            "/workspace/plugins/fork-ops/src",
+        ),
+        encoding="utf-8",
+    )
+    _make_private_tree_group_readable(isolated_site_packages)
     tools_bin = environment / "bin"
     return aggregate, CandidateContainerBoundary(
-        repo,
-        site_packages,
-        tools_bin,
-        image,
-        dict(subprocess_env),
-        container_user,
+        source_repo=repo,
+        site_packages=site_packages,
+        isolated_site_packages=isolated_site_packages,
+        container_site_packages=f"/usr/local/lib/python{python_minor}/site-packages",
+        tools_bin=tools_bin,
+        image=image,
+        host_environment=dict(subprocess_env),
+        user=container_user,
     )
 
 
@@ -1508,6 +1535,89 @@ contracts = [
 ]
 print(json.dumps({"contracts": contracts}, sort_keys=True))
 """
+
+
+ISOLATED_CHILD_TARGET = r"""
+import importlib.metadata
+import json
+import pathlib
+import sys
+
+import fork_ops
+import jsonschema
+
+try:
+    importlib.metadata.distribution("fork-ops")
+except importlib.metadata.PackageNotFoundError:
+    fork_ops_distribution_installed = False
+else:
+    fork_ops_distribution_installed = True
+
+print(json.dumps({
+    "fork_ops": str(pathlib.Path(fork_ops.__file__).resolve(strict=True)),
+    "fork_ops_distribution_installed": fork_ops_distribution_installed,
+    "jsonschema": str(pathlib.Path(jsonschema.__file__).resolve(strict=True)),
+    "sitecustomize_is_verifier_placeholder": (
+        sys.modules.get("sitecustomize") is sys.modules.get("site")
+    ),
+    "workspace_paths": [path for path in sys.path if path.startswith("/workspace")],
+}, sort_keys=True))
+"""
+
+
+ISOLATED_CHILD_IMPORT_CLIENT = f"""
+import subprocess
+import sys
+
+completed = subprocess.run(
+    [sys.executable, "-I", "-c", {ISOLATED_CHILD_TARGET!r}],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+sys.stdout.write(completed.stdout)
+sys.stderr.write(completed.stderr)
+raise SystemExit(completed.returncode)
+"""
+
+
+def _isolated_child_import_check(
+    repo: Path,
+    boundary: CandidateContainerBoundary,
+) -> dict[str, Any]:
+    check = _run_command(
+        "isolated_child_imports",
+        ["source", "locked_dependencies"],
+        ["candidate.isolated_child_imports"],
+        _source_candidate_container_command(
+            boundary,
+            ["-c", ISOLATED_CHILD_IMPORT_CLIENT],
+        ),
+        cwd=repo,
+        env=boundary.host_environment,
+    )
+    if check["status"] != "passed":
+        return check
+    try:
+        payload = json.loads(check["_stdout_complete"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        check["status"] = "failed"
+        check["exit_code"] = 1
+        check["stderr_tail"] = f"Isolated child import evidence was not usable: {exc}"
+        return check
+    expected = {
+        "fork_ops": "/workspace/plugins/fork-ops/src/fork_ops/__init__.py",
+        "fork_ops_distribution_installed": False,
+        "jsonschema": "/opt/fork-ops/site-packages/jsonschema/__init__.py",
+        "sitecustomize_is_verifier_placeholder": True,
+        "workspace_paths": ["/workspace/plugins/fork-ops/src"],
+    }
+    if payload != expected:
+        check["status"] = "failed"
+        check["exit_code"] = 1
+        check["stderr_tail"] = "Isolated child imports did not match the source boundary."
+    check["origins"] = payload
+    return check
 
 
 def _cli_surface_inventory_check(
@@ -1721,6 +1831,11 @@ def _source_checks_in_boundary(
     checks.extend(
         [
             inventory_check,
+            *(
+                [_isolated_child_import_check(repo, candidate_boundary)]
+                if candidate_boundary is not None
+                else []
+            ),
             _cli_surface_inventory_check(
                 repo,
                 uv_run,
