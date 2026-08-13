@@ -45,6 +45,16 @@ PYTHON_CONTAINER_IMAGES = {
     "3.14": "python:3.14-slim@sha256:"
     "a7fb1e634c4a578f9e0bd6327f11a3cde11b7a9395f48e24360c0988bcc5c2bc",
 }
+SOURCE_PYTHON_CONTAINER_IMAGES = {
+    "3.11": "python:3.11@sha256:"
+    "d0199e2a90bf7a206a485b115323a75bc946f30b463d704c5435a454aca084dd",
+    "3.12": "python:3.12@sha256:"
+    "dd4fe98ab39f91e936f8e7e7a65a3ce59ecfb11e32f9a125b3132779920ba7f7",
+    "3.13": "python:3.13@sha256:"
+    "79a441dc2306d79ea4350fbe3f75de38328dd9b74588d1a7f0b6bacb6e0a5e9c",
+    "3.14": "python:3.14@sha256:"
+    "297cf11d0b98b38ac26a56136f0279df845314bcd0347c1f6383fee6e75125ee",
+}
 DEPENDENCY_SCOPES = ("runtime", "optional", "build", "test", "development")
 CLI_LEAVES = (
     "capability report",
@@ -1155,6 +1165,7 @@ def _source_candidate_tool_command(
         *_candidate_container_base(user=boundary.user),
         "--workdir=/workspace",
         f"--mount=type=bind,src={boundary.source_repo},dst=/workspace,readonly",
+        f"--mount=type=bind,src={boundary.site_packages},dst=/opt/fork-ops/site-packages,readonly",
         f"--mount=type=bind,src={boundary.tools_bin},dst=/opt/fork-ops/bin,readonly",
         boundary.image,
         f"/opt/fork-ops/bin/{tool}",
@@ -1170,7 +1181,7 @@ def _prepare_source_candidate_container(
     source_policy: SourcePolicy,
 ) -> tuple[dict[str, Any], CandidateContainerBoundary | None]:
     python_minor = _python_minor(interpreter)
-    image = PYTHON_CONTAINER_IMAGES.get(python_minor)
+    image = SOURCE_PYTHON_CONTAINER_IMAGES.get(python_minor)
     environment = root / "environment"
     requirements = root / "source-requirements.txt"
     with _source_policy_subprocess_environment(
@@ -1902,7 +1913,15 @@ def _source_checks_in_boundary(
                 ["source", "tests"],
                 ["types.pyrefly_strict"],
                 (
-                    _source_candidate_tool_command(candidate_boundary, "pyrefly", ["check"])
+                    _source_candidate_tool_command(
+                        candidate_boundary,
+                        "pyrefly",
+                        [
+                            "check",
+                            "--site-package-path",
+                            "/opt/fork-ops/site-packages",
+                        ],
+                    )
                     if candidate_boundary is not None
                     else [*uv_run, "pyrefly", "check"]
                 ),

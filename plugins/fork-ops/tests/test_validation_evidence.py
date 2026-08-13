@@ -200,6 +200,16 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             source_evidence = json.loads(source_output.read_text(encoding="utf-8"))
             self.assertEqual(source_evidence["execution_boundary"], "container")
             self.assertEqual(source_evidence["checks"][0]["id"], "candidate_isolation")
+            source_image = {
+                "3.11": "python:3.11@sha256:"
+                "d0199e2a90bf7a206a485b115323a75bc946f30b463d704c5435a454aca084dd",
+                "3.12": "python:3.12@sha256:"
+                "dd4fe98ab39f91e936f8e7e7a65a3ce59ecfb11e32f9a125b3132779920ba7f7",
+                "3.13": "python:3.13@sha256:"
+                "79a441dc2306d79ea4350fbe3f75de38328dd9b74588d1a7f0b6bacb6e0a5e9c",
+                "3.14": "python:3.14@sha256:"
+                "297cf11d0b98b38ac26a56136f0279df845314bcd0347c1f6383fee6e75125ee",
+            }[f"{sys.version_info.major}.{sys.version_info.minor}"]
 
             env.update(
                 {
@@ -348,6 +358,17 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if argument.startswith("python:") and "@sha256:" in argument
                 )
                 self.assertEqual(command[image_index + 1], f"/opt/fork-ops/bin/{tool}")
+                self.assertEqual(command[image_index], source_image)
+            self.assertEqual(
+                source_commands["pyrefly_strict"][-2:],
+                ["--site-package-path", "/opt/fork-ops/site-packages"],
+            )
+            pyrefly_site_packages = next(
+                argument
+                for argument in source_commands["pyrefly_strict"]
+                if "dst=/opt/fork-ops/site-packages" in argument
+            )
+            self.assertTrue(pyrefly_site_packages.endswith(",readonly"))
 
     def test_hosted_locked_workspace_modes_keep_the_closed_source_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3788,6 +3809,15 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if not tools_mount.endswith(",readonly"):
                         print("trusted tool binaries were writable", file=sys.stderr)
                         raise SystemExit(98)
+                    if isolated_python[:1] == ["/opt/fork-ops/bin/pyrefly"]:
+                        site_packages_mount = next(
+                            value
+                            for value in sys.argv
+                            if "dst=/opt/fork-ops/site-packages" in value
+                        )
+                        if not site_packages_mount.endswith(",readonly"):
+                            print("trusted site packages were writable", file=sys.stderr)
+                            raise SystemExit(98)
                     workspace_mount = next(
                         value for value in sys.argv if "dst=/workspace" in value
                     )

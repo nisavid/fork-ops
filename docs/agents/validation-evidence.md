@@ -238,7 +238,9 @@ private size-bounded tmpfs paths, and an explicit environment. Installed
 validation mounts only the prepared site-packages tree and expected schema
 read-only. Source validation additionally mounts the verified candidate source
 read-only, mounts pinned Ruff and Pyrefly binaries read-only, and exposes an
-explicit coverage scratch directory. Build validation mounts verified source
+explicit coverage scratch directory. Source lanes use digest-pinned full
+official Python images whose immutable image history includes Git; build and
+installed lanes retain the smaller digest-pinned slim images. Build validation mounts verified source
 and build dependencies read-only, copies source into private container tmpfs,
 and exposes only the explicit artifact output as a writable host bind. No lane
 mounts the trusted verifier, final evidence,
