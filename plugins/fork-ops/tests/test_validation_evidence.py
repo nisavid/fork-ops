@@ -309,6 +309,12 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self.assertIn("--read-only", command)
                 self.assertIn("--cap-drop=ALL", command)
                 self.assertIn("--security-opt=no-new-privileges", command)
+                self.assertIn("--pids-limit=256", command)
+                self.assertFalse(
+                    any(
+                        argument == "--pid" or argument.startswith("--pid=") for argument in command
+                    )
+                )
                 self.assertIn("--env=PYTHONSAFEPATH=1", command)
                 self.assertFalse(any("GITHUB" in argument for argument in command))
                 self.assertFalse(any("ACTIONS" in argument for argument in command))
@@ -358,18 +364,34 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
     def test_locked_workspace_modes_reject_unsafe_sources_before_uv(self) -> None:
         unsafe_project_replacements = {
-            "package-mode": ("package = false", "package = true"),
+            "package-mode": ("pyproject.toml", "package = false", "package = true"),
             "default-groups": (
+                "pyproject.toml",
                 'default-groups = ["test", "development"]',
                 'default-groups = ["build"]',
             ),
             "tool-source": (
+                "pyproject.toml",
                 'fork-ops = { workspace = true }',
                 'fork-ops = { git = "https://example.invalid/fork-ops" }',
             ),
-            "direct-path": ('"fork-ops[mcp]"', '"fork-ops[mcp]@../fork-ops"'),
+            "direct-path": (
+                "pyproject.toml",
+                '"fork-ops[mcp]"',
+                '"fork-ops[mcp]@../fork-ops"',
+            ),
+            "root-python-range": (
+                "pyproject.toml",
+                'requires-python = ">=3.11"',
+                'requires-python = ">=3.12"',
+            ),
+            "package-python-range": (
+                "plugins/fork-ops/pyproject.toml",
+                'requires-python = ">=3.11"',
+                'requires-python = ">=3.12"',
+            ),
         }
-        for source_kind, replacement in unsafe_project_replacements.items():
+        for source_kind, (project_path, before, after) in unsafe_project_replacements.items():
             for mode in ("locked-source", "build", "installed"):
                 with (
                     self.subTest(source_kind=source_kind, mode=mode),
@@ -377,9 +399,9 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 ):
                     fixture_root = Path(temp_dir)
                     repo = self._create_fixture_repository(fixture_root)
-                    project = repo / "pyproject.toml"
+                    project = repo / project_path
                     project.write_text(
-                        project.read_text(encoding="utf-8").replace(*replacement),
+                        project.read_text(encoding="utf-8").replace(before, after),
                         encoding="utf-8",
                     )
                     sentinel = fixture_root / "uv-executed"
@@ -489,6 +511,26 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 ],
             )
             self.assertTrue(all(check["status"] == "passed" for check in evidence["checks"]))
+            scope_inventory = next(
+                check for check in evidence["checks"] if check["id"] == "package_scope_inventory"
+            )
+            scope_exports = [
+                command
+                for command in scope_inventory["commands"]
+                if command[:2] == ["uv", "export"]
+            ]
+            marker_projections = [
+                command
+                for command in scope_inventory["commands"]
+                if command[:3] == ["uv", "pip", "compile"]
+            ]
+            self.assertEqual(len(scope_exports), 20)
+            self.assertTrue(all("--python" not in command for command in scope_exports))
+            self.assertEqual(len(marker_projections), 20)
+            self.assertEqual(
+                {command[command.index("--python-version") + 1] for command in marker_projections},
+                {"3.11", "3.12", "3.13", "3.14"},
+            )
             self.assertTrue(
                 all(check["required_ids"] for check in evidence["checks"]),
                 "every behavior-class claim must name the contract IDs it checks",
@@ -1985,7 +2027,13 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         self.assertIn("--read-only", command)
                         self.assertIn("--cap-drop=ALL", command)
                         self.assertIn("--security-opt=no-new-privileges", command)
-                        self.assertIn("--pid=private", command)
+                        self.assertIn("--pids-limit=256", command)
+                        self.assertFalse(
+                            any(
+                                argument == "--pid" or argument.startswith("--pid=")
+                                for argument in command
+                            )
+                        )
                         self.assertIn("--user=65532:65532", command)
                         self.assertIn(expected_image, command)
                         self.assertEqual(
@@ -2950,24 +2998,34 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     from pathlib import Path
 
                     export_args = sys.argv[1:]
-                    if (
-                        export_args.count("--output-file") != 1
-                        or export_args.count("--python") != 1
-                    ):
+                    if export_args.count("--output-file") != 1:
                         print(
                             f"unexpected fake uv export argv: {{export_args!r}}",
                             file=sys.stderr,
                         )
                         raise SystemExit(97)
                     output_value = export_args[export_args.index("--output-file") + 1]
-                    python_value = export_args[export_args.index("--python") + 1]
-                    if python_value not in {{
+                    scope_inventory_export = "fork-ops-package-scopes-" in output_value
+                    if scope_inventory_export and "--python" in export_args:
+                        print(
+                            "scope inventory export unexpectedly required an installed interpreter",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(97)
+                    if not scope_inventory_export and export_args.count("--python") != 1:
+                        print(
+                            f"unexpected fake uv export argv: {{export_args!r}}",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(97)
+                    python_value = (
+                        export_args[export_args.index("--python") + 1]
+                        if "--python" in export_args
+                        else None
+                    )
+                    if python_value is not None and python_value not in {{
                         sys.executable,
                         str(Path(sys.executable).resolve()),
-                        "3.11",
-                        "3.12",
-                        "3.13",
-                        "3.14",
                     }}:
                         print(
                             f"unexpected fake uv export argv: {{export_args!r}}",
@@ -2982,8 +3040,6 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         "--no-header",
                         "--output-file",
                         output_value,
-                        "--python",
-                        python_value,
                     ]
                     runtime_tail = [
                         "--no-default-groups",
@@ -2992,9 +3048,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         "--no-header",
                         "--output-file",
                         output_value,
-                        "--python",
-                        python_value,
                     ]
+                    if python_value is not None:
+                        scope_tail.extend(("--python", python_value))
+                        runtime_tail.extend(("--python", python_value))
                     valid_exports = [
                         [
                             "export",
@@ -3494,6 +3551,18 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         f"docker inherited forbidden environment: {{sorted(forbidden)!r}}",
                         file=sys.stderr,
                     )
+                    raise SystemExit(98)
+                if any(
+                    argument == "--pid" or argument.startswith("--pid=")
+                    for argument in sys.argv[1:]
+                ):
+                    print(
+                        "candidate container set an invalid PID namespace override",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(98)
+                if "--pids-limit=256" not in sys.argv[1:]:
+                    print("candidate container omitted the process-count bound", file=sys.stderr)
                     raise SystemExit(98)
                 image_index = next(
                     index for index, value in enumerate(sys.argv)

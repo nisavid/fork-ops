@@ -57,9 +57,9 @@ similarly limited to the candidate's published `mcp` extra. Evidence records
 the export digest and scope, the uv version and executable digest, and the
 normalized installed distribution graph digest.
 
-Source evidence derives `package_scopes_by_python` from locked, hash-bearing uv
-exports for each supported minor, 3.11 through 3.14. It filters every export
-through uv's Linux resolver for the matching Python minor before inventorying
+Source evidence derives `package_scopes_by_python` from universal locked,
+hash-bearing uv exports. It projects every export through uv's Linux marker
+resolver for each supported minor, 3.11 through 3.14, before inventorying
 package names, and records both the locked export and resolved-scope digests.
 Every minor has runtime, optional, build, test, and development graphs; the
 optional scope is the `mcp` extra delta over the base runtime graph. Names are
@@ -231,7 +231,8 @@ before it prepares dependencies. It passes every host subprocess an explicit
 minimal environment and refuses any sdist or build requirement. Candidate
 Python runs only in a digest-pinned official Python image with no network, a
 read-only root, bounded CPU, memory, and process counts, all capabilities
-dropped, no-new-privileges, a private PID namespace, a numeric non-root user,
+dropped, no-new-privileges, Docker's default private PID namespace with no PID
+namespace override, a numeric non-root user,
 private size-bounded tmpfs paths, and an explicit environment. Installed
 validation mounts only the prepared site-packages tree and expected schema
 read-only. Source validation additionally mounts the verified candidate source

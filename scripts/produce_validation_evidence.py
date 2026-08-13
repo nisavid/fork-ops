@@ -1064,7 +1064,6 @@ def _candidate_container_base(*, user: str = "65532:65532") -> list[str]:
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
-        "--pid=private",
         "--pids-limit=256",
         "--memory=2g",
         "--cpus=2",
@@ -2087,6 +2086,8 @@ def _validate_closed_workspace_project(repo: Path) -> dict[str, object]:
     for project in (root.get("project"), package.get("project")):
         if not isinstance(project, dict):
             raise ValueError("Closed workspace project metadata is malformed")
+        if project.get("requires-python") != ">=3.11":
+            raise ValueError("Closed workspace requires the supported Python range")
         if "dynamic" in project:
             raise ValueError("Closed workspace rejects dynamic project metadata")
         raw_dependencies = project.get("dependencies", [])
@@ -2728,8 +2729,6 @@ def _package_scope_inventory_check(
                         "--no-header",
                         "--output-file",
                         str(locked_export_path),
-                        "--python",
-                        python_minor,
                     ],
                     cwd=repo,
                     env=subprocess_env,
