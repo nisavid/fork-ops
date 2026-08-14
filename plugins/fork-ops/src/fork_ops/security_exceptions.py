@@ -1544,6 +1544,49 @@ def load_security_exception_contract(
     )
 
 
+def validate_public_security_exception_ledger(
+    public_ledger: Mapping[str, object],
+    *,
+    evaluated_at: str,
+) -> None:
+    """Validate standalone public fields; private lineage reconciliation is separate."""
+    contract = load_security_exception_contract()
+    _validate_artifact(contract, "public_ledger", public_ledger)
+    public_values = public_ledger.get("exceptions", [])
+    if not isinstance(public_values, list):
+        raise SecurityExceptionValidationError(
+            "Public Security Exception records must be an array."
+        )
+    _validate_projection_confidentiality(public_values, [])
+    _validate_kind_subject_pairs(contract, public_values)
+    records: list[Mapping[str, object]] = []
+    for record in public_values:
+        if not isinstance(record, Mapping):
+            raise SecurityExceptionValidationError(
+                "Public Security Exception record must be an object."
+            )
+        _validate_record_semantics(
+            contract,
+            record,
+            visibility="public",
+            evaluated_at=evaluated_at,
+        )
+        records.append(record)
+    exception_ids = [_required_str(record, "exception_id") for record in records]
+    lineage_ids = [_required_str(record, "lineage_id") for record in records]
+    if len(exception_ids) != len(set(exception_ids)):
+        raise SecurityExceptionValidationError(
+            "Public Security Exception ledger contains exception identifier reuse."
+        )
+    if len(lineage_ids) != len(set(lineage_ids)):
+        raise SecurityExceptionValidationError(
+            "Public Security Exception ledger contains multiple current lineage records."
+        )
+    # Contract 1.0 keeps lineage entries out of the public schema. The private
+    # projection binds and recomputes event and record digests for the whole ledger.
+    _validate_canonical_digests(contract, records, [])
+
+
 def validate_security_exception_inventory(
     public_ledger: Mapping[str, object],
     private_projection: Mapping[str, object] | None,

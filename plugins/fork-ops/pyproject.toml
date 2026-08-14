@@ -13,7 +13,8 @@ authors = [
   { name = "nisavid", email = "nisavid@users.noreply.github.com" }
 ]
 dependencies = [
-  "jsonschema>=4.20"
+  "jsonschema>=4.20",
+  "pyyaml>=6.0.2,<7"
 ]
 
 [project.optional-dependencies]
@@ -44,7 +45,11 @@ fork-ops-mcp = "fork_ops.mcp_server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-fork_ops = ["fork-ops.schema.json", "security-exception-contract-1.0.json"]
+fork_ops = [
+  "fork-ops.schema.json",
+  "repository-control-observation-contract-1.0.json",
+  "security-exception-contract-1.0.json",
+]
 
 [tool.ruff]
 line-length = 100
