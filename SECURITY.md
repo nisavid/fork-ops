@@ -73,4 +73,9 @@ history, provide live admission proof, roll back remote history, enforce gates
 or rulesets, authenticate producer provenance, or implement a bootstrap path.
 No exception has gate, merge, assurance, release, product, or dogfood effect.
 Any future effect-bearing design requires a separately accepted and unsupported
-contract 2.0.
+contract 2.0. The repo-owned
+[merge-admission decision](docs/agents/merge-admission.md) identifies a
+supported composite candidate designed for fresh exact-candidate Security
+Posture. Operational viability remains unproven pending the downstream live
+proof. No admission App, witness, rule, bypass, credential, or live effect is
+implemented.
