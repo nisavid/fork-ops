@@ -37,6 +37,9 @@ Use the narrowest source that answers the question:
 - Design rationale and pressure cases: `specs/fork-ops-foundation/`
 - Issue workflow and triage vocabulary: `docs/agents/issue-tracker.md` and
   `docs/agents/triage-labels.md`
+- security exception governance: `docs/agents/security-exceptions.md`
+- fresh exact-candidate merge admission decision:
+  `docs/agents/merge-admission.md`
 - Current implementation: `plugins/fork-ops/src/fork_ops/`
 
 ## Current Implementation Boundary
