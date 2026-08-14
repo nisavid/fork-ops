@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "artifact_kind": "repository_control_observation_contract",
+  "contract_version": "1.0",
+  "supported_schema_versions": [
+    "1.0"
+  ],
+  "maximum_validity_seconds": 900,
+  "statuses": [
+    "passed",
+    "failed",
+    "unavailable"
+  ],
+  "failure_classes": [
+    "unauthorized",
+    "forbidden",
+    "not_found_or_inaccessible",
+    "rate_limited",
+    "timeout",
+    "malformed",
+    "pagination_incomplete",
+    "identity_mismatch",
+    "stale",
+    "adapter_error"
+  ],
+  "control_sources": {
+    "main_ruleset": "github",
+    "human_review": "github",
+    "stale_approval_dismissal": "github",
+    "last_push_approval": "github",
+    "resolved_review_threads": "github",
+    "validation_required": "github",
+    "codeql_required": "github",
+    "code_quality_required": "github",
+    "copilot_review_required": "github",
+    "approved_producer_identities": "github",
+    "dependabot_grouped_updates": "package",
+    "dependabot_security_updates": "github",
+    "dependency_auto_merge_disabled": "github",
+    "dependency_review": "package",
+    "immutable_action_pins": "package",
+    "code_scanning": "github",
+    "secret_scanning": "github",
+    "push_protection": "github",
+    "private_vulnerability_reporting": "github",
+    "codeql_alerts": "github",
+    "dependabot_alerts": "github",
+    "secret_scanning_alerts": "github",
+    "public_security_exception_state": "package",
+    "private_security_exception_state": "github"
+  },
+  "provider_requirements": {
+    "alert_controls": {
+      "control_ids": [
+        "codeql_alerts",
+        "dependabot_alerts",
+        "secret_scanning_alerts"
+      ],
+      "complete_pagination_required": true,
+      "pass_requires_open_count": 0
+    },
+    "private_security_exception_state": {
+      "complete_pagination_required": true,
+      "semantic_pass_count": 2,
+      "passes_must_be_semantically_identical": true
+    },
+    "package_controls": {
+      "candidate_commit_binding": "exact_candidate_sha_candidate_path_set_scoped_index_worktree_and_blob_with_post_read_reverification",
+      "git_execution": "trusted_executable_and_hardened_configuration",
+      "local_action_traversal": "recursive_bounded_exact_candidate_manifests",
+      "policy_document_budget_bytes": 8388608,
+      "policy_parsing": "structural",
+      "secure_materialization_platform": "linux",
+      "workflow_evidence": "aggregate_sha256_over_sorted_path_and_file_sha256_records"
+    }
+  },
+  "operation": {
+    "one_shared_epoch": true,
+    "one_shared_deadline": true,
+    "fanout_is_read_only": true,
+    "late_results_are_ignored": true,
+    "unavailable_or_incomplete_is_failed": true
+  },
+  "confidentiality": {
+    "raw_private_responses": "ephemeral",
+    "control_projection_fields": [
+      "control_id",
+      "source",
+      "status",
+      "observed_at",
+      "valid_until",
+      "projection_sha256",
+      "opaque_ids",
+      "failure_class"
+    ],
+    "free_form_messages": false,
+    "raw_response_fields": false
+  },
+  "evaluation": {
+    "pure": true,
+    "deterministic": true,
+    "security_exception_1_0_effect": "inventory_only",
+    "failure_conditions": [
+      "required_control_failed",
+      "required_control_unavailable",
+      "observation_stale",
+      "identity_mismatch",
+      "unsupported_version",
+      "incomplete_control_set"
+    ]
+  },
+  "canonicalization": {
+    "encoding": "utf-8",
+    "object_keys": "lexicographic-by-unicode-code-point",
+    "numbers": "integers-only",
+    "json_separators": [
+      ",",
+      ":"
+    ],
+    "digest_algorithm": "sha256",
+    "control_digest_projection": "complete control without projection_sha256",
+    "observation_digest_projection": "complete observation without observation_sha256"
+  },
+  "observation_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "artifact_kind",
+      "schema_version",
+      "repository",
+      "candidate_sha",
+      "producer",
+      "operation",
+      "controls",
+      "observation_sha256"
+    ],
+    "properties": {
+      "artifact_kind": {
+        "const": "repository_control_observation"
+      },
+      "schema_version": {
+        "const": "1.0"
+      },
+      "repository": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "full_name",
+          "database_id",
+          "node_id",
+          "default_branch"
+        ],
+        "properties": {
+          "full_name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+          },
+          "database_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "node_id": {
+            "$ref": "#/$defs/opaque_id"
+          },
+          "default_branch": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        }
+      },
+      "candidate_sha": {
+        "$ref": "#/$defs/git_sha"
+      },
+      "producer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "opaque_id",
+          "workflow_sha",
+          "evaluator_sha256"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "github_app",
+              "github_actions_oidc"
+            ]
+          },
+          "opaque_id": {
+            "$ref": "#/$defs/opaque_id"
+          },
+          "workflow_sha": {
+            "$ref": "#/$defs/git_sha"
+          },
+          "evaluator_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      },
+      "operation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "epoch",
+          "started_at",
+          "completed_at",
+          "deadline_at"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/$defs/sha256"
+          },
+          "started_at": {
+            "$ref": "#/$defs/utc_time"
+          },
+          "completed_at": {
+            "$ref": "#/$defs/utc_time"
+          },
+          "deadline_at": {
+            "$ref": "#/$defs/utc_time"
+          }
+        }
+      },
+      "controls": {
+        "type": "array",
+        "minItems": 24,
+        "maxItems": 24,
+        "items": {
+          "$ref": "#/$defs/control"
+        }
+      },
+      "observation_sha256": {
+        "$ref": "#/$defs/sha256"
+      }
+    }
+  },
+  "$defs": {
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "opaque_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:=+-]{1,128}$"
+    },
+    "utc_time": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "failure_class"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "failure_class"
+              ]
+            }
+          }
+        }
+      ],
+      "required": [
+        "control_id",
+        "source",
+        "status",
+        "observed_at",
+        "valid_until",
+        "projection_sha256",
+        "opaque_ids"
+      ],
+      "properties": {
+        "control_id": {
+          "enum": [
+            "main_ruleset",
+            "human_review",
+            "stale_approval_dismissal",
+            "last_push_approval",
+            "resolved_review_threads",
+            "validation_required",
+            "codeql_required",
+            "code_quality_required",
+            "copilot_review_required",
+            "approved_producer_identities",
+            "dependabot_grouped_updates",
+            "dependabot_security_updates",
+            "dependency_auto_merge_disabled",
+            "dependency_review",
+            "immutable_action_pins",
+            "code_scanning",
+            "secret_scanning",
+            "push_protection",
+            "private_vulnerability_reporting",
+            "codeql_alerts",
+            "dependabot_alerts",
+            "secret_scanning_alerts",
+            "public_security_exception_state",
+            "private_security_exception_state"
+          ]
+        },
+        "source": {
+          "enum": [
+            "github",
+            "package"
+          ]
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "unavailable"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/utc_time"
+        },
+        "valid_until": {
+          "$ref": "#/$defs/utc_time"
+        },
+        "projection_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "opaque_ids": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/opaque_id"
+          }
+        },
+        "failure_class": {
+          "enum": [
+            "unauthorized",
+            "forbidden",
+            "not_found_or_inaccessible",
+            "rate_limited",
+            "timeout",
+            "malformed",
+            "pagination_incomplete",
+            "identity_mismatch",
+            "stale",
+            "adapter_error"
+          ]
+        }
+      }
+    }
+  }
+}

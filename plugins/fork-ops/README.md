@@ -25,7 +25,8 @@ local development checks.
 - Plugin health: `uv run --package fork-ops fork-ops plugin health`
 - MCP: `fork_ops_plugin_health`, `fork_ops_workflow_catalog`, `fork_ops_workflow_migration_inventory`, `fork_ops_equipment_migration_preflight`, `fork_ops_migration_plan`, `fork_ops_migration_dry_run`, `fork_ops_migration_execute`, `fork_ops_migration_blocker_resolution`, `fork_ops_migration_config_patch`, and related tools exposed through `.mcp.json`
 - Schema: `schema/fork-ops.schema.json` and packaged runtime copy `src/fork_ops/fork-ops.schema.json`
-- Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`
+- Docs: `docs/config-schema.md`, `docs/operation-guide.md`, `docs/migration.md`,
+  `docs/repository-controls.md`
 
 Plugin health treats registration, skill, and MCP config files as observational
 inputs. The CLI probe always uses an isolated installed-package module. The MCP
