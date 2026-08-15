@@ -965,10 +965,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 list(workflow_catalog["contracts"]),
                 [
                     "authority-source-routing",
-                    "blocker-resolution",
                     "carried-divergence-review",
                     "fork-authority-migration",
                     "guarded-sync-execution",
+                    "migration-blocker-explanation",
                     "operator-onboarding",
                     "publication-closeout",
                     "review-preparation",
@@ -983,7 +983,10 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             )
             self.assertEqual(
                 workflow_catalog["contracts"]["guarded-sync-execution"],
-                {"available": False, "implementation_status": "planned"},
+                {
+                    "available_operation_ids": [],
+                    "implementation_extent": "planned",
+                },
             )
             self.assertIn("runtime", inventories["3.11"]["typing-extensions"])
             self.assertNotIn(
@@ -3968,26 +3971,42 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     import json
 
                     records = [
-                        ("authority-source-routing", "diagnostic-only", True),
-                        ("blocker-resolution", "diagnostic-only", True),
-                        ("carried-divergence-review", "planned", False),
-                        ("fork-authority-migration", "current", True),
-                        ("guarded-sync-execution", "planned", False),
-                        ("operator-onboarding", "current", True),
-                        ("publication-closeout", "planned", False),
-                        ("review-preparation", "planned", False),
-                        ("upstream-status-assessment", "diagnostic-only", True),
-                        ("upstream-sync-planning", "next-slice", False),
-                        ("workflow-migration-inventory", "diagnostic-only", True),
+                        ("authority-source-routing", "implemented", ["authority-source-routing"]),
+                        ("carried-divergence-review", "planned", []),
+                        ("fork-authority-migration", "partial", [
+                            "migration-assessment", "equipment-migration-preflight",
+                            "migration-config-proposal", "migration-plan",
+                            "migration-dry-run", "initial-config-creation",
+                        ]),
+                        ("guarded-sync-execution", "planned", []),
+                        (
+                            "migration-blocker-explanation",
+                            "implemented",
+                            ["migration-blocker-explanation"],
+                        ),
+                        ("operator-onboarding", "partial", ["plugin-health", "workflow-catalog"]),
+                        ("publication-closeout", "planned", []),
+                        ("review-preparation", "planned", []),
+                        ("upstream-status-assessment", "partial", ["local-upstream-inspection"]),
+                        ("upstream-sync-planning", "planned", []),
+                        (
+                            "workflow-migration-inventory",
+                            "implemented",
+                            ["workflow-migration-inventory"],
+                        ),
                     ]
-                    print(json.dumps({{"contracts": [
-                        {{
-                            "available": available,
-                            "id": contract_id,
-                            "implementation_status": status,
-                        }}
-                        for contract_id, status, available in records
-                    ]}}))
+                    print(json.dumps({{
+                        "artifact_kind": "workflow_catalog",
+                        "schema_version": "1.0",
+                        "contracts": [
+                            {{
+                                "available_operation_ids": available_operation_ids,
+                                "id": contract_id,
+                                "implementation_extent": extent,
+                            }}
+                            for contract_id, extent, available_operation_ids in records
+                        ],
+                    }}))
                     raise SystemExit(0)
                 if (
                     len(sys.argv) > 1
@@ -4320,26 +4339,42 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     in python_args[1]
                 ):
                     records = [
-                        ("authority-source-routing", "diagnostic-only", True),
-                        ("blocker-resolution", "diagnostic-only", True),
-                        ("carried-divergence-review", "planned", False),
-                        ("fork-authority-migration", "current", True),
-                        ("guarded-sync-execution", "planned", False),
-                        ("operator-onboarding", "current", True),
-                        ("publication-closeout", "planned", False),
-                        ("review-preparation", "planned", False),
-                        ("upstream-status-assessment", "diagnostic-only", True),
-                        ("upstream-sync-planning", "next-slice", False),
-                        ("workflow-migration-inventory", "diagnostic-only", True),
+                        ("authority-source-routing", "implemented", ["authority-source-routing"]),
+                        ("carried-divergence-review", "planned", []),
+                        ("fork-authority-migration", "partial", [
+                            "migration-assessment", "equipment-migration-preflight",
+                            "migration-config-proposal", "migration-plan",
+                            "migration-dry-run", "initial-config-creation",
+                        ]),
+                        ("guarded-sync-execution", "planned", []),
+                        (
+                            "migration-blocker-explanation",
+                            "implemented",
+                            ["migration-blocker-explanation"],
+                        ),
+                        ("operator-onboarding", "partial", ["plugin-health", "workflow-catalog"]),
+                        ("publication-closeout", "planned", []),
+                        ("review-preparation", "planned", []),
+                        ("upstream-status-assessment", "partial", ["local-upstream-inspection"]),
+                        ("upstream-sync-planning", "planned", []),
+                        (
+                            "workflow-migration-inventory",
+                            "implemented",
+                            ["workflow-migration-inventory"],
+                        ),
                     ]
-                    print(json.dumps({{"contracts": [
-                        {{
-                            "available": available,
-                            "id": contract_id,
-                            "implementation_status": status,
-                        }}
-                        for contract_id, status, available in records
-                    ]}}))
+                    print(json.dumps({{
+                        "artifact_kind": "workflow_catalog",
+                        "schema_version": "1.0",
+                        "contracts": [
+                            {{
+                                "available_operation_ids": available_operation_ids,
+                                "id": contract_id,
+                                "implementation_extent": extent,
+                            }}
+                            for contract_id, extent, available_operation_ids in records
+                        ],
+                    }}))
                 elif python_args[:3] == ["-m", "coverage", "run"]:
                     scratch = require_isolated_user_writable_mount("/scratch")
                     if {coverage_mode!r} != "missing-data":

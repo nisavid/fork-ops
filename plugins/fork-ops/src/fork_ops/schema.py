@@ -23,6 +23,8 @@ CAPABILITY_LEVELS = [
 
 SCHEMA_RESOURCE = "fork-ops.schema.json"
 MAX_SCHEMA_BYTES = 1_048_576
+CONFIG_SCHEMA_ARTIFACT_KIND = "fork_ops_config_schema"
+CONFIG_SCHEMA_VERSION = "1.0"
 
 
 def _load_config_schema() -> dict[str, Any]:
@@ -42,6 +44,11 @@ def _load_config_schema() -> dict[str, Any]:
     schema = json.loads(schema_text)
     if not isinstance(schema, dict):
         raise TypeError(f"{SCHEMA_RESOURCE} must contain a JSON object")
+    if (
+        schema.get("artifact_kind") != CONFIG_SCHEMA_ARTIFACT_KIND
+        or schema.get("schema_version") != CONFIG_SCHEMA_VERSION
+    ):
+        raise TypeError(f"{SCHEMA_RESOURCE} uses an unsupported artifact identity")
     return schema
 
 

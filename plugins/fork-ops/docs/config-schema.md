@@ -2,7 +2,12 @@
 
 Fork Ops Config lives at `.agents/fork-ops.toml` in a Maintained Fork. The machine-readable schema is `schema/fork-ops.schema.json`.
 
-The schema defines the parsed TOML shape. Unknown keys are allowed so a fork can carry local extensions while Fork Ops grows. Tools should still validate all known fields and report unknown extension behavior as inferred when it affects an operation.
+The schema defines the parsed TOML shape. Unknown keys are allowed so a fork can
+carry local extensions while Fork Ops grows. Known-semantics operations preserve
+those keys and ignore them for readiness and gates. An operation that declares a
+dependency on unknown extension semantics refuses with
+`unsupported_extension_semantics`; it does not interpret the extension or make a
+semantic claim from it.
 
 The packaged runtime schema and the documented schema are expected to match the
 canonical runtime serialization. Check both artifacts with:
@@ -15,6 +20,9 @@ uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 ## Required Foundation Sections
 
 `schema_version` identifies the config schema family. The foundation version is `0.1`.
+Missing and unsupported versions are identified before repository fields are
+interpreted; validation refuses without deriving repository identity or
+authority readiness from that config.
 
 `[repository]` is a Descriptive Fork Fact block. It names the hosted repository and its default branch. Fields such as `protected_branches` should be populated from verified repo policy, not inferred from a default branch name.
 

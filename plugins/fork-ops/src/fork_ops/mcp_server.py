@@ -10,8 +10,8 @@ import sys
 from collections.abc import Callable
 from typing import Any, cast
 
+from ._contracts import ArtifactKind, operation_artifact
 from .core import (
-    CONFIG_RELATIVE_PATH,
     ForkOpsError,
     _validate_bounded_object,
     assess_migration,
@@ -22,10 +22,9 @@ from .core import (
     dry_run_migration,
     execute_migration,
     explain_migration_blocker,
-    find_config_path,
     generate_migration_plan,
-    load_raw_config,
     propose_migration_config_patch,
+    read_config_result,
     schema_json,
 )
 from .workflow_catalog import workflow_catalog
@@ -70,48 +69,23 @@ def fork_ops_plugin_health(
 @_tool
 def fork_ops_config_read(repo_path: str = ".", normalized: bool = True) -> dict[str, Any]:
     """Read the Fork Ops config for a repository."""
-    if normalized:
-        return build_status_report(repo_path, include_config=True)
-    path = find_config_path(repo_path)
-    try:
-        raw = load_raw_config(repo_path)
-    except ForkOpsError as exc:
-        return {
-            "path": str(path),
-            "raw": "",
-            "diagnostics": [
-                {
-                    "severity": "error",
-                    "code": "config.read_failed",
-                    "message": str(exc),
-                    "path": str(CONFIG_RELATIVE_PATH),
-                }
-            ],
-        }
-    return {
-        "path": str(path),
-        "raw": raw,
-        "diagnostics": [],
-    }
+    return read_config_result(repo_path, normalized=normalized)
 
 
 @_tool
 def fork_ops_config_validate(repo_path: str = ".", required_level: str = "") -> dict[str, Any]:
     """Validate Fork Ops config and optionally check a required capability level."""
-    report = build_status_report(repo_path, include_config=False)
-    if required_level:
-        levels = report["capability"]["levels"]
-        report["required_level"] = {
-            "level": required_level,
-            "available": bool(levels.get(required_level, {}).get("available")),
-        }
-    return report
+    return build_status_report(
+        repo_path,
+        include_config=True,
+        required_level=required_level,
+    )
 
 
 @_tool
 def fork_ops_capability_report(repo_path: str = ".") -> dict[str, Any]:
     """Report Fork Ops capability levels for a repository."""
-    return cast(dict[str, Any], build_status_report(repo_path, include_config=False)["capability"])
+    return cast(dict[str, Any], build_status_report(repo_path, include_config=True)["capability"])
 
 
 @_tool
@@ -146,7 +120,7 @@ def fork_ops_migration_plan(repo_path: str = ".", scan_profile: str = "custom") 
 
 @_tool
 def fork_ops_migration_dry_run(
-    repo_path: str = ".",
+    repo_path: str | None = None,
     migration_plan: dict[str, Any] | None = None,
     scan_profile: str = "custom",
 ) -> dict[str, Any]:
@@ -211,12 +185,19 @@ def fork_ops_workflow_migration_inventory(
 
 def mcp_healthcheck() -> dict[str, Any]:
     """Return lightweight startup evidence without opening the stdio MCP server."""
-    return {
-        "mcp_dependency_available": mcp is not None,
-        "missing_dependency": str(_MCP_IMPORT_ERROR) if _MCP_IMPORT_ERROR else None,
-        "server": "Fork Ops",
-        "tools": list(_REGISTERED_TOOL_IDS),
-    }
+    return cast(
+        dict[str, Any],
+        operation_artifact(
+            ArtifactKind.MCP_HEALTHCHECK,
+            "mcp-healthcheck",
+            {
+                "mcp_dependency_available": mcp is not None,
+                "missing_dependency": str(_MCP_IMPORT_ERROR) if _MCP_IMPORT_ERROR else None,
+                "server": "Fork Ops",
+                "tools": list(_REGISTERED_TOOL_IDS),
+            },
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
