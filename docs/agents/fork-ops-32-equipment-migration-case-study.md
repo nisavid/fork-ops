@@ -45,7 +45,7 @@ After marking the two semantic-coverage paths as reviewed
 review record, the reviewed-equipment dry run reported:
 
 - `can_execute`: `true`
-- activation readiness: `ready_for_guarded_config_creation_with_limits`
+- activation readiness: `ready`, with the guarded-config limits named separately
 - blocked steps: none
 - replayable wet run: available
 - drift policy: `fail_closed_by_default`

@@ -76,10 +76,10 @@ CLI_LEAVES = (
 )
 WORKFLOW_CONTRACT_IDS = (
     "authority-source-routing",
-    "blocker-resolution",
     "carried-divergence-review",
     "fork-authority-migration",
     "guarded-sync-execution",
+    "migration-blocker-explanation",
     "operator-onboarding",
     "publication-closeout",
     "review-preparation",

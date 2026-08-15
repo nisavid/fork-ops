@@ -1,9 +1,7 @@
 """Complete internal inventory of current Fork Ops payload boundaries.
 
-External identity and observed compatibility describe current truth.
-``cutover_compatibility`` names issue #66 policy separately; legacy producers
-still emit no internal artifact kind and replay consumers still accept their
-current unversioned payloads.
+External identity, observed compatibility, and cutover compatibility describe
+the canonical contract implemented by the current source tree.
 """
 
 from __future__ import annotations
@@ -21,6 +19,8 @@ from ._contracts import (
     ObservedVersionHandling,
     ObservedVersionOutcome,
     SchemaVersion,
+    artifact_contract,
+    current_artifact_version,
 )
 
 
@@ -376,7 +376,6 @@ def _legacy(
 
 def _versioned(
     kind: ArtifactKind,
-    version: str,
     *,
     producers: tuple[Endpoint, ...],
     consumers: tuple[ConsumerEndpoint, ...],
@@ -390,7 +389,23 @@ def _versioned(
     consumer_gap: str = "",
     persistence_gap: str = "",
 ) -> PayloadFamily:
-    parsed_version = SchemaVersion.parse(version)
+    contract = artifact_contract(kind)
+    parsed_version = current_artifact_version(kind)
+    selected_artifact_kind = (
+        contract.emitted_artifact_kind
+        if emitted_artifact_kind is None
+        else emitted_artifact_kind
+    )
+    if version_field != contract.version_field:
+        raise ValueError(f"{kind.value} inventory version field differs from its registry")
+    if selected_artifact_kind != contract.emitted_artifact_kind:
+        raise ValueError(f"{kind.value} inventory artifact kind differs from its registry")
+    for consumer in consumers:
+        compatibility = consumer.cutover_compatibility
+        if compatibility is not None and compatibility.current != parsed_version:
+            raise ValueError(
+                f"{kind.value} consumer cutover version differs from its registry"
+            )
     endpoint_tests = tuple(
         node
         for endpoint in (*producers, *consumers, *persistence)
@@ -399,12 +414,7 @@ def _versioned(
     return PayloadFamily(
         kind=kind,
         external_identity=external_identity,
-        emitted_artifact_kind=(
-            kind.value
-            if emitted_artifact_kind is None
-            and external_identity is ExternalIdentity.VERSIONED_ARTIFACT
-            else emitted_artifact_kind
-        ),
+        emitted_artifact_kind=selected_artifact_kind,
         emitted_version=parsed_version,
         version_field=version_field,
         producers=producers,
@@ -456,7 +466,7 @@ _MCP_TEST = (
 )
 _PERSISTENCE_TEST = (
     "plugins/fork-ops/tests/test_contracts.py::"
-    "test_legacy_replay_and_persisted_payloads_remain_accepted_and_exact",
+    "test_canonical_replay_and_persisted_payloads_are_exact",
 )
 _SECURITY_TEST = (
     "plugins/fork-ops/tests/test_contracts.py::"
@@ -1025,10 +1035,26 @@ def _plan_replay_and_execution(
             label="consumer",
         ) + additional_characterization
 
+    def replay_consumer(
+        id: str,
+        *,
+        transport: Transport = Transport.PYTHON,
+        purpose: ConsumerPurpose,
+        legacy_regeneration: str,
+        characterized_by: tuple[str, ...],
+    ) -> ConsumerEndpoint:
+        return _enforced_consumer(
+            id,
+            version=cutover_version,
+            transport=transport,
+            purpose=purpose,
+            legacy_regeneration=legacy_regeneration,
+            characterized_by=characterized_by,
+        )
+
     return (
-        _consumer(
+        replay_consumer(
             "fork_ops.core:dry_run_migration(plan=)",
-            cutover_version=cutover_version,
             purpose=ConsumerPurpose.REPLAY,
             legacy_regeneration="fork_ops.core:generate_migration_plan",
             characterized_by=characterization(
@@ -1036,9 +1062,8 @@ def _plan_replay_and_execution(
                 Transport.PYTHON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork_ops.core:dry_run_migration_plan(plan)",
-            cutover_version=cutover_version,
             purpose=ConsumerPurpose.REPLAY,
             legacy_regeneration="fork_ops.core:generate_migration_plan",
             characterized_by=characterization(
@@ -1046,9 +1071,8 @@ def _plan_replay_and_execution(
                 Transport.PYTHON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork-ops migration dry-run --plan",
-            cutover_version=cutover_version,
             transport=Transport.CLI_JSON,
             purpose=ConsumerPurpose.REPLAY,
             legacy_regeneration="fork-ops migration plan",
@@ -1057,9 +1081,8 @@ def _plan_replay_and_execution(
                 Transport.CLI_JSON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork_ops_migration_dry_run(migration_plan=)",
-            cutover_version=cutover_version,
             transport=Transport.MCP,
             purpose=ConsumerPurpose.REPLAY,
             legacy_regeneration="fork_ops_migration_plan",
@@ -1068,9 +1091,8 @@ def _plan_replay_and_execution(
                 Transport.MCP,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork_ops.core:execute_migration(plan=)",
-            cutover_version=cutover_version,
             purpose=ConsumerPurpose.EXECUTION,
             legacy_regeneration="fork_ops.core:generate_migration_plan",
             characterized_by=characterization(
@@ -1078,9 +1100,8 @@ def _plan_replay_and_execution(
                 Transport.PYTHON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork_ops.core:execute_migration_plan(plan)",
-            cutover_version=cutover_version,
             purpose=ConsumerPurpose.EXECUTION,
             legacy_regeneration="fork_ops.core:generate_migration_plan",
             characterized_by=characterization(
@@ -1088,9 +1109,8 @@ def _plan_replay_and_execution(
                 Transport.PYTHON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork-ops migration execute --plan",
-            cutover_version=cutover_version,
             transport=Transport.CLI_JSON,
             purpose=ConsumerPurpose.EXECUTION,
             legacy_regeneration="fork-ops migration plan",
@@ -1099,9 +1119,8 @@ def _plan_replay_and_execution(
                 Transport.CLI_JSON,
             ),
         ),
-        _consumer(
+        replay_consumer(
             "fork_ops_migration_execute(migration_plan=)",
-            cutover_version=cutover_version,
             transport=Transport.MCP,
             purpose=ConsumerPurpose.EXECUTION,
             legacy_regeneration="fork_ops_migration_plan",
@@ -1114,28 +1133,28 @@ def _plan_replay_and_execution(
 
 
 _PLAN_REPLAY_AND_EXECUTION = _plan_replay_and_execution()
-_MIGRATION_NARRATIVE_DIAGNOSTIC = _consumer(
+_MIGRATION_NARRATIVE_DIAGNOSTIC = _enforced_consumer(
     "fork_ops:render_migration_narrative(workflow_output)",
+    version="1.0",
     purpose=ConsumerPurpose.DIAGNOSTIC,
-    legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
 )
 _WORKFLOW_DIAGNOSTICS = (
-    _consumer(
+    _enforced_consumer(
         "fork_ops:explain_migration_blocker(workflow_output)",
+        version="1.0",
         purpose=ConsumerPurpose.DIAGNOSTIC,
-        legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
     ),
-    _consumer(
+    _enforced_consumer(
         "fork-ops migration explain-blocker --input",
+        version="1.0",
         transport=Transport.CLI_JSON,
         purpose=ConsumerPurpose.DIAGNOSTIC,
-        legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
     ),
-    _consumer(
+    _enforced_consumer(
         "fork_ops_migration_blocker_resolution(workflow_output=)",
+        version="1.0",
         transport=Transport.MCP,
         purpose=ConsumerPurpose.DIAGNOSTIC,
-        legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
     ),
     _MIGRATION_NARRATIVE_DIAGNOSTIC,
 )
@@ -1154,7 +1173,6 @@ _MIGRATION_OUTPUT_FILE = _persistence(
 PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     _versioned(
         ArtifactKind.FORK_OPS_CONFIG,
-        "0.1",
         external_identity=ExternalIdentity.VERSIONED_CONFIG,
         version_field="schema_version",
         emitted_artifact_kind=None,
@@ -1171,16 +1189,14 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             _endpoint("fork_ops_config_read(normalized=True)", Transport.MCP),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:load_config",
-                cutover_version="0.1",
+                version="0.1",
                 characterized_by=_PYTHON_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_status_report",
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                missing_version=ObservedVersionOutcome.REPORTED,
-                cutover_version="0.1",
+                version="0.1",
                 characterized_by=_PYTHON_TEST + _VERSION_BEHAVIOR_TEST,
             ),
             _consumer(
@@ -1191,51 +1207,46 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
                 cutover_legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
                 characterized_by=_CLI_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork-ops config show --format json|--normalized",
+                version="0.1",
                 transport=Transport.CLI_JSON,
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                cutover_version="0.1",
                 characterized_by=_CLI_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork-ops config validate (without --json)",
+                version="0.1",
                 transport=Transport.CLI_TEXT,
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                missing_version=ObservedVersionOutcome.REFUSED,
-                cutover_version="0.1",
                 characterized_by=_CLI_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork-ops config validate --json",
+                version="0.1",
                 transport=Transport.CLI_JSON,
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                missing_version=ObservedVersionOutcome.REFUSED,
-                cutover_version="0.1",
                 characterized_by=_CLI_TEST + _VERSION_BEHAVIOR_TEST,
             ),
             _consumer(
                 "fork_ops_config_read(normalized=False)",
                 transport=Transport.MCP,
                 purpose=ConsumerPurpose.DIAGNOSTIC,
+                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
+                missing_version=ObservedVersionOutcome.REPORTED,
+                unknown_version=ObservedVersionOutcome.REPORTED,
+                legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
                 cutover_version="0.1",
                 cutover_legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
                 characterized_by=_MCP_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops_config_read(normalized=True)",
+                version="0.1",
                 transport=Transport.MCP,
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                missing_version=ObservedVersionOutcome.REPORTED,
-                cutover_version="0.1",
                 characterized_by=_MCP_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops_config_validate",
+                version="0.1",
                 transport=Transport.MCP,
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                missing_version=ObservedVersionOutcome.REPORTED,
-                cutover_version="0.1",
                 characterized_by=_MCP_TEST + _VERSION_BEHAVIOR_TEST,
             ),
         ),
@@ -1249,7 +1260,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_CONFIG_GUIDE + _OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.FORK_OPS_CONFIG_SCHEMA,
         producers=(
             _endpoint("fork_ops.core:schema_json"),
@@ -1257,14 +1268,22 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             _endpoint("fork_ops_schema", Transport.MCP),
         ),
         consumers=(
-            _consumer("fork_ops.schema:schema_diagnostics"),
-            _consumer("fork_ops.core:schema_artifact_report"),
-            _consumer(
+            _enforced_consumer(
+                "fork_ops.schema:schema_diagnostics",
+                version="1.0",
+            ),
+            _enforced_consumer(
+                "fork_ops.core:schema_artifact_report",
+                version="1.0",
+            ),
+            _enforced_consumer(
                 "fork-ops schema check (without --json)",
+                version="1.0",
                 transport=Transport.CLI_TEXT,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork-ops schema check --json",
+                version="1.0",
                 transport=Transport.CLI_JSON,
             ),
         ),
@@ -1283,7 +1302,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_CONFIG_GUIDE + _OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.PLUGIN_HEALTH_REPORT,
         producers=(
             _endpoint("fork_ops.core:build_plugin_health_report"),
@@ -1296,24 +1315,29 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.CONFIG_READ_RESULT,
         producers=(
+            _endpoint(
+                "fork-ops config show --format json|--normalized",
+                Transport.CLI_JSON,
+            ),
             _endpoint("fork_ops_config_read(normalized=False)", Transport.MCP),
+            _endpoint("fork_ops_config_read(normalized=True)", Transport.MCP),
         ),
         consumers=(),
-        consumer_gap="No in-repository consumer; emitted to the exact MCP caller.",
+        consumer_gap=(
+            "No in-repository consumer; emitted to the exact Python, CLI, or MCP caller."
+        ),
         persistence_gap="Config-read results are returned, not persisted by Fork Ops.",
         docs=_OPERATION_GUIDE,
-        tests=_CORE_TEST + _MCP_TEST,
+        tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.STATUS_REPORT,
         producers=(
             _endpoint("fork_ops.core:build_status_report"),
             _endpoint("fork-ops config validate --json", Transport.CLI_JSON),
-            _endpoint("fork-ops capability report --json", Transport.CLI_JSON),
-            _endpoint("fork_ops_config_read(normalized=True)", Transport.MCP),
             _endpoint("fork_ops_config_validate", Transport.MCP),
         ),
         consumers=(),
@@ -1322,16 +1346,18 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_CONFIG_GUIDE + _OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.CAPABILITY_REPORT,
         producers=(
             _endpoint("fork_ops.core:capability_report"),
             _endpoint("fork-ops capability report (without --json)", Transport.CLI_TEXT),
+            _endpoint("fork-ops capability report --json", Transport.CLI_JSON),
             _endpoint("fork_ops_capability_report", Transport.MCP),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_status_report",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
         ),
@@ -1339,12 +1365,13 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_CONFIG_GUIDE + _OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.CONFIG_INITIALIZATION_RESULT,
         producers=(_endpoint("fork_ops.core:initialize_config"),),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.cli:cmd_config_init(--write)",
+                version="1.0",
                 transport=Transport.CLI_TEXT,
                 purpose=ConsumerPurpose.DERIVATION,
             ),
@@ -1355,7 +1382,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_ASSESSMENT,
         producers=(
             _endpoint("fork_ops.core:assess_migration"),
@@ -1374,7 +1401,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.EQUIPMENT_MIGRATION_PREFLIGHT,
         producers=(
             _endpoint("fork_ops.core:build_equipment_migration_preflight"),
@@ -1387,16 +1414,18 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.EMBEDDED_EQUIPMENT_MIGRATION_PREFLIGHT,
         producers=(_endpoint("fork_ops.core:_equipment_migration_preflight"),),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_equipment_migration_preflight(embedded_preflight)",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:generate_migration_plan(embedded_preflight)",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
         )
@@ -1407,7 +1436,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_CONFIG_PATCH,
         producers=(
             _endpoint("fork_ops.core:propose_migration_config_patch"),
@@ -1418,16 +1447,19 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             _endpoint("fork_ops_migration_config_patch", Transport.MCP),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:generate_migration_plan",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:assess_migration(include_proposed_config_patch=True)",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_equipment_migration_preflight(proposed_config_patch)",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
         )
@@ -1439,7 +1471,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_PLAN,
         producers=(
             _endpoint("fork_ops.core:generate_migration_plan"),
@@ -1451,7 +1483,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_DRY_RUN,
         producers=(
             _endpoint("fork_ops.core:dry_run_migration(plan=None)"),
@@ -1476,7 +1508,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_EXECUTION_RESULT,
         producers=(
             _endpoint("fork_ops.core:execute_migration(plan=None)"),
@@ -1501,7 +1533,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_BLOCKER_EXPLANATION,
         producers=(
             _endpoint("fork_ops.core:explain_migration_blocker"),
@@ -1522,7 +1554,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_NARRATIVE,
         producers=(_endpoint("fork_ops:render_migration_narrative(workflow_output)"),),
         consumers=(),
@@ -1534,7 +1566,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MIGRATION_REVIEW_ARTIFACT,
         producers=(_endpoint("fork_ops.core:_migration_review_artifact"),),
         consumers=_PLAN_REPLAY_AND_EXECUTION,
@@ -1550,7 +1582,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.EQUIPMENT_REVIEW,
-        "0.1",
         producers=(
             _endpoint("fork_ops.core:_equipment_review_record"),
             _endpoint(
@@ -1558,16 +1589,14 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             ),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:_equipment_review_record_report",
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                cutover_version="1.0",
+                version="1.0",
                 characterized_by=_PYTHON_TEST + _VERSION_BEHAVIOR_TEST,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_status_report",
-                observed_version_handling=ObservedVersionHandling.PERMISSIVE,
-                cutover_version="1.0",
+                version="1.0",
                 characterized_by=_PYTHON_TEST + _VERSION_BEHAVIOR_TEST,
             ),
         )
@@ -1585,7 +1614,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST + _PERSISTENCE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.WORKFLOW_CATALOG,
         producers=(
             _endpoint("fork_ops.workflow_catalog:workflow_catalog"),
@@ -1593,13 +1622,14 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             _endpoint("fork_ops_workflow_catalog", Transport.MCP),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:_cli_execution_check",
+                version="1.0",
                 purpose=ConsumerPurpose.DIAGNOSTIC,
-                legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
             ),
-            _consumer(
+            _enforced_consumer(
                 "scripts/produce_validation_evidence.py:_workflow_catalog_check",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
         ),
@@ -1607,8 +1637,10 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.WORKFLOW_CONTRACT_SET,
+        external_identity=ExternalIdentity.INTERNAL_TYPED,
+        version_field="schema_version",
         producers=(_endpoint("fork_ops.workflow_catalog:workflow_contracts"),),
         consumers=(
             _consumer(
@@ -1626,7 +1658,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_OPERATION_GUIDE,
         tests=_CORE_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.WORKFLOW_MIGRATION_INVENTORY,
         producers=(
             _endpoint("fork_ops.core:build_workflow_migration_inventory"),
@@ -1634,12 +1666,14 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
             _endpoint("fork_ops_workflow_migration_inventory", Transport.MCP),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:generate_migration_plan",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_equipment_migration_preflight(workflow_inventory)",
+                version="1.0",
                 purpose=ConsumerPurpose.DERIVATION,
             ),
         ),
@@ -1650,7 +1684,7 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_MIGRATION_GUIDE + _OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST + _MCP_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.SCHEMA_ARTIFACT_REPORT,
         producers=(
             _endpoint("fork_ops.core:schema_artifact_report"),
@@ -1662,17 +1696,17 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
         docs=_OPERATION_GUIDE,
         tests=_CORE_TEST + _CLI_TEST,
     ),
-    _legacy(
+    _versioned(
         ArtifactKind.MCP_HEALTHCHECK,
         producers=(
             _endpoint("fork_ops.mcp_server:mcp_healthcheck"),
             _endpoint("fork-ops-mcp --health-check", Transport.CLI_JSON),
         ),
         consumers=(
-            _consumer(
+            _enforced_consumer(
                 "fork_ops.core:build_plugin_health_report",
+                version="1.0",
                 purpose=ConsumerPurpose.DIAGNOSTIC,
-                legacy_policy=LegacyPolicy.IDENTIFY_ONLY,
             ),
         ),
         persistence_gap="MCP health-check results are returned, not persisted by Fork Ops.",
@@ -1681,7 +1715,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.REPOSITORY_CONTROL_OBSERVATION_CONTRACT,
-        "1.0",
         external_identity=ExternalIdentity.VERSIONED_CONTRACT,
         version_field="contract_version",
         emitted_artifact_kind=(
@@ -1712,7 +1745,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.REPOSITORY_CONTROL_OBSERVATION,
-        "1.0",
         producers=(
             _endpoint(
                 "fork_ops.repository_control_adapters:"
@@ -1741,7 +1773,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.REPOSITORY_CONTROL_PROJECTION,
-        "1.0",
         external_identity=ExternalIdentity.INTERNAL_TYPED,
         version_field=None,
         producers=(
@@ -1773,7 +1804,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.FIRST_PARTY_SECURITY_RESULT,
-        "1.0",
         producers=(
             _endpoint("fork_ops.repository_controls:evaluate_first_party_security"),
         ),
@@ -1785,7 +1815,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.VALIDATION_EVIDENCE_RESULT,
-        "1.0",
         producers=(_endpoint("scripts/produce_validation_evidence.py:main"),),
         consumers=(
             _enforced_consumer(
@@ -1813,7 +1842,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.VALIDATION_WORKFLOW_AGGREGATE,
-        "1.0",
         producers=(
             _endpoint(
                 ".github/workflows/validation.yml:validation",
@@ -1832,7 +1860,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.NORMALIZED_DEPENDENCY_VULNERABILITY_EVIDENCE,
-        "2.0",
         producers=(
             _endpoint("fork_ops.dependency_security:collect_uv_audit_evidence"),
             _endpoint("scripts/produce_validation_evidence.py:_dependency_audit_matrix_check"),
@@ -1851,7 +1878,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.DEPENDENCY_SECURITY_RESULT,
-        "1.0",
         producers=(_endpoint("fork_ops.dependency_security:evaluate_dependency_security"),),
         consumers=(),
         consumer_gap="No in-repository consumer; returned to the evaluation caller.",
@@ -1861,7 +1887,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_CONTRACT,
-        "1.0",
         external_identity=ExternalIdentity.VERSIONED_CONTRACT,
         version_field="contract_version",
         emitted_artifact_kind=ArtifactKind.SECURITY_EXCEPTION_CONTRACT.value,
@@ -1910,7 +1935,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_LEDGER,
-        "1.0",
         producers=(_endpoint("checked-in public governance ledger", Transport.TOML_FILE),),
         consumers=(
             _enforced_consumer(
@@ -1934,7 +1958,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_PRIVATE_PROJECTION,
-        "1.0",
         producers=(),
         producer_gap="Private persistence adapter is intentionally not implemented.",
         consumers=(
@@ -1949,7 +1972,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_LINEAGE_INDEX_PROJECTION,
-        "1.0",
         producers=(),
         producer_gap="Private lineage persistence adapter is intentionally not implemented.",
         consumers=(
@@ -1964,7 +1986,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_AUTHORITY_OBSERVATION,
-        "1.0",
         producers=(),
         producer_gap="Authenticated authority observation adapter is not implemented.",
         consumers=(
@@ -1979,7 +2000,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_INVENTORY,
-        "1.0",
         external_identity=ExternalIdentity.INTERNAL_TYPED,
         version_field="contract_version",
         emitted_artifact_kind=None,
@@ -2036,7 +2056,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_PUBLIC_COMMAND_REQUEST,
-        "1.0",
         external_identity=ExternalIdentity.INTERNAL_TYPED,
         version_field=None,
         emitted_artifact_kind=None,
@@ -2056,7 +2075,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_TRANSITION_PROJECTION,
-        "1.0",
         producers=(),
         producer_gap="Authenticated transition persistence adapter is not implemented.",
         consumers=(
@@ -2071,7 +2089,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_PROVIDER_OBSERVATION,
-        "1.0",
         producers=(),
         producer_gap="Authenticated provider observation adapter is not implemented.",
         consumers=(
@@ -2086,7 +2103,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_STRUCTURAL_PROVIDER_OBSERVATION,
-        "1.0",
         external_identity=ExternalIdentity.INTERNAL_TYPED,
         version_field=None,
         emitted_artifact_kind=None,
@@ -2108,7 +2124,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_RESPONSE_CLOCK_INVENTORY,
-        "1.0",
         producers=(),
         producer_gap="Response-clock collection adapter is not implemented.",
         consumers=(
@@ -2123,7 +2138,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_LINEAGE_ISSUANCE_PROJECTION,
-        "1.0",
         producers=(),
         producer_gap="Authenticated lineage issuance adapter is not implemented.",
         consumers=(
@@ -2138,7 +2152,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_ADVISORY_RECONCILIATION_PROJECTION,
-        "1.0",
         producers=(),
         producer_gap="Authenticated advisory reconciliation adapter is not implemented.",
         consumers=(
@@ -2153,7 +2166,6 @@ PAYLOAD_FAMILIES: tuple[PayloadFamily, ...] = (
     ),
     _versioned(
         ArtifactKind.SECURITY_EXCEPTION_AUTHORITY_MIGRATION,
-        "1.0",
         producers=(),
         producer_gap="Authority migration projection producer is intentionally unavailable.",
         consumers=(

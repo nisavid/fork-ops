@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
-ImplementationStatus = Literal["current", "diagnostic-only", "next-slice", "planned"]
-_AVAILABLE_STATUSES: frozenset[ImplementationStatus] = frozenset(
-    {"current", "diagnostic-only"}
+from ._contracts import ArtifactKind, current_artifact_version, operation_artifact
+
+ImplementationExtent = Literal["implemented", "partial", "planned"]
+OperationMode = Literal["diagnostic", "read_only", "guarded_mutation"]
+
+IMPLEMENTATION_EXTENT_VALUES: tuple[ImplementationExtent, ...] = (
+    "implemented",
+    "partial",
+    "planned",
+)
+OPERATION_MODE_VALUES: tuple[OperationMode, ...] = (
+    "diagnostic",
+    "read_only",
+    "guarded_mutation",
 )
 
 
@@ -28,14 +40,28 @@ class WorkflowEntrypoint:
 
 
 @dataclass(frozen=True)
+class WorkflowOperation:
+    id: str
+    operation_mode: OperationMode
+    available: bool
+
+    def to_dict(self) -> dict[str, str | bool]:
+        return {
+            "id": self.id,
+            "operation_mode": self.operation_mode,
+            "available": self.available,
+        }
+
+
+@dataclass(frozen=True)
 class WorkflowContract:
     id: str
     title: str
     operator_intent: str
     trigger_phrases: tuple[str, ...]
     capability_gate: str
-    implementation_status: ImplementationStatus
-    available: bool
+    implementation_extent: ImplementationExtent
+    operations: tuple[WorkflowOperation, ...]
     authority_reads: tuple[str, ...]
     preflight_checks: tuple[str, ...]
     mutation_gates: tuple[str, ...]
@@ -46,10 +72,23 @@ class WorkflowContract:
     closeout_criteria: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.available and self.implementation_status not in _AVAILABLE_STATUSES:
+        if not self.operations:
+            raise ValueError(f"Workflow {self.id!r}: at least one operation is required")
+        operation_ids = [operation.id for operation in self.operations]
+        if len(set(operation_ids)) != len(operation_ids):
+            raise ValueError(f"Workflow {self.id!r}: operation ids must be unique")
+        availability = {operation.available for operation in self.operations}
+        expected_extent: ImplementationExtent
+        if availability == {True}:
+            expected_extent = "implemented"
+        elif availability == {False}:
+            expected_extent = "planned"
+        else:
+            expected_extent = "partial"
+        if self.implementation_extent != expected_extent:
             raise ValueError(
-                f"Workflow {self.id!r}: available=True requires implementation_status in "
-                f"{_AVAILABLE_STATUSES!r}, got {self.implementation_status!r}"
+                f"Workflow {self.id!r}: implementation_extent must be "
+                f"{expected_extent!r} for its named operations"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,8 +98,8 @@ class WorkflowContract:
             "operator_intent": self.operator_intent,
             "trigger_phrases": list(self.trigger_phrases),
             "capability_gate": self.capability_gate,
-            "implementation_status": self.implementation_status,
-            "available": self.available,
+            "implementation_extent": self.implementation_extent,
+            "operations": [operation.to_dict() for operation in self.operations],
             "authority_reads": list(self.authority_reads),
             "preflight_checks": list(self.preflight_checks),
             "mutation_gates": list(self.mutation_gates),
@@ -70,6 +109,29 @@ class WorkflowContract:
             "handoff_expectations": list(self.handoff_expectations),
             "closeout_criteria": list(self.closeout_criteria),
         }
+
+
+@dataclass(frozen=True)
+class WorkflowContractSet:
+    """The exact internal typed contract set consumed across modules."""
+
+    contracts: tuple[WorkflowContract, ...]
+    artifact_kind: str = ArtifactKind.WORKFLOW_CONTRACT_SET.value
+    schema_version: str = str(
+        current_artifact_version(ArtifactKind.WORKFLOW_CONTRACT_SET)
+    )
+
+    def __iter__(self) -> Iterator[WorkflowContract]:
+        return iter(self.contracts)
+
+    def __len__(self) -> int:
+        return len(self.contracts)
+
+    def __getitem__(self, index: int | slice) -> WorkflowContract | tuple[WorkflowContract, ...]:
+        return self.contracts[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.contracts)
 
 
 _CATALOG_ENTRYPOINT = WorkflowEntrypoint(
@@ -103,8 +165,12 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "operator onboarding",
         ),
         capability_gate="plugin-health",
-        implementation_status="current",
-        available=True,
+        implementation_extent="partial",
+        operations=(
+            WorkflowOperation("plugin-health", "diagnostic", True),
+            WorkflowOperation("workflow-catalog", "diagnostic", True),
+            WorkflowOperation("ui-visibility-inspection", "diagnostic", False),
+        ),
         authority_reads=("plugin registration", "skill discovery", "CLI and MCP surfaces"),
         preflight_checks=(
             "Check plugin registration.",
@@ -167,8 +233,16 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "generate a fork ops config",
         ),
         capability_gate="identified",
-        implementation_status="current",
-        available=True,
+        implementation_extent="partial",
+        operations=(
+            WorkflowOperation("migration-assessment", "read_only", True),
+            WorkflowOperation("equipment-migration-preflight", "read_only", True),
+            WorkflowOperation("migration-config-proposal", "read_only", True),
+            WorkflowOperation("migration-plan", "read_only", True),
+            WorkflowOperation("migration-dry-run", "read_only", True),
+            WorkflowOperation("initial-config-creation", "guarded_mutation", True),
+            WorkflowOperation("source-material-removal", "guarded_mutation", False),
+        ),
         authority_reads=(
             ".agents/fork-ops.toml when present",
             "candidate fork-local agent docs and skills",
@@ -286,8 +360,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "map skills to the workflow catalog",
         ),
         capability_gate="plugin-health",
-        implementation_status="diagnostic-only",
-        available=True,
+        implementation_extent="implemented",
+        operations=(
+            WorkflowOperation("workflow-migration-inventory", "read_only", True),
+        ),
         authority_reads=("operator-provided source roots", "workflow catalog contracts"),
         preflight_checks=("Confirm source roots are readable.", "Classify source material."),
         mutation_gates=("No source root mutation is allowed during inventory reporting.",),
@@ -329,8 +405,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Explain where fork-local authority comes from before selecting tools.",
         trigger_phrases=("where should fork ops read from", "explain authority routing"),
         capability_gate="identified",
-        implementation_status="diagnostic-only",
-        available=True,
+        implementation_extent="implemented",
+        operations=(
+            WorkflowOperation("authority-source-routing", "diagnostic", True),
+        ),
         authority_reads=(".agents/fork-ops.toml", "local_surfaces", "repo docs"),
         preflight_checks=("Read config when present.", "List required local surfaces."),
         mutation_gates=("No mutation is allowed for authority explanation.",),
@@ -361,8 +439,11 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Assess configured remotes and upstream tracks without changing refs.",
         trigger_phrases=("assess upstream status", "check upstream tracks"),
         capability_gate="track-aware",
-        implementation_status="diagnostic-only",
-        available=True,
+        implementation_extent="partial",
+        operations=(
+            WorkflowOperation("local-upstream-inspection", "diagnostic", True),
+            WorkflowOperation("live-upstream-freshness", "diagnostic", False),
+        ),
         authority_reads=("configured remotes", "release channels", "upstream tracks"),
         preflight_checks=("Validate config.", "Inspect local Git remotes and refs."),
         mutation_gates=("No fetch, push, merge, or ref update is performed.",),
@@ -395,8 +476,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Plan a safe upstream sync path without executing it.",
         trigger_phrases=("plan an upstream sync", "prepare sync plan"),
         capability_gate="sync-ready",
-        implementation_status="next-slice",
-        available=False,
+        implementation_extent="planned",
+        operations=(
+            WorkflowOperation("upstream-sync-planning", "read_only", False),
+        ),
         authority_reads=("sync_policy", "divergence_policy", "upstream tracks"),
         preflight_checks=("Validate sync-ready authority.", "Compare configured baseline refs."),
         mutation_gates=("Planning is non-mutating; execution remains separate.",),
@@ -415,8 +498,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Execute an upstream sync only after configured mutation gates pass.",
         trigger_phrases=("execute upstream sync", "sync this fork"),
         capability_gate="sync-ready",
-        implementation_status="planned",
-        available=False,
+        implementation_extent="planned",
+        operations=(
+            WorkflowOperation("guarded-sync-execution", "guarded_mutation", False),
+        ),
         authority_reads=("sync_policy", "divergence_policy", "review policy"),
         preflight_checks=("Validate sync-ready authority.", "Verify ancestry and mutation gates."),
         mutation_gates=("History rewrite policy", "allowed merge methods", "required checks"),
@@ -439,8 +524,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Review fork-carried divergence before a sync or publication decision.",
         trigger_phrases=("review carried divergence", "what does this fork carry"),
         capability_gate="sync-ready",
-        implementation_status="planned",
-        available=False,
+        implementation_extent="planned",
+        operations=(
+            WorkflowOperation("carried-divergence-review", "read_only", False),
+        ),
         authority_reads=("divergence_policy", "change targets", "upstream baseline"),
         preflight_checks=("Identify fork-only commits.", "Classify divergence policy."),
         mutation_gates=("No mutation is allowed during divergence review.",),
@@ -460,8 +547,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Prepare a fork-local change for review using configured review policy.",
         trigger_phrases=("prepare this for review", "review prep"),
         capability_gate="review-ready",
-        implementation_status="planned",
-        available=False,
+        implementation_extent="planned",
+        operations=(
+            WorkflowOperation("review-preparation", "read_only", False),
+        ),
         authority_reads=("review_policy", "local_gates", "publication_policy"),
         preflight_checks=("Run configured local gates.", "Summarize evidence for reviewers."),
         mutation_gates=("No publication mutation occurs during review preparation.",),
@@ -477,8 +566,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         operator_intent="Publish or close out fork-local changes after review gates pass.",
         trigger_phrases=("publish this fork change", "close out publication"),
         capability_gate="review-ready",
-        implementation_status="planned",
-        available=False,
+        implementation_extent="planned",
+        operations=(
+            WorkflowOperation("publication-closeout", "guarded_mutation", False),
+        ),
         authority_reads=("publication_policy", "review_policy", "local_gates"),
         preflight_checks=("Verify review state.", "Verify publication target and merge policy."),
         mutation_gates=("Review approval", "CI state", "allowed merge methods"),
@@ -494,13 +585,15 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         closeout_criteria=("Published ref, PR, or explicit blocker is recorded.",),
     ),
     WorkflowContract(
-        id="blocker-resolution",
+        id="migration-blocker-explanation",
         title="Blocker explanation or resolution",
         operator_intent="Explain a Fork Ops blocker and route the smallest safe continuation.",
         trigger_phrases=("explain this blocker", "resolve fork ops blocker"),
         capability_gate="identified",
-        implementation_status="diagnostic-only",
-        available=True,
+        implementation_extent="implemented",
+        operations=(
+            WorkflowOperation("migration-blocker-explanation", "diagnostic", True),
+        ),
         authority_reads=("workflow output", "diagnostics", "fork-local authority"),
         preflight_checks=("Identify blocker code.", "Trace evidence that produced the blocker."),
         mutation_gates=("Resolution mutations use the originating workflow's gates.",),
@@ -514,7 +607,7 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             WorkflowEntrypoint(
                 kind="mcp",
                 id="fork_ops_migration_blocker_resolution",
-                label="Return blocker-resolution output to MCP clients.",
+                label="Return a migration blocker explanation to MCP clients.",
                 surface="MCP tool",
             ),
             _CATALOG_ENTRYPOINT,
@@ -534,24 +627,29 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
 )
 
 
-def workflow_contracts() -> tuple[WorkflowContract, ...]:
-    return WORKFLOW_CONTRACTS
+def workflow_contracts() -> WorkflowContractSet:
+    return WorkflowContractSet(WORKFLOW_CONTRACTS)
 
 
 def workflow_catalog() -> dict[str, Any]:
     workflows = [workflow.to_dict() for workflow in WORKFLOW_CONTRACTS]
-    return {
-        "operation": "workflow-catalog",
-        "model": "intent-led-workflow-contracts",
-        # Keep these keys in sync with the ImplementationStatus Literal type.
-        "status_values": {
-            "current": "Implemented in the plugin's current controlled surfaces.",
-            "diagnostic-only": "Implemented only for read-only diagnostics or explanation.",
-            "next-slice": "Visible contract for the next implementation slice.",
-            "planned": "Planned workflow; visible with refusal boundaries.",
+    return operation_artifact(
+        ArtifactKind.WORKFLOW_CATALOG,
+        "workflow-catalog",
+        {
+            "model": "intent-led-workflow-contracts",
+            "implementation_extent_values": list(IMPLEMENTATION_EXTENT_VALUES),
+            "operation_mode_values": list(OPERATION_MODE_VALUES),
+            "workflows": workflows,
         },
-        "workflows": workflows,
-    }
+    )
 
 
-__all__ = ["WorkflowContract", "WorkflowEntrypoint", "workflow_catalog", "workflow_contracts"]
+__all__ = [
+    "WorkflowContract",
+    "WorkflowContractSet",
+    "WorkflowEntrypoint",
+    "WorkflowOperation",
+    "workflow_catalog",
+    "workflow_contracts",
+]

@@ -13,7 +13,7 @@ import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any
 from unittest.mock import patch
 
 from fork_ops import cli as cli_module
@@ -63,7 +63,13 @@ from fork_ops.mcp_server import (
     mcp_healthcheck,
 )
 from fork_ops.schema import schema_diagnostics
-from fork_ops.workflow_catalog import ImplementationStatus, WorkflowContract, workflow_catalog
+from fork_ops.workflow_catalog import (
+    IMPLEMENTATION_EXTENT_VALUES,
+    OPERATION_MODE_VALUES,
+    WorkflowContract,
+    WorkflowOperation,
+    workflow_catalog,
+)
 
 TRACK_AWARE_CONFIG = """schema_version = "0.1"
 
@@ -171,13 +177,71 @@ def _mark_reviewed_exclude(plan: dict[str, Any], source_path: str) -> None:
 
 
 def _mark_equipment_reviewed_retain(plan: dict[str, Any], source_path: str) -> None:
-    for entry in plan["equipment_review_record"]["equipment"]:
+    record = plan["equipment_review_record"]
+    record["status"] = "reviewed"
+    for entry in record["equipment"]:
         if entry["source_path"] == source_path:
             entry["decision_status"] = "reviewed"
             entry["disposition"] = "retain_authoritative_owner"
             entry["reason_recommended"] = "Reviewed as retained authoritative equipment."
+            _mark_equipment_accounting_retained(record, source_path)
+            record["toml"] = core_module._equipment_review_record_toml(record)
             return
     raise AssertionError(f"Missing equipment review entry for {source_path}")
+
+
+def _mark_equipment_accounting_retained(
+    record: dict[str, Any],
+    source_path: str,
+) -> None:
+    accounting = next(
+        item
+        for item in record["accounting_records"]
+        if item.get("source_path") == source_path
+    )
+    accounting.update(
+        {
+            "accounting_status": "retained_fork_local_authority",
+            "coverage_status": "retained_as_fork_local_authority",
+            "target_surface_type": "fork_local_authority",
+            "target_workflow_id": "",
+            "target_path": source_path,
+            "reason": "The source remains retained fork-local authority.",
+            "next_action": (
+                "Retain and read this authority until replacement coverage validates."
+            ),
+            "follow_up_id": "",
+        }
+    )
+    record["unassessed_equipment_areas"] = [
+        area
+        for area in record["unassessed_equipment_areas"]
+        if area.get("path") != source_path
+    ]
+    record["follow_up_candidates"] = core_module._accounting_follow_up_candidates(
+        record["accounting_records"]
+    )
+
+
+def _append_superseding_equipment_decision(
+    record: dict[str, Any],
+    source_path: str,
+) -> dict[str, Any]:
+    previous = next(
+        item for item in record["equipment"] if item["source_path"] == source_path
+    )
+    successor = copy.deepcopy(previous)
+    successor["id"] = f"{previous['id']}:successor"
+    successor["decision_status"] = "reviewed"
+    successor["disposition"] = "retain_authoritative_owner"
+    successor["supersedes"] = previous["id"]
+    previous["decision_status"] = "superseded"
+    previous["superseded_by"] = successor["id"]
+    record["status"] = "reviewed"
+    record["equipment"].append(successor)
+    _mark_equipment_accounting_retained(record, source_path)
+    record["toml"] = core_module._equipment_review_record_toml(record)
+    return successor
 
 
 class ForkOpsCoreTests(unittest.TestCase):
@@ -244,7 +308,8 @@ class ForkOpsCoreTests(unittest.TestCase):
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertIn(
             "migration_execution.scan_accounting_incomplete",
             {blocker["code"] for blocker in result["blockers"]},
@@ -341,36 +406,38 @@ class ForkOpsCoreTests(unittest.TestCase):
     def test_workflow_catalog_defines_intent_level_contracts(self) -> None:
         catalog = workflow_catalog()
 
+        self.assertEqual(catalog["artifact_kind"], "workflow_catalog")
+        self.assertEqual(catalog["schema_version"], "1.0")
         self.assertEqual(catalog["operation"], "workflow-catalog")
         workflows = {workflow["id"]: workflow for workflow in catalog["workflows"]}
         expected_contracts = {
-            "operator-onboarding": ("plugin-health", "current", True),
-            "fork-authority-migration": ("identified", "current", True),
-            "workflow-migration-inventory": ("plugin-health", "diagnostic-only", True),
-            "authority-source-routing": ("identified", "diagnostic-only", True),
-            "upstream-status-assessment": ("track-aware", "diagnostic-only", True),
-            "upstream-sync-planning": ("sync-ready", "next-slice", False),
-            "guarded-sync-execution": ("sync-ready", "planned", False),
-            "carried-divergence-review": ("sync-ready", "planned", False),
-            "review-preparation": ("review-ready", "planned", False),
-            "publication-closeout": ("review-ready", "planned", False),
-            "blocker-resolution": ("identified", "diagnostic-only", True),
+            "operator-onboarding": ("plugin-health", "partial"),
+            "fork-authority-migration": ("identified", "partial"),
+            "workflow-migration-inventory": ("plugin-health", "implemented"),
+            "authority-source-routing": ("identified", "implemented"),
+            "upstream-status-assessment": ("track-aware", "partial"),
+            "upstream-sync-planning": ("sync-ready", "planned"),
+            "guarded-sync-execution": ("sync-ready", "planned"),
+            "carried-divergence-review": ("sync-ready", "planned"),
+            "review-preparation": ("review-ready", "planned"),
+            "publication-closeout": ("review-ready", "planned"),
+            "migration-blocker-explanation": ("identified", "implemented"),
         }
         self.assertEqual(set(workflows), set(expected_contracts))
         self.assertEqual(len(catalog["workflows"]), len(workflows))
 
-        for workflow_id, (capability_gate, status, available) in expected_contracts.items():
+        for workflow_id, (capability_gate, extent) in expected_contracts.items():
             workflow = workflows[workflow_id]
             self.assertEqual(workflow["capability_gate"], capability_gate)
-            self.assertEqual(workflow["implementation_status"], status)
-            self.assertEqual(workflow["available"], available)
+            self.assertEqual(workflow["implementation_extent"], extent)
+            self.assertTrue(workflow["operations"])
             self.assertTrue(workflow["operator_intent"])
             self.assertTrue(workflow["trigger_phrases"])
             self.assertTrue(workflow["evidence_expectations"])
             self.assertTrue(workflow["refusal_behavior"])
             self.assertTrue(workflow["handoff_expectations"])
             self.assertTrue(workflow["closeout_criteria"])
-            if not available:
+            if extent == "planned":
                 self.assertIn("fork-ops workflow catalog", _entrypoint_ids(workflow))
                 self.assertIn("fork_ops_workflow_catalog", _entrypoint_ids(workflow))
 
@@ -395,7 +462,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             _entrypoint_ids(migration),
         )
         self.assertIn("source material disposition", " ".join(migration["evidence_expectations"]))
-        blocker_resolution = workflows["blocker-resolution"]
+        blocker_resolution = workflows["migration-blocker-explanation"]
         self.assertIn(
             "fork-ops migration explain-blocker",
             _entrypoint_ids(blocker_resolution),
@@ -477,6 +544,7 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         checks = {check["id"]: check for check in report["checks"]}
         self.assertEqual(report["summary"]["status"], "failed")
+        self.assertEqual(report["outcome"], "failed")
         self.assertEqual(checks["cli_execution"]["status"], "ready")
         self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
         self.assertEqual(checks["mcp_tool_listing"]["status"], "unavailable")
@@ -502,6 +570,7 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         checks = {check["id"]: check for check in report["checks"]}
         self.assertEqual(report["summary"]["status"], "failed")
+        self.assertEqual(report["outcome"], "failed")
         self.assertEqual(checks["cli_execution"]["status"], "failed")
         self.assertFalse(report["cli_fallback"]["usable"])
         self.assertIn("stderr from cli", checks["cli_execution"]["evidence"]["stderr"])
@@ -584,7 +653,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             return subprocess.CompletedProcess(
                 command,
                 0,
-                json.dumps({"operation": "workflow-catalog", "workflows": []}),
+                json.dumps(_workflow_catalog_probe()),
                 "",
             )
 
@@ -689,14 +758,9 @@ class ForkOpsCoreTests(unittest.TestCase):
             launches.append((command, cwd))
             payload: dict[str, Any]
             if command[-2:] == ["workflow", "catalog"]:
-                payload = {"operation": "workflow-catalog", "workflows": []}
+                payload = _workflow_catalog_probe()
             else:
-                payload = {
-                    "mcp_dependency_available": True,
-                    "missing_dependency": None,
-                    "server": "Fork Ops",
-                    "tools": list(MCP_TOOL_IDS),
-                }
+                payload = _mcp_health_probe()
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
         with tempfile.TemporaryDirectory() as workspace:
@@ -766,14 +830,9 @@ class ForkOpsCoreTests(unittest.TestCase):
             launches.append((command, cwd))
             payload: dict[str, Any]
             if command[-2:] == ["workflow", "catalog"]:
-                payload = {"operation": "workflow-catalog", "workflows": []}
+                payload = _workflow_catalog_probe()
             else:
-                payload = {
-                    "mcp_dependency_available": True,
-                    "missing_dependency": None,
-                    "server": "Fork Ops",
-                    "tools": list(MCP_TOOL_IDS),
-                }
+                payload = _mcp_health_probe()
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
         with tempfile.TemporaryDirectory() as workspace:
@@ -839,16 +898,18 @@ class ForkOpsCoreTests(unittest.TestCase):
         ) -> subprocess.CompletedProcess[str]:
             del cwd, timeout
             if "--health-check" in command:
+                payload = _mcp_health_probe()
+                payload.pop("mcp_dependency_available")
                 return subprocess.CompletedProcess(
                     command,
                     0,
-                    json.dumps({"server": "Fork Ops", "tools": list(MCP_TOOL_IDS)}),
+                    json.dumps(payload),
                     "",
                 )
             return subprocess.CompletedProcess(
                 command,
                 0,
-                json.dumps({"operation": "workflow-catalog", "workflows": []}),
+                json.dumps(_workflow_catalog_probe()),
                 "",
             )
 
@@ -918,19 +979,14 @@ class ForkOpsCoreTests(unittest.TestCase):
                     command,
                     0,
                     json.dumps(
-                        {
-                            "mcp_dependency_available": True,
-                            "missing_dependency": None,
-                            "server": "Fork Ops",
-                            "tools": list(MCP_TOOL_IDS),
-                        }
+                        _mcp_health_probe()
                     ),
                     "",
                 )
             return subprocess.CompletedProcess(
                 command,
                 0,
-                json.dumps({"operation": "workflow-catalog", "workflows": None}),
+                json.dumps(_workflow_catalog_probe(workflows=None)),
                 "",
             )
 
@@ -1117,16 +1173,16 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(payload, expected)
         self.assertFalse(payload["mcp_dependency_available"])
 
-    def test_workflow_contract_rejects_available_unimplemented_workflow(self) -> None:
-        with self.assertRaisesRegex(ValueError, "available=True requires"):
+    def test_workflow_contract_rejects_extent_that_disagrees_with_operations(self) -> None:
+        with self.assertRaisesRegex(ValueError, "implementation_extent must be"):
             WorkflowContract(
                 id="bad-workflow",
                 title="Bad workflow",
                 operator_intent="Expose an invalid workflow contract.",
                 trigger_phrases=("bad workflow",),
                 capability_gate="sync-ready",
-                implementation_status="planned",
-                available=True,
+                implementation_extent="planned",
+                operations=(WorkflowOperation("bad-operation", "diagnostic", True),),
                 authority_reads=("sync_policy",),
                 preflight_checks=("Validate sync policy.",),
                 mutation_gates=("No mutation.",),
@@ -1137,10 +1193,17 @@ class ForkOpsCoreTests(unittest.TestCase):
                 closeout_criteria=("Contract is valid.",),
             )
 
-    def test_workflow_catalog_status_values_cover_status_type(self) -> None:
+    def test_workflow_catalog_values_cover_contract_types(self) -> None:
         catalog = workflow_catalog()
 
-        self.assertEqual(set(catalog["status_values"]), set(get_args(ImplementationStatus)))
+        self.assertEqual(
+            set(catalog["implementation_extent_values"]),
+            set(IMPLEMENTATION_EXTENT_VALUES),
+        )
+        self.assertEqual(
+            set(catalog["operation_mode_values"]),
+            set(OPERATION_MODE_VALUES),
+        )
 
     def test_workflow_migration_inventory_classifies_representative_sources(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -1330,8 +1393,9 @@ class ForkOpsCoreTests(unittest.TestCase):
             group["workflow_id"]: group for group in inventory["catalog_evidence"]
         }
         sync_planning = catalog_evidence["upstream-sync-planning"]
-        self.assertEqual(sync_planning["coverage_status"], "cataloged-not-implemented")
-        self.assertFalse(sync_planning["available"])
+        self.assertEqual(sync_planning["coverage_status"], "cataloged-planned")
+        self.assertEqual(sync_planning["implementation_extent"], "planned")
+        self.assertEqual(sync_planning["available_operations"], [])
         self.assertTrue(sync_planning["entry_refs"])
         self.assertNotIn("source_text", sync_planning)
         self.assertNotIn("source_text", sync_planning["entry_refs"][0])
@@ -1487,6 +1551,650 @@ class ForkOpsCoreTests(unittest.TestCase):
             record["id"],
         )
 
+    def test_rejected_source_root_has_canonical_unassessed_accounting(self) -> None:
+        root = {
+            "path": "/rejected/source-root",
+            "source_scope": "operator-source-root",
+            "root_role": "operator-provided",
+            "status": "rejected",
+        }
+
+        [record] = core_module._workflow_inventory_accounting_records([], [root])
+
+        self.assertEqual(record["accounting_status"], "unassessed")
+        self.assertEqual(record["source_root"], root["path"])
+        self.assertEqual(
+            record["next_action"],
+            "Replace or remove the rejected source root.",
+        )
+
+    def test_rejected_source_root_preflight_record_is_semantically_replayable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo_path = workspace_path / "selected-repo"
+            rejected_root = workspace_path / "rejected-root"
+            repo_path.mkdir()
+            rejected_root.symlink_to(repo_path, target_is_directory=True)
+
+            preflight = build_equipment_migration_preflight(
+                repo_path,
+                [rejected_root],
+            )
+            record = preflight["equipment_review_record"]
+            error = core_module._equipment_review_semantic_error(
+                record,
+                require_toml=True,
+            )
+
+        self.assertIsNone(error)
+        [accounting] = [
+            item
+            for item in record["accounting_records"]
+            if item["source_kind"] == "source-root"
+        ]
+        self.assertEqual(accounting["source_root"], str(rejected_root))
+        self.assertEqual(
+            accounting["reason"],
+            "The source root is not a regular file or directory.",
+        )
+
+    def test_workflow_inventory_excludes_generated_equipment_review_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/review-policy.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "PR review bot policy and publication closeout remain reviewable.\n"
+            )
+            generated = build_equipment_migration_preflight(repo_path)
+            review_path = (
+                repo_path / core_module.EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH
+            )
+            review_path.write_text(generated["equipment_review_record"]["toml"])
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            config_path.parent.mkdir(exist_ok=True)
+            config_path.write_text(
+                propose_migration_config_patch(repo_path)["toml"]
+                + "\n# PR review bot policy and publication closeout remain reviewable.\n"
+            )
+
+            inventory = build_workflow_migration_inventory([repo_path])
+            preflight = build_equipment_migration_preflight(repo_path, [repo_path])
+            trusted_inventory = build_workflow_migration_inventory([repo_path])
+
+        self.assertNotIn(
+            core_module.EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH,
+            {entry["source_path"] for entry in inventory["entries"]},
+        )
+        self.assertNotIn(
+            CONFIG_RELATIVE_PATH.as_posix(),
+            {entry["source_path"] for entry in inventory["entries"]},
+        )
+        self.assertIsNone(
+            core_module._equipment_review_semantic_error(
+                preflight["equipment_review_record"],
+                require_toml=True,
+                trusted_workflow_inventory=trusted_inventory,
+            )
+        )
+
+    def test_full_breadth_plan_with_missing_roots_remains_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo_path = workspace_path / "selected-repo"
+            repo_path.mkdir()
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                result = dry_run_migration_plan(plan)
+
+        self.assertEqual(result["outcome"], "completed")
+        self.assertFalse(result["can_execute"])
+        self.assertNotIn(
+            "invalid_artifact_semantics",
+            {item["code"] for item in result.get("diagnostics", [])},
+        )
+
+    def test_full_breadth_replay_ignores_generated_fork_ops_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            generated_root = workspace_path / "repos" / "tuned-limine"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                config_path = generated_root / CONFIG_RELATIVE_PATH
+                review_path = (
+                    generated_root / core_module.EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH
+                )
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                review_path.parent.mkdir(parents=True, exist_ok=True)
+                config_path.write_text("# generated Fork Ops config\n")
+                review_path.write_text("# generated Fork Ops equipment review\n")
+
+                result = dry_run_migration_plan(plan, repo_path)
+
+        self.assertEqual(result["outcome"], "completed")
+        self.assertNotIn(
+            "invalid_artifact_semantics",
+            {item["code"] for item in result.get("diagnostics", [])},
+        )
+
+    def test_migration_plan_replay_refuses_unknown_contract_modes(self) -> None:
+        mutations = (
+            ("scan_profile", "unknown-profile"),
+            (
+                "workflow_run_mode",
+                {
+                    "default": "wet-run",
+                    "available": ["wet-run"],
+                    "wet_run_policy": "always",
+                    "drift_policy": "ignore",
+                    "override_policy": "allow",
+                },
+            ),
+        )
+        for field_name, value in mutations:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                plan = generate_migration_plan(repo_path)
+                plan[field_name] = value
+
+                dry_run = dry_run_migration_plan(plan, repo_path)
+                execution = execute_migration_plan(plan, repo_path)
+
+                self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+                for result in (dry_run, execution):
+                    self.assertEqual(result["outcome"], "refused")
+                    self.assertEqual(
+                        result["diagnostics"][0]["code"],
+                        "invalid_artifact_semantics",
+                    )
+                self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_full_breadth_pending_equipment_keeps_activation_unassessed(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "selected-repo"
+            source = (
+                repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            )
+            source.parent.mkdir(parents=True)
+            source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                result = dry_run_migration_plan(plan, repo_path)
+
+        self.assertTrue(result["can_execute"])
+        self.assertTrue(
+            any(
+                item["decision_status"] != "reviewed"
+                for item in result["equipment_migration_preflight"][
+                    "equipment_groups"
+                ]
+            )
+        )
+        self.assertEqual(result["activation_readiness"]["value"], "unassessed")
+        self.assertIn(
+            "Review current equipment decisions before activation.",
+            result["activation_limits"],
+        )
+
+    def test_full_breadth_replay_refuses_newly_discovered_workflow_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                new_source = (
+                    workspace_path
+                    / ".agents"
+                    / "skills"
+                    / "late-publication"
+                    / "SKILL.md"
+                )
+                new_source.parent.mkdir()
+                new_source.write_text(
+                    "# Late Publication\n\nReview bot evidence gates publication closeout.\n"
+                )
+
+                dry_run = dry_run_migration_plan(plan, repo_path)
+                execution = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_full_breadth_replay_requires_one_accounting_row_per_live_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                record = plan["equipment_review_record"]
+                removed = next(
+                    item
+                    for item in record["accounting_records"]
+                    if item["source_scope"] != "repo-local"
+                    and item["source_entry_id"]
+                )
+                record["accounting_records"].remove(removed)
+                record["follow_up_candidates"] = (
+                    core_module._accounting_follow_up_candidates(
+                        record["accounting_records"]
+                    )
+                )
+                record["toml"] = core_module._equipment_review_record_toml(record)
+
+                dry_run = dry_run_migration_plan(plan, repo_path)
+                execution = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_full_breadth_replay_derives_completeness_from_fresh_inventory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                too_large = workspace_path / "repos" / "tuned-limine" / "too-large.md"
+                too_large.write_text("x" * (core_module.MAX_FILE_BYTES + 1))
+                fresh_inventory = build_workflow_migration_inventory(
+                    scan_profile="full-breadth"
+                )
+                self.assertFalse(fresh_inventory["complete"])
+                plan["scan_accounting"]["workflow_inventory"] = copy.deepcopy(
+                    fresh_inventory["scan_accounting"]
+                )
+
+                dry_run = dry_run_migration_plan(plan, repo_path)
+                execution = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_full_breadth_replay_refuses_changed_source_root_status(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            drifted_root = workspace_path / "repos" / "tuned-limine"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                drifted_root.rmdir()
+                drifted_root.symlink_to(workspace_path / ".agents" / "skills")
+
+                dry_run = dry_run_migration_plan(plan, repo_path)
+                execution = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_custom_plan_cannot_self_authorize_external_discovery_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            record["unassessed_equipment_areas"] = list[dict[str, Any]]()
+            record["accounting_records"] = list[dict[str, Any]]()
+            record["follow_up_candidates"] = list[dict[str, Any]]()
+            record["discovery_scopes"].append(
+                {
+                    "id": "scope:self-certified",
+                    "kind": "user-global",
+                    "root_role": "user-global",
+                    "path": "/never-scanned",
+                    "status": "scanned",
+                    "equipment_group_count": 0,
+                    "snapshot_sha256": core_module._equipment_scope_snapshot_sha256(
+                        [],
+                        "user-global",
+                        "/never-scanned",
+                    ),
+                }
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+
+            dry_run = dry_run_migration_plan(plan, repo_path)
+            execution = execute_migration_plan(plan, repo_path)
+
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(execution["mutation_state"], "not_started")
+
+    def test_full_breadth_replay_rejects_consistently_forged_workflow_coverage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "repos" / "lemonade"
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                record = plan["equipment_review_record"]
+                accounting = next(
+                    item
+                    for item in record["accounting_records"]
+                    if item["target_workflow_id"] == "publication-closeout"
+                )
+                evidence = next(
+                    item
+                    for item in record["evidence"]
+                    if item.get("workflow_source_entry_id")
+                    == accounting["source_entry_id"]
+                )
+                equipment = next(
+                    item
+                    for item in record["equipment"]
+                    if item["source_scope"] == accounting["source_scope"]
+                    and item["source_root"] == accounting["source_root"]
+                    and item["source_path"] == accounting["source_path"]
+                )
+                accounting.update(
+                    {
+                        "accounting_status": "implemented_workflow",
+                        "coverage_status": "covered-implemented",
+                        "target_workflow_id": "workflow-migration-inventory",
+                        "reason": (
+                            "workflow-migration-inventory is implemented in Fork Ops."
+                        ),
+                        "next_action": (
+                            "Keep coverage evidence visible in inventory output."
+                        ),
+                        "follow_up_id": "",
+                    }
+                )
+                evidence.update(
+                    {
+                        "workflow_coverage_status": "covered-implemented",
+                        "workflow_catalog_target": "workflow-migration-inventory",
+                    }
+                )
+                equipment["disposition"] = "migrate_to_fork_ops"
+                record["follow_up_candidates"] = (
+                    core_module._accounting_follow_up_candidates(
+                        record["accounting_records"]
+                    )
+                )
+                record["toml"] = core_module._equipment_review_record_toml(record)
+                plan["accounting_records"] = copy.deepcopy(
+                    record["accounting_records"]
+                )
+                plan["follow_up_candidates"] = copy.deepcopy(
+                    record["follow_up_candidates"]
+                )
+                preflight = plan["equipment_migration_preflight"]
+                for field_name in (
+                    "evidence",
+                    "accounting_records",
+                    "follow_up_candidates",
+                ):
+                    preflight[field_name] = copy.deepcopy(record[field_name])
+                for summary in (plan["summary"], preflight["summary"]):
+                    summary["accounting_record_count"] = len(
+                        record["accounting_records"]
+                    )
+                    summary["follow_up_candidate_count"] = len(
+                        record["follow_up_candidates"]
+                    )
+
+                result = dry_run_migration_plan(plan, repo_path)
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(
+            result["diagnostics"][0]["code"],
+            "invalid_artifact_semantics",
+        )
+        self.assertIn(
+            "source bytes",
+            result["diagnostics"][0]["detail"]["error"],
+        )
+
+    def test_migration_plan_replay_uses_review_as_authoritative_accounting_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            plan = generate_migration_plan(Path(repo))
+            expected_accounting = copy.deepcopy(
+                plan["equipment_review_record"]["accounting_records"]
+            )
+            expected_follow_ups = copy.deepcopy(
+                plan["equipment_review_record"]["follow_up_candidates"]
+            )
+            plan["accounting_records"] = [{"forged": "yes"}]
+            plan["follow_up_candidates"] = [{"forged": "yes"}]
+            plan["summary"]["accounting_record_count"] = 1
+            plan["summary"]["follow_up_candidate_count"] = 1
+
+            result = dry_run_migration_plan(plan)
+
+        self.assertEqual(result["accounting_records"], expected_accounting)
+        self.assertEqual(result["follow_up_candidates"], expected_follow_ups)
+        self.assertNotIn({"forged": "yes"}, result["accounting_records"])
+
+    def test_migration_plan_replay_normalizes_equipment_groups_from_review(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/local-policy.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "A fork-local upstream policy remains authoritative.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            group = next(
+                item
+                for item in plan["equipment_migration_preflight"]["equipment_groups"]
+                if item["source_path"] == "docs/agents/local-policy.md"
+            )
+            group["decision_status"] = "reviewed"
+            group["disposition"] = "retain_authoritative_owner"
+            group["facets"] = [{"forged": "facet"}]
+            group["compatibility_entries"] = [{"forged": "compatibility"}]
+            plan["equipment_migration_preflight"]["summary"] = "forged-summary"
+            plan["equipment_migration_preflight"]["forged_authorization"] = "ready"
+            plan["equipment_migration_preflight"]["activation_readiness"] = {
+                "value": "ready",
+                "evidence_ids": ["forged"],
+                "subject": "workflow:fork-authority-migration",
+                "derivation_rule": (
+                    "activation.named_operation_authority_equipment_and_blockers"
+                ),
+            }
+
+            forged_result = dry_run_migration_plan(copy.deepcopy(plan), repo_path)
+            _mark_equipment_reviewed_retain(
+                plan,
+                "docs/agents/local-policy.md",
+            )
+            reviewed_result = dry_run_migration_plan(plan, repo_path)
+
+        forged_continuity = next(
+            item
+            for item in forged_result["operational_continuity"]
+            if item["source_path"] == "docs/agents/local-policy.md"
+        )
+        reviewed_continuity = next(
+            item
+            for item in reviewed_result["operational_continuity"]
+            if item["source_path"] == "docs/agents/local-policy.md"
+        )
+        self.assertNotEqual(forged_continuity["value"], "continuous")
+        self.assertEqual(reviewed_continuity["value"], "continuous")
+        normalized_group = next(
+            item
+            for item in reviewed_result["equipment_migration_preflight"][
+                "equipment_groups"
+            ]
+            if item["source_path"] == "docs/agents/local-policy.md"
+        )
+        self.assertEqual(normalized_group["decision_status"], "reviewed")
+        self.assertEqual(normalized_group["disposition"], "retain_authoritative_owner")
+        self.assertNotIn({"forged": "facet"}, normalized_group["facets"])
+        self.assertNotIn(
+            {"forged": "compatibility"},
+            normalized_group["compatibility_entries"],
+        )
+        [source_facet] = normalized_group["facets"]
+        self.assertEqual(
+            source_facet["equipment_disposition"],
+            "retain_authoritative_owner",
+        )
+        nested_preflight = reviewed_result["equipment_migration_preflight"]
+        self.assertIsInstance(nested_preflight["summary"], dict)
+        self.assertNotIn("forged_authorization", nested_preflight)
+        equipment_state_evidence = next(
+            item
+            for item in reviewed_result["evidence"]
+            if item["id"] == "equipment.preflight"
+        )
+        self.assertEqual(
+            equipment_state_evidence["pending_equipment_decision_count"],
+            0,
+        )
+        for state_name in (
+            "activation_readiness",
+            "replacement_coverage",
+            "operational_continuity",
+            "activation_blocked_by",
+            "activation_limits",
+        ):
+            with self.subTest(state_name=state_name):
+                self.assertEqual(
+                    nested_preflight[state_name],
+                    reviewed_result[state_name],
+                )
+
+    def test_migration_plan_replay_recomputes_equipment_preflight_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            plan = generate_migration_plan(Path(repo))
+            record = plan["equipment_review_record"]
+            extra_area = {
+                "id": "unassessed:operator-global-second",
+                "scope": "operator-global",
+                "reason": "A second distinct user-global area remains unassessed.",
+                "activation_impact": "Do not claim replacement coverage.",
+            }
+            record["unassessed_equipment_areas"].append(extra_area)
+            record["accounting_records"].append(
+                core_module._accounting_record_from_unassessed_area(extra_area)
+            )
+            record["follow_up_candidates"] = (
+                core_module._accounting_follow_up_candidates(
+                    record["accounting_records"]
+                )
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+
+            result = dry_run_migration_plan(plan)
+
+        preflight = result["equipment_migration_preflight"]
+        summary = preflight["summary"]
+        for field_name, section_name in (
+            ("discovery_scope_count", "discovery_scopes"),
+            ("equipment_group_count", "equipment_groups"),
+            ("evidence_entry_count", "evidence"),
+            ("unassessed_equipment_area_count", "unassessed_equipment_areas"),
+            ("accounting_record_count", "accounting_records"),
+            ("follow_up_candidate_count", "follow_up_candidates"),
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertEqual(summary[field_name], len(preflight[section_name]))
+
     def test_workflow_migration_inventory_skips_arch_package_build_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             root = Path(workspace) / "arch-pkgs"
@@ -1599,9 +2307,10 @@ class ForkOpsCoreTests(unittest.TestCase):
 
             report = build_status_report(repo)
 
-        self.assertEqual(report["capability"]["highest_available"], "track-aware")
-        self.assertTrue(report["capability"]["levels"]["track-aware"]["available"])
-        self.assertFalse(report["capability"]["levels"]["sync-ready"]["available"])
+        authority = report["capability"]["authority_readiness"]
+        self.assertEqual(authority["highest_authority_ready"], "track-aware")
+        self.assertTrue(authority["levels"]["track-aware"]["ready"])
+        self.assertFalse(authority["levels"]["sync-ready"]["ready"])
 
     def test_sync_ready_requires_safe_boolean_policy_values(self) -> None:
         config = (
@@ -1624,10 +2333,11 @@ uncertainty_destination = "ask-human-operator"
 
             report = build_status_report(repo)
 
-        self.assertFalse(report["capability"]["levels"]["sync-ready"]["available"])
+        authority = report["capability"]["authority_readiness"]
+        self.assertFalse(authority["levels"]["sync-ready"]["ready"])
         self.assertIn(
             "sync_policy.preserve_commit_identity",
-            report["capability"]["levels"]["sync-ready"]["missing"],
+            authority["levels"]["sync-ready"]["missing"],
         )
 
     def test_schema_rejects_missing_required_foundation_sections(self) -> None:
@@ -1765,7 +2475,9 @@ uncertainty_destination = "ask-human-operator"
 
         codes = [item["code"] for item in report["diagnostics"]]
         self.assertIn("reference.unknown_release_channel", codes)
-        self.assertIsNone(report["capability"]["highest_available"])
+        self.assertIsNone(
+            report["capability"]["authority_readiness"]["highest_authority_ready"]
+        )
 
     def test_git_missing_remote_diagnostics_point_to_config_key(self) -> None:
         config = TRACK_AWARE_CONFIG.replace('name = "origin"', 'name = "fork-origin"', 1)
@@ -2057,7 +2769,8 @@ uncertainty_destination = "ask-human-operator"
             patch = propose_migration_config_patch(repo)
 
         self.assertEqual(patch["mode"], "non-mutating")
-        self.assertEqual(patch["operation"], "create")
+        self.assertEqual(patch["operation"], "migration-config-patch")
+        self.assertEqual(patch["action"], "create")
         self.assertEqual(patch["diagnostics"], [])
         config = patch["config"]
         self.assertEqual(config["repository"]["owner"], "nisavid")
@@ -2181,7 +2894,8 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(plan["summary"]["candidate_count"], 1)
         self.assertEqual(plan["summary"]["retained_source_material_count"], 1)
         self.assertIn("proposed_config_patch", plan)
-        self.assertEqual(plan["proposed_config_patch"]["operation"], "create")
+        self.assertEqual(plan["proposed_config_patch"]["operation"], "migration-config-patch")
+        self.assertEqual(plan["proposed_config_patch"]["action"], "create")
         self.assertEqual(plan["proposed_config_patch"]["target_path"], ".agents/fork-ops.toml")
         self.assertEqual(plan["proposed_config_patch"]["diagnostics"], [])
         evidence = plan["evidence"]
@@ -2250,7 +2964,8 @@ uncertainty_destination = "ask-human-operator"
             "equipment_review",
         )
         self.assertIn("activation_readiness", plan)
-        self.assertFalse(plan["activation_readiness"]["replacement_coverage_ready"])
+        self.assertNotIn("replacement_coverage_ready", plan["activation_readiness"])
+        self.assertTrue(plan["replacement_coverage"])
 
         migration_map = _migration_map_by_path(plan)
         self.assertEqual(
@@ -2362,12 +3077,51 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(record["artifact_kind"], "equipment_review")
         parsed = tomllib.loads(record["toml"])
         self.assertEqual(parsed["artifact_kind"], "equipment_review")
-        self.assertEqual(parsed["schema_version"], "0.1")
+        self.assertEqual(parsed["schema_version"], "1.0")
         self.assertEqual(parsed["default_onboarding_intent"], "migrate_toward_fork_ops")
         self.assertIn("equipment", parsed)
         self.assertTrue(parsed["equipment"])
         self.assertTrue(all("source_root" in entry for entry in parsed["equipment"]))
         self.assertTrue(parsed["evidence"][0]["content_sha256"])
+
+    def test_proposed_external_equipment_review_round_trips_as_unassessed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo_path = workspace_path / "fork"
+            source_root = workspace_path / "global-skills"
+            review_path = (
+                repo_path / core_module.EQUIPMENT_REVIEW_RECORD_RELATIVE_PATH
+            )
+            repo_path.mkdir()
+            source = source_root / "fork-review" / "SKILL.md"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "Review bot evidence gates publication closeout for this fork.\n"
+            )
+            preflight = build_equipment_migration_preflight(
+                repo_path,
+                [source_root],
+            )
+            review_path.parent.mkdir(parents=True)
+            review_path.write_text(preflight["equipment_review_record"]["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertTrue(equipment["valid"])
+        self.assertEqual(equipment["validation_status"], "semantically_validated")
+        self.assertFalse(equipment["accounting_claims_verified"])
+        self.assertEqual(
+            equipment["accounting_status_counts"],
+            core_module._empty_accounting_status_counts(),
+        )
+        self.assertFalse(
+            report["capability"]["accounting"]["accounting_claims_verified"]
+        )
+        self.assertNotEqual(equipment["activation_readiness"]["value"], "ready")
+        self.assertEqual(equipment["operational_continuity"]["value"], "unassessed")
 
     def test_equipment_preflight_full_breadth_accounts_global_and_repo_sources(
         self,
@@ -2446,7 +3200,7 @@ uncertainty_destination = "ask-human-operator"
         )
         covered_by_path = {
             entry["source_path"]: entry
-            for entry in preflight["activation_readiness"]["covered_behaviors"]
+            for entry in preflight["replacement_coverage"]
         }
         equipment_id = covered_by_path[source_path]["equipment_id"]
         groups_by_id = {group["id"]: group for group in preflight["equipment_groups"]}
@@ -2557,7 +3311,8 @@ uncertainty_destination = "ask-human-operator"
             "- Target section: deferred mappings",
             dry_run["migration_review_artifact"]["markdown"],
         )
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         skipped_by_path = {item["path"]: item for item in result["skipped_edits"]}
         self.assertEqual(
             skipped_by_path[".agents/skills/working-with-upstream-refs/SKILL.md"]["action"],
@@ -2678,7 +3433,7 @@ uncertainty_destination = "ask-human-operator"
             dry_run["equipment_review_record"]["target_path"],
             "docs/agents/fork-ops-equipment-review.toml",
         )
-        self.assertTrue(dry_run["activation_readiness"]["config_creation_ready"])
+        self.assertEqual(dry_run["activation_readiness"]["value"], "unassessed")
         self.assertEqual(dry_run["summary"]["file_edit_count"], 1)
         self.assertEqual(dry_run["accounting_records"], plan["accounting_records"])
         self.assertEqual(dry_run["follow_up_candidates"], plan["follow_up_candidates"])
@@ -2770,7 +3525,7 @@ uncertainty_destination = "ask-human-operator"
             ):
                 dry_run_migration_plan(plan)
 
-    def test_migration_dry_run_uses_embedded_repo_path_for_supplied_plan(self) -> None:
+    def test_migration_dry_run_uses_embedded_repo_path_when_repo_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
@@ -2778,9 +3533,36 @@ uncertainty_destination = "ask-human-operator"
             source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
             plan = generate_migration_plan(repo_path)
 
-            dry_run = dry_run_migration(".", plan=plan)
+            dry_run = dry_run_migration(plan=plan)
 
         self.assertEqual(dry_run["repo_path"], str(repo_path.resolve()))
+
+    def test_migration_dry_run_honors_selected_repo_for_supplied_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as other:
+            repo_path = Path(repo)
+            other_path = Path(other)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            new_path = other_path / ".agents/skills/new-equipment/SKILL.md"
+            new_path.parent.mkdir(parents=True)
+            new_path.write_text(
+                "A fork-local upstream release policy remains authoritative.\n"
+            )
+
+            expected = dry_run_migration_plan(plan, other_path)
+            direct = dry_run_migration(other_path, plan=plan)
+            mcp = fork_ops_migration_dry_run(str(other_path), migration_plan=plan)
+
+        for result in (direct, mcp):
+            self.assertEqual(result, expected)
+            self.assertEqual(result["repo_path"], str(other_path.resolve()))
+            self.assertFalse(result["can_execute"])
+            self.assertIn(
+                "migration_execution.equipment_scope_stale",
+                {item["code"] for item in result["blocked_steps"]},
+            )
 
     def test_migration_dry_run_reports_plan_blockers_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -2848,7 +3630,8 @@ uncertainty_destination = "ask-human-operator"
             "source-material replacement/removal",
             dry_run_authority["docs/agents/lemonade-local-policy.md"]["blocks"],
         )
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
         self.assertEqual(result["summary"]["blocker_count"], 0)
         result_authority = {item["path"]: item for item in result["retained_authority"]}
         self.assertTrue(result_authority["docs/agents/lemonade-local-policy.md"]["read_required"])
@@ -2876,10 +3659,7 @@ uncertainty_destination = "ask-human-operator"
             dry_run = dry_run_migration_plan(plan)
 
         self.assertTrue(dry_run["can_execute"])
-        self.assertEqual(
-            dry_run["activation_readiness"]["activation_readiness"],
-            "ready_for_guarded_config_creation_with_limits",
-        )
+        self.assertEqual(dry_run["activation_readiness"]["value"], "unassessed")
         self.assertNotEqual(
             blocked_dry_run["replayable_wet_run"]["plan_fingerprint"],
             dry_run["replayable_wet_run"]["plan_fingerprint"],
@@ -2917,19 +3697,57 @@ uncertainty_destination = "ask-human-operator"
                     operator_entry["source_root"] = "/tmp/global-skills"
                     operator_entry["decision_status"] = "reviewed"
                     operator_entry["disposition"] = "retain_authoritative_owner"
+                    operator_entry["evidence_ids"] = [
+                        "equipment-evidence:operator-global-local-policy"
+                    ]
                     operator_entry["reason_recommended"] = (
                         "Reviewed as retained operator-global equipment."
                     )
+                    plan["equipment_review_record"]["evidence"].append(
+                        {
+                            "id": "equipment-evidence:operator-global-local-policy",
+                            "equipment_id": "operator-global-local-policy",
+                            "source_scope": operator_entry["source_scope"],
+                            "source_root": operator_entry["source_root"],
+                            "source_path": operator_entry["source_path"],
+                            "source_kind": operator_entry["source_kind"],
+                            "content_sha256": operator_entry["content_sha256"],
+                        }
+                    )
                     plan["equipment_review_record"]["equipment"].append(operator_entry)
+                    plan["equipment_review_record"]["discovery_scopes"].append(
+                        {
+                            "id": "scope:operator-global-test",
+                            "kind": "operator-source-root",
+                            "root_role": "operator-provided",
+                            "path": "/tmp/global-skills",
+                            "status": "scanned",
+                            "equipment_group_count": 1,
+                            "snapshot_sha256": (
+                                core_module._equipment_scope_snapshot_sha256(
+                                    [operator_entry],
+                                    "operator-source-root",
+                                    "/tmp/global-skills",
+                                )
+                            ),
+                        }
+                    )
+                    plan["equipment_review_record"]["toml"] = (
+                        core_module._equipment_review_record_toml(
+                            plan["equipment_review_record"]
+                        )
+                    )
                     break
             else:
                 raise AssertionError("Missing retained policy equipment entry")
 
             dry_run = dry_run_migration_plan(plan)
 
-        blocker_codes = {item["code"] for item in dry_run["blocked_steps"]}
-        self.assertFalse(dry_run["can_execute"])
-        self.assertIn("semantic_coverage.incomplete", blocker_codes)
+        self.assertEqual(dry_run["outcome"], "refused")
+        self.assertEqual(
+            dry_run["diagnostics"][0]["code"],
+            "invalid_artifact_semantics",
+        )
 
     def test_reviewed_exclude_does_not_report_retained_authority(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -2948,11 +3766,31 @@ uncertainty_destination = "ask-human-operator"
             dry_run = dry_run_migration_plan(plan)
 
         retained_authority_paths = {item["path"] for item in dry_run["retained_authority"]}
-        self.assertIn(
+        self.assertNotIn(
             ".agents/skills/working-with-upstream-refs/SKILL.md",
             retained_authority_paths,
         )
         self.assertNotIn(".codex/process-notes.md", retained_authority_paths)
+
+    def test_proposed_migration_review_choice_is_not_retained_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+
+            proposed = {
+                entry["source_path"]
+                for entry in plan["migration_review_artifact"]["entries"]
+                if entry.get("review_decision", {}).get("status") != "reviewed"
+                and entry.get("review_decision", {}).get("proposed_choice") == "retain"
+            }
+            dry_run = dry_run_migration_plan(plan)
+
+        retained_authority_paths = {item["path"] for item in dry_run["retained_authority"]}
+        self.assertTrue(proposed)
+        self.assertTrue(proposed.isdisjoint(retained_authority_paths))
 
     def test_missing_review_decision_does_not_report_retained_authority(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -3031,7 +3869,7 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(exit_code, 0)
         self.assertEqual(cli_payload["narrative"], mcp_plan["narrative"])
         self.assertIn("read-only migration assessment", mcp_assessment["narrative"]["text"])
-        self.assertEqual(mcp_resolution["operation"], "blocker-resolution")
+        self.assertEqual(mcp_resolution["operation"], "migration-blocker-explanation")
 
     def test_cli_explains_migration_blocker_from_workflow_output(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -3059,7 +3897,7 @@ uncertainty_destination = "ask-human-operator"
 
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["operation"], "blocker-resolution")
+        self.assertEqual(payload["operation"], "migration-blocker-explanation")
         self.assertEqual(payload["blocker"]["code"], "semantic_coverage.incomplete")
         self.assertIn("docs/maintainers/upstream-notes.md", payload["narrative"]["text"])
 
@@ -3190,8 +4028,8 @@ uncertainty_destination = "ask-human-operator"
         self.assertEqual(show_exit, 0)
         self.assertEqual(validate_exit, 0)
         self.assertEqual(Path(init_output.getvalue().strip()).name, "fork-ops.toml")
-        self.assertEqual(shown["repository"]["owner"], "nisavid")
-        self.assertTrue(validated["required_level"]["available"])
+        self.assertEqual(shown["config"]["repository"]["owner"], "nisavid")
+        self.assertTrue(validated["required_level"]["authority_ready"])
 
     def test_cli_config_init_write_refuses_a_target_parent_symlink_outside_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
@@ -3221,7 +4059,7 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertFalse((outside_path / "fork-ops.toml").exists())
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 1)
         self.assertIn("outside the repository", error.getvalue())
 
     def test_config_initialization_reports_guarded_mutation_outcome(self) -> None:
@@ -3240,7 +4078,8 @@ uncertainty_destination = "ask-human-operator"
             config_text = (repo_path / CONFIG_RELATIVE_PATH).read_text()
 
         self.assertEqual(result["operation"], "config-initialization")
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
         self.assertEqual(result["applied_edits"][0]["path"], ".agents/fork-ops.toml")
         self.assertEqual(
             result["applied_edits"][0]["content_sha256"],
@@ -3248,7 +4087,7 @@ uncertainty_destination = "ask-human-operator"
         )
         self.assertEqual(result["blockers"], [])
         self.assertEqual(result["verification"]["status"], "passed")
-        self.assertTrue(result["verification"]["required_level_available"])
+        self.assertTrue(result["verification"]["required_level_ready"])
 
     def test_config_initialization_does_not_follow_parent_swapped_after_path_check(
         self,
@@ -3284,7 +4123,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertFalse((outside_path / CONFIG_RELATIVE_PATH.name).exists())
             self.assertTrue((displaced_parent / CONFIG_RELATIVE_PATH.name).is_file())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
@@ -3324,7 +4164,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertFalse((Path(outside) / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertFalse(result["mutation"]["occurred"])
         self.assertEqual(
             result["blockers"][0]["code"],
@@ -3361,7 +4202,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((replacement_repo / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
     def test_config_initialization_rejects_repository_replaced_after_root_open(
@@ -3405,7 +4247,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertFalse(result["mutation"]["occurred"])
         self.assertEqual(
             result["blockers"][0]["code"],
@@ -3433,7 +4276,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
 
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
 
     def test_config_initialization_preserves_bound_config_after_repository_root_swap(
         self,
@@ -3477,7 +4321,8 @@ uncertainty_destination = "ask-human-operator"
                 (displaced_repo / CONFIG_RELATIVE_PATH).read_text(),
             )
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
 
     def test_config_initialization_preserves_parent_replacement_after_failed_create(
@@ -3513,7 +4358,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertTrue(parent_path.is_dir())
             self.assertTrue(displaced_parent.is_dir())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
 
@@ -3563,7 +4409,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
 
         self.assertEqual(parent_open_attempts, 0)
-        self.assertEqual(first_result["status"], "applied_unverified")
+        self.assertEqual(first_result["outcome"], "failed")
+        self.assertEqual(first_result["mutation_state"], "applied_unverified")
         self.assertTrue(first_result["mutation"]["occurred"])
         self.assertEqual(first_result["mutation"]["target_state"], "not-created")
         self.assertEqual(first_result["mutation"]["rollback_status"], "not-needed")
@@ -3572,7 +4419,8 @@ uncertainty_destination = "ask-human-operator"
             first_result["blockers"][0]["code"],
             "migration_execution.target_parent_unverified",
         )
-        self.assertEqual(second_result["status"], "applied")
+        self.assertEqual(second_result["outcome"], "completed")
+        self.assertEqual(second_result["mutation_state"], "applied")
 
     def test_config_initialization_closes_parent_descriptor_when_parent_fstat_fails(
         self,
@@ -3603,7 +4451,8 @@ uncertainty_destination = "ask-human-operator"
             after_fds = len(list(Path("/proc/self/fd").iterdir()))
 
         self.assertEqual(after_fds, before_fds)
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertFalse(result["mutation"]["occurred"])
 
     def test_config_initialization_does_not_claim_rollback_when_target_is_renamed(
@@ -3620,8 +4469,10 @@ uncertainty_destination = "ask-human-operator"
                 target_path.rename(renamed_path)
                 return {
                     "capability": {
-                        "highest_available": None,
-                        "levels": {"track-aware": {"available": False}},
+                        "authority_readiness": {
+                            "highest_authority_ready": None,
+                            "levels": {"track-aware": {"ready": False}},
+                        },
                     },
                     "diagnostics": [{"severity": "error", "code": "test.renamed"}],
                 }
@@ -3638,7 +4489,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertFalse(target_path.exists())
             self.assertIn('owner = "nisavid"', renamed_path.read_text())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertEqual(
             result["blockers"][-1]["reason_code"],
@@ -3683,7 +4535,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertIn('owner = "nisavid"', displaced_target.read_text())
             self.assertFalse((Path(outside) / CONFIG_RELATIVE_PATH.name).exists())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
@@ -3693,8 +4546,10 @@ uncertainty_destination = "ask-human-operator"
     ) -> None:
         failed_report = {
             "capability": {
-                "highest_available": "scoutable",
-                "levels": {"track-aware": {"available": False}},
+                "authority_readiness": {
+                    "highest_authority_ready": "scoutable",
+                    "levels": {"track-aware": {"ready": False}},
+                },
             },
             "diagnostics": [{"severity": "error", "code": "test.verification_failed"}],
         }
@@ -3719,7 +4574,8 @@ uncertainty_destination = "ask-human-operator"
             )
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
@@ -3730,8 +4586,10 @@ uncertainty_destination = "ask-human-operator"
     ) -> None:
         failed_report = {
             "capability": {
-                "highest_available": "scoutable",
-                "levels": {"track-aware": {"available": False}},
+                "authority_readiness": {
+                    "highest_authority_ready": "scoutable",
+                    "levels": {"track-aware": {"ready": False}},
+                },
             },
             "diagnostics": [{"severity": "error", "code": "test.verification_failed"}],
         }
@@ -3773,7 +4631,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertEqual(target_path.read_text(), "concurrent writer\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
@@ -3822,7 +4681,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertEqual(target_path.read_text(), "concurrent writer\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertEqual(
             result["verification"]["target"]["identity_matches"],
@@ -3865,7 +4725,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue(target_path.read_bytes().startswith(b"X"))
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertFalse(result["verification"]["target"]["content_unchanged"])
 
@@ -3909,7 +4770,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue(target_path.read_bytes().startswith(b"Y"))
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertFalse(result["verification"]["target"]["content_unchanged"])
 
@@ -3947,7 +4809,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue((displaced_parent / CONFIG_RELATIVE_PATH.name).is_file())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertFalse(result["verification"]["target"]["parent_identity_matches"])
 
     def test_config_initialization_detects_repository_swapped_during_final_verification(
@@ -3985,7 +4848,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertTrue((displaced_repo / CONFIG_RELATIVE_PATH).is_file())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertFalse(result["verification"]["target"]["repository_identity_matches"])
 
     def test_config_initialization_reports_applied_unverified_after_target_tamper(self) -> None:
@@ -3999,8 +4863,10 @@ uncertainty_destination = "ask-human-operator"
                 target_path.write_text("tampered after create\n")
                 return {
                     "capability": {
-                        "highest_available": None,
-                        "levels": {"track-aware": {"available": False}},
+                        "authority_readiness": {
+                            "highest_authority_ready": None,
+                            "levels": {"track-aware": {"ready": False}},
+                        },
                     },
                     "diagnostics": [{"severity": "error", "code": "test.tampered"}],
                 }
@@ -4016,7 +4882,8 @@ uncertainty_destination = "ask-human-operator"
 
             self.assertEqual(target_path.read_text(), "tampered after create\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
@@ -4038,8 +4905,10 @@ uncertainty_destination = "ask-human-operator"
                 target_path.symlink_to(unrelated_path)
                 return {
                     "capability": {
-                        "highest_available": None,
-                        "levels": {"track-aware": {"available": False}},
+                        "authority_readiness": {
+                            "highest_authority_ready": None,
+                            "levels": {"track-aware": {"ready": False}},
+                        },
                     },
                     "diagnostics": [{"severity": "error", "code": "test.symlink_swap"}],
                 }
@@ -4056,7 +4925,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertTrue(target_path.is_symlink())
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
 
     def test_config_initialization_reports_applied_unverified_when_target_is_unreadable(
@@ -4099,7 +4969,8 @@ uncertainty_destination = "ask-human-operator"
             self.assertIn('owner = "nisavid"', target_path.read_text())
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["target_state"], "unverified")
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
@@ -4131,7 +5002,8 @@ uncertainty_destination = "ask-human-operator"
             )
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["mutation"]["rollback_status"], "unsafe")
         self.assertEqual(
@@ -4173,9 +5045,13 @@ uncertainty_destination = "ask-human-operator"
             self.assertEqual(target_path.read_text(), "concurrent writer\n")
             self.assertEqual(unrelated_path.read_text(), "unrelated\n")
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertFalse(result["mutation"]["occurred"])
-        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+        self.assertIn(
+            "migration_execution.target_exists",
+            {item["code"] for item in result["blockers"]},
+        )
 
     def test_config_initialization_refuses_existing_file_and_symlink_targets(self) -> None:
         target_kinds = ("file", "symlink")
@@ -4199,7 +5075,8 @@ uncertainty_destination = "ask-human-operator"
                     upstream_name="demo",
                 )
 
-                self.assertEqual(result["status"], "blocked")
+                self.assertEqual(result["outcome"], "blocked")
+                self.assertEqual(result["mutation_state"], "not_started")
                 self.assertFalse(result["mutation"]["occurred"])
                 self.assertEqual(unrelated_path.read_text(), "unrelated\n")
                 if target_kind == "file":
@@ -4229,8 +5106,10 @@ uncertainty_destination = "ask-human-operator"
                         _target_path.write_text("changed after create\n")
                     return {
                         "capability": {
-                            "highest_available": None,
-                            "levels": {"track-aware": {"available": False}},
+                            "authority_readiness": {
+                                "highest_authority_ready": None,
+                                "levels": {"track-aware": {"ready": False}},
+                            },
                         },
                         "diagnostics": [{"severity": "error", "code": "test.failed"}],
                     }
@@ -4257,7 +5136,7 @@ uncertainty_destination = "ask-human-operator"
                         ]
                     )
 
-                self.assertEqual(exit_code, 2)
+                self.assertEqual(exit_code, 1)
                 self.assertIn("remains unverified", error.getvalue())
                 self.assertIn(str(target_path), error.getvalue())
                 if scenario == "tampered":
@@ -4292,7 +5171,7 @@ uncertainty_destination = "ask-human-operator"
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH.parent).is_dir())
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 1)
         self.assertIn("created the .agents directory", error.getvalue())
         self.assertIn("rerun the command", error.getvalue())
         self.assertNotIn("could not be safely rolled back", error.getvalue())
@@ -4411,101 +5290,236 @@ uncertainty_destination = "ask-human-operator"
 
         self.assertEqual(raw["raw"], TRACK_AWARE_CONFIG)
         self.assertEqual(normalized["config"]["repository"]["owner"], "nisavid")
-        self.assertTrue(validation["required_level"]["available"])
-        self.assertTrue(capability["levels"]["track-aware"]["available"])
+        self.assertTrue(validation["required_level"]["authority_ready"])
+        self.assertTrue(
+            capability["authority_readiness"]["levels"]["track-aware"]["ready"]
+        )
         self.assertEqual(schema, schema_json())
 
     def test_capability_report_includes_equipment_review_record_summary(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
             review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
             config_path.parent.mkdir(parents=True)
-            review_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
             config_path.write_text(TRACK_AWARE_CONFIG)
-            review_path.write_text(
-                """artifact_kind = "equipment_review"
-schema_version = "0.1"
-status = "reviewed"
-default_onboarding_intent = "migrate_toward_fork_ops"
-
-[[equipment]]
-id = "equipment:local-policy:decision"
-equipment_id = "equipment:local-policy"
-identifier = "repo-local:docs/agents/local-policy.md"
-source_scope = "repo-local"
-source_path = "docs/agents/local-policy.md"
-source_kind = "doc"
-content_sha256 = "abc123"
-equipment_classification = "fork_ops_owner"
-classification_confidence = "high"
-disposition = "retain_authoritative_owner"
-decision_status = "reviewed"
-activation_impact = "Retained owner remains authoritative."
-evidence_ids = ["equipment-evidence:local-policy"]
-reason_recommended = "Reviewed as retained authoritative equipment."
-"""
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
             )
+            plan = generate_migration_plan(repo_path)
+            _mark_equipment_reviewed_retain(
+                plan, "docs/agents/lemonade-local-policy.md"
+            )
+            expected_equipment_count = len(
+                plan["equipment_review_record"]["equipment"]
+            )
+            expected_accounting_count = len(
+                plan["equipment_review_record"]["accounting_records"]
+            )
+            review_path.write_text(plan["equipment_review_record"]["toml"])
 
             report = build_status_report(repo_path, include_config=False)
 
         equipment = report["capability"]["equipment_review"]
         self.assertTrue(equipment["exists"])
         self.assertTrue(equipment["valid"])
-        self.assertEqual(equipment["equipment_count"], 1)
-        self.assertEqual(report["capability"]["accounting"]["accounting_record_count"], 0)
+        self.assertEqual(equipment["equipment_count"], expected_equipment_count)
+        self.assertEqual(
+            report["capability"]["accounting"]["accounting_record_count"],
+            expected_accounting_count,
+        )
         self.assertEqual(equipment["reviewed_equipment_count"], 1)
         self.assertEqual(
             equipment["retained_authority_paths"],
-            ["docs/agents/local-policy.md"],
+            ["docs/agents/lemonade-local-policy.md"],
         )
 
-    def test_capability_report_summarizes_equipment_accounting_records(self) -> None:
+    def test_capability_report_rejects_unsupported_equipment_accounting_claims(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
-            config_path = repo_path / CONFIG_RELATIVE_PATH
             review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
-            config_path.parent.mkdir(parents=True)
             review_path.parent.mkdir(parents=True)
-            config_path.write_text(TRACK_AWARE_CONFIG)
-            review_path.write_text(
-                """artifact_kind = "equipment_review"
-schema_version = "0.1"
-status = "reviewed"
-default_onboarding_intent = "migrate_toward_fork_ops"
-
-[[accounting_records]]
-id = "accounting:review-policy"
-source_scope = "repo-local"
-source_root = "/tmp/fork"
-source_path = "docs/agents/review-policy.md"
-accounting_status = "planned_workflow"
-coverage_status = "cataloged-not-implemented"
-target_surface_type = "workflow"
-target_workflow_id = "publication-closeout"
-reason = "Publication closeout is cataloged but not implemented."
-next_action = "Track publication closeout follow-up."
-follow_up_id = "follow-up:publication-closeout"
-
-[[follow_up_candidates]]
-id = "follow-up:publication-closeout"
-accounting_record_id = "accounting:review-policy"
-audience_scope = "team-wide"
-status = "candidate"
-target_tracker = "github-issues"
-title = "Implement publication closeout"
-reason = "Publication closeout is cataloged but not implemented."
-next_action = "Create or link a durable GitHub issue."
-"""
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            record["accounting_records"].append(
+                {
+                    "id": "accounting:forged",
+                    "accounting_status": "implemented_workflow",
+                }
             )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.write_text(record["toml"])
 
             report = build_status_report(repo_path, include_config=False)
 
-        accounting = report["capability"]["accounting"]
-        self.assertEqual(accounting["accounting_record_count"], 1)
-        self.assertEqual(accounting["follow_up_candidate_count"], 1)
-        self.assertEqual(accounting["status_counts"]["planned_workflow"], 1)
-        self.assertFalse(accounting["replacement_coverage_ready"])
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertIn("accounting", equipment["error"])
+
+    def test_equipment_accounting_cannot_relabel_source_as_implemented_workflow(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            accounting = next(
+                item
+                for item in record["accounting_records"]
+                if item["source_kind"] != "unassessed-area"
+            )
+            accounting.update(
+                {
+                    "source_entry_id": core_module._workflow_inventory_entry_id(
+                        repo_path,
+                        source_path,
+                    ),
+                    "material_scope": "reusable-workflow-material",
+                    "accounting_status": "implemented_workflow",
+                    "coverage_status": "covered-implemented",
+                    "target_surface_type": "workflow",
+                    "target_workflow_id": "workflow-migration-inventory",
+                    "target_path": "",
+                    "reason": "workflow-migration-inventory is implemented in Fork Ops.",
+                    "next_action": "Keep coverage evidence visible in inventory output.",
+                    "follow_up_id": "",
+                }
+            )
+            record["unassessed_equipment_areas"] = [
+                area
+                for area in record["unassessed_equipment_areas"]
+                if area.get("path") != "docs/agents/lemonade-local-policy.md"
+            ]
+            record["follow_up_candidates"] = (
+                core_module._accounting_follow_up_candidates(
+                    record["accounting_records"]
+                )
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+
+            error = core_module._equipment_review_semantic_error(record)
+            record["equipment"][0]["disposition"] = "migrate_to_fork_ops"
+            record["evidence"][0].update(
+                {
+                    "workflow_source_entry_id": accounting["source_entry_id"],
+                    "workflow_material_scope": accounting["material_scope"],
+                    "workflow_coverage_status": accounting["coverage_status"],
+                    "workflow_catalog_target": accounting["target_workflow_id"],
+                }
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            consistent_error = core_module._equipment_review_semantic_error(record)
+
+        self.assertIsNotNone(error)
+        self.assertIn("canonical discovery projection", str(error))
+        self.assertEqual(
+            consistent_error,
+            (
+                "repo-local migration evidence cannot self-certify a workflow "
+                "inventory projection"
+            ),
+        )
+
+    def test_equipment_accounting_cannot_swap_same_extent_workflow_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo_path = workspace_path / "selected-repo"
+            source_root = workspace_path / "operator-source"
+            repo_path.mkdir()
+            source_root.mkdir()
+            (source_root / "review.md").write_text(
+                "PR review bot policy and review threads publication closeout.\n"
+            )
+            record = build_equipment_migration_preflight(
+                repo_path,
+                [source_root],
+            )["equipment_review_record"]
+            trusted_inventory = build_workflow_migration_inventory([source_root])
+            accounting = next(
+                item
+                for item in record["accounting_records"]
+                if item["target_workflow_id"] == "publication-closeout"
+            )
+            accounting["target_workflow_id"] = "upstream-sync-planning"
+            accounting["reason"] = (
+                "upstream-sync-planning is cataloged but not implemented."
+            )
+            accounting["follow_up_id"] = core_module._follow_up_id_for_accounting(
+                accounting["source_scope"],
+                accounting["source_root"],
+                accounting["source_path"],
+                accounting["target_workflow_id"],
+            )
+            record["follow_up_candidates"] = (
+                core_module._accounting_follow_up_candidates(
+                    record["accounting_records"]
+                )
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+
+            error = core_module._equipment_review_semantic_error(
+                record,
+                require_toml=True,
+                trusted_workflow_inventory=trusted_inventory,
+            )
+            evidence = next(
+                item
+                for item in record["evidence"]
+                if item.get("workflow_source_entry_id")
+                == accounting["source_entry_id"]
+            )
+            evidence["workflow_catalog_target"] = accounting["target_workflow_id"]
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            consistent_error = core_module._equipment_review_semantic_error(
+                record,
+                require_toml=True,
+                trusted_workflow_inventory=trusted_inventory,
+            )
+
+        self.assertEqual(
+            error,
+            "workflow accounting target workflow must match canonical coverage evidence",
+        )
+        self.assertEqual(
+            consistent_error,
+            "workflow accounting discovery evidence no longer matches source bytes",
+        )
+
+    def test_equipment_accounting_requires_one_canonical_record_per_unassessed_area(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            record = generate_migration_plan(Path(repo))["equipment_review_record"]
+            record["unassessed_equipment_areas"].append(
+                {
+                    "id": "unassessed:user-global-second",
+                    "scope": "user-global",
+                    "reason": "A second distinct user-global area remains unassessed.",
+                    "activation_impact": "Do not claim replacement coverage.",
+                }
+            )
+            record["accounting_records"] = [
+                {
+                    "id": "accounting:placeholder",
+                    "accounting_status": "unassessed",
+                    "source_scope": "user-global",
+                }
+            ]
+            record["toml"] = core_module._equipment_review_record_toml(record)
+
+            error = core_module._equipment_review_semantic_error(record)
+
+        self.assertIsNotNone(error)
+        self.assertIn("accounting", str(error))
 
     def test_capability_report_includes_equipment_review_when_config_missing(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4514,7 +5528,7 @@ next_action = "Create or link a durable GitHub issue."
             review_path.parent.mkdir(parents=True)
             review_path.write_text(
                 """artifact_kind = "equipment_review"
-schema_version = "0.1"
+schema_version = "1.0"
 status = "reviewed"
 default_onboarding_intent = "migrate_toward_fork_ops"
 """
@@ -4525,51 +5539,742 @@ default_onboarding_intent = "migrate_toward_fork_ops"
         self.assertFalse(report["config_exists"])
         equipment = report["capability"]["equipment_review"]
         self.assertTrue(equipment["exists"])
-        self.assertTrue(equipment["valid"])
+        self.assertFalse(equipment["valid"])
+        self.assertEqual(equipment["validation_status"], "shallow")
+        self.assertNotIn("activation_readiness", equipment)
 
-    def test_equipment_review_pending_decisions_take_activation_precedence(self) -> None:
+    def test_proposed_equipment_review_never_claims_activation_ready(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
             config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / "docs/agents/local-policy.md"
             review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
             config_path.parent.mkdir(parents=True)
-            review_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
             config_path.write_text(TRACK_AWARE_CONFIG)
-            review_path.write_text(
-                """artifact_kind = "equipment_review"
-schema_version = "0.1"
-status = "proposed"
-default_onboarding_intent = "migrate_toward_fork_ops"
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            decision = next(
+                item
+                for item in record["equipment"]
+                if item["source_path"] == "docs/agents/local-policy.md"
+            )
+            decision["decision_status"] = "reviewed"
+            decision["disposition"] = "retain_authoritative_owner"
+            _mark_equipment_accounting_retained(
+                record,
+                "docs/agents/local-policy.md",
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.write_text(record["toml"])
 
-[[unassessed_equipment_areas]]
-id = "unassessed:operator-global"
-source_scope = "operator-global"
-reason = "Operator-global skill roots were not scanned."
+            report = build_status_report(repo_path, include_config=False)
 
-[[equipment]]
-id = "equipment:local-policy:decision"
-equipment_id = "equipment:local-policy"
-identifier = "repo-local:docs/agents/local-policy.md"
-source_scope = "repo-local"
-source_path = "docs/agents/local-policy.md"
-source_kind = "doc"
-content_sha256 = "abc123"
-equipment_classification = "fork_ops_owner"
-classification_confidence = "high"
-disposition = "retain_authoritative_owner"
-decision_status = "proposed"
-activation_impact = "Retained owner remains authoritative."
-evidence_ids = ["equipment-evidence:local-policy"]
-reason_recommended = "Review before activation."
-"""
+        equipment = report["capability"]["equipment_review"]
+        self.assertTrue(equipment["valid"])
+        self.assertEqual(equipment["validation_status"], "semantically_validated")
+        self.assertNotEqual(equipment["activation_readiness"]["value"], "ready")
+        self.assertEqual(equipment["operational_continuity"]["value"], "unassessed")
+        self.assertEqual(equipment["retained_authority_paths"], [])
+
+    def test_plan_replay_refuses_equipment_decisions_with_unattached_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            modeled_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            retained_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            modeled_path.parent.mkdir(parents=True)
+            retained_path.parent.mkdir(parents=True)
+            modeled_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            retained_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            plan["equipment_review_record"]["status"] = "reviewed"
+            decision = next(
+                item
+                for item in plan["equipment_review_record"]["equipment"]
+                if item["source_path"] == "docs/agents/lemonade-local-policy.md"
+            )
+            decision["decision_status"] = "reviewed"
+            decision["disposition"] = "retain_authoritative_owner"
+            decision["evidence_ids"] = ["missing-evidence"]
+            plan["equipment_review_record"]["toml"] = (
+                core_module._equipment_review_record_toml(
+                    plan["equipment_review_record"]
+                )
+            )
+
+            dry_run = dry_run_migration_plan(plan)
+            execution = execute_migration_plan(plan, repo_path)
+
+        for result in (dry_run, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+
+    def test_plan_replay_refuses_equipment_decisions_with_mismatched_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            modeled_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            retained_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            modeled_path.parent.mkdir(parents=True)
+            retained_path.parent.mkdir(parents=True)
+            modeled_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            retained_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            decision = next(
+                item
+                for item in plan["equipment_review_record"]["equipment"]
+                if item["source_path"] == "docs/agents/lemonade-local-policy.md"
+            )
+            decision["source_path"] = (
+                ".agents/skills/working-with-upstream-refs/SKILL.md"
+            )
+            plan["equipment_review_record"]["toml"] = (
+                core_module._equipment_review_record_toml(
+                    plan["equipment_review_record"]
+                )
+            )
+            plan_path = repo_path / "migration-plan.json"
+            plan_path.write_text(json.dumps(plan))
+
+            direct = dry_run_migration_plan(plan)
+            mcp = fork_ops_migration_dry_run(migration_plan=plan)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["migration", "dry-run", "--plan", str(plan_path)]
+                )
+            cli = json.loads(output.getvalue())
+            execution = execute_migration_plan(plan, repo_path)
+            config_exists = (repo_path / CONFIG_RELATIVE_PATH).exists()
+
+        for result in (direct, mcp, cli, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"],
+                "invalid_artifact_semantics",
+            )
+        self.assertEqual(cli_exit, 1)
+        self.assertFalse(config_exists)
+
+    def test_plan_replay_refuses_stale_equipment_review_toml_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["equipment_review_record"]["status"] = "reviewed"
+
+            result = dry_run_migration_plan(plan)
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(
+            result["diagnostics"][0]["code"],
+            "invalid_artifact_semantics",
+        )
+        self.assertIn("toml", result["diagnostics"][0]["detail"]["error"])
+
+    def test_plan_replay_requires_equipment_review_toml_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            plan["equipment_review_record"].pop("toml")
+
+            result = dry_run_migration_plan(plan)
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(
+            result["diagnostics"][0]["code"],
+            "invalid_artifact_semantics",
+        )
+        self.assertIn("toml", result["diagnostics"][0]["detail"]["error"])
+
+    def test_plan_replay_refuses_malformed_equipment_table_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            plan_path = repo_path / "migration-plan.json"
+            plan = generate_migration_plan(repo_path)
+            plan["equipment_review_record"]["equipment"] = ["bad"]
+            plan["equipment_review_record"]["toml"] = (
+                core_module._equipment_review_record_toml(
+                    plan["equipment_review_record"]
+                )
+            )
+            plan_path.write_text(json.dumps(plan))
+
+            direct = dry_run_migration_plan(plan)
+            mcp = fork_ops_migration_dry_run(str(repo_path), migration_plan=plan)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["migration", "dry-run", "--plan", str(plan_path)]
+                )
+            cli = json.loads(output.getvalue())
+            execution = execute_migration_plan(plan, repo_path)
+
+        for result in (direct, mcp, cli, execution):
+            self.assertEqual(result["outcome"], "refused")
+            self.assertEqual(
+                result["diagnostics"][0]["code"], "invalid_artifact_semantics"
+            )
+        self.assertEqual(cli_exit, 1)
+        self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+    def test_plan_replay_rejects_every_malformed_equipment_section(self) -> None:
+        sections = (
+            "discovery_scopes",
+            "evidence",
+            "equipment",
+            "unassessed_equipment_areas",
+            "accounting_records",
+            "follow_up_candidates",
+        )
+        for section in sections:
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as repo:
+                plan = generate_migration_plan(Path(repo))
+                plan["equipment_review_record"][section] = ["bad"]
+                plan["equipment_review_record"]["toml"] = (
+                    core_module._equipment_review_record_toml(
+                        plan["equipment_review_record"]
+                    )
+                )
+
+                result = dry_run_migration_plan(plan)
+
+            self.assertEqual(result["outcome"], "refused")
+            self.assertIn(section, result["diagnostics"][0]["detail"]["error"])
+
+    def test_plan_replay_refuses_live_equipment_scope_drift_before_mutation(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            tempfile.TemporaryDirectory() as plan_store,
+        ):
+            repo_path = Path(repo)
+            plan_path = Path(plan_store) / "migration-plan.json"
+            modeled_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            retained_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            modeled_path.parent.mkdir(parents=True)
+            retained_path.parent.mkdir(parents=True)
+            modeled_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            retained_path.write_text(
+                "Lemonade upstream track policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_reviewed_retain(plan, "docs/agents/lemonade-local-policy.md")
+            self.assertTrue(dry_run_migration_plan(plan)["can_execute"])
+            plan_path.write_text(json.dumps(plan))
+            new_path = repo_path / ".agents/skills/new-equipment/SKILL.md"
+            new_path.parent.mkdir(parents=True)
+            new_path.write_text(
+                "A fork-local upstream release policy remains authoritative.\n"
+            )
+
+            direct = dry_run_migration_plan(plan)
+            mcp = fork_ops_migration_dry_run(str(repo_path), migration_plan=plan)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["migration", "dry-run", "--plan", str(plan_path)]
+                )
+            cli = json.loads(output.getvalue())
+            execution = execute_migration_plan(plan, repo_path)
+
+        for result in (direct, mcp, cli):
+            self.assertEqual(result["outcome"], "completed")
+            self.assertFalse(result["can_execute"])
+            blocker = next(
+                item
+                for item in result["blocked_steps"]
+                if item["code"] == "migration_execution.equipment_scope_stale"
+            )
+            self.assertIn("stale", blocker["detail"]["error"])
+        self.assertEqual(execution["outcome"], "blocked")
+        self.assertEqual(execution["mutation_state"], "not_started")
+        self.assertIn("stale", execution["blockers"][0]["detail"]["error"])
+        self.assertEqual(cli_exit, 0)
+        self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+    def test_equipment_scope_ignores_the_expected_fork_ops_config_target(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            before, _ = core_module._equipment_review_repo_scope_state(
+                repo_path, record
+            )
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(plan["proposed_config_patch"]["toml"])
+
+            after, _ = core_module._equipment_review_repo_scope_state(
+                repo_path, record
+            )
+
+        self.assertIsNone(before)
+        self.assertIsNone(after)
+
+    def test_reviewed_equipment_record_requires_current_repo_local_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            config_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_equipment_reviewed_retain(
+                plan, "docs/agents/lemonade-local-policy.md"
+            )
+            review_path.write_text(plan["equipment_review_record"]["toml"])
+            source_path.write_text("Changed authority.\n")
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertEqual(equipment["compatibility"], "invalid")
+        self.assertEqual(equipment["retained_authority_paths"], [])
+        self.assertNotIn("activation_readiness", equipment)
+        self.assertIn("stale", equipment["error"])
+
+    def test_reviewed_equipment_revalidation_obeys_scan_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_equipment_reviewed_retain(
+                plan, "docs/agents/lemonade-local-policy.md"
+            )
+            review_path.write_text(plan["equipment_review_record"]["toml"])
+
+            with patch.object(core_module, "MAX_SCAN_FILES", 0):
+                report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertNotIn("activation_readiness", equipment)
+        self.assertIn("completely revalidated", equipment["error"])
+
+    def test_reviewed_equipment_record_rejects_unresolved_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "The upstream track policy is described narratively without refs.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            record["status"] = "reviewed"
+            decision = next(
+                item
+                for item in record["equipment"]
+                if item["disposition"] == "decide_item_by_item"
+            )
+            decision["decision_status"] = "reviewed"
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertNotIn("activation_readiness", equipment)
+        self.assertIn("decide_item_by_item", equipment["error"])
+
+    def test_orphan_superseded_equipment_decision_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            record["status"] = "reviewed"
+            for decision in record["equipment"]:
+                decision["decision_status"] = "reviewed"
+            record["equipment"][0]["decision_status"] = "superseded"
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertNotIn("activation_readiness", equipment)
+        self.assertIn("superseded_by", equipment["error"])
+
+    def test_equipment_supersession_history_rejects_cycles(self) -> None:
+        for cycle_size in (1, 2):
+            with self.subTest(cycle_size=cycle_size), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+                source_path.parent.mkdir(parents=True)
+                source_path.write_text(
+                    "Lemonade upstream policy remains fork-local authority.\n"
+                )
+                record = generate_migration_plan(repo_path)["equipment_review_record"]
+                current = record["equipment"][0]
+                current["decision_status"] = "reviewed"
+                history = [copy.deepcopy(current) for _ in range(cycle_size)]
+                for index, entry in enumerate(history):
+                    entry["id"] = f"{current['id']}:history:{index}"
+                    entry["decision_status"] = "superseded"
+                for index, entry in enumerate(history):
+                    predecessor = history[(index - 1) % cycle_size]
+                    successor = history[(index + 1) % cycle_size]
+                    entry["supersedes"] = predecessor["id"]
+                    entry["superseded_by"] = successor["id"]
+                record["equipment"].extend(history)
+                record["toml"] = core_module._equipment_review_record_toml(record)
+
+                error = core_module._equipment_review_semantic_error(record)
+
+            self.assertIsNotNone(error)
+            self.assertIn("cycle", str(error))
+
+    def test_reviewed_external_equipment_does_not_claim_current_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            _mark_equipment_reviewed_retain(
+                plan, "docs/agents/lemonade-local-policy.md"
+            )
+            record = plan["equipment_review_record"]
+            record["unassessed_equipment_areas"].clear()
+            decision = next(
+                item
+                for item in record["equipment"]
+                if item["source_path"] == "docs/agents/lemonade-local-policy.md"
+            )
+            evidence = next(
+                item
+                for item in record["evidence"]
+                if item["id"] in decision["evidence_ids"]
+            )
+            for item in (decision, evidence):
+                item["source_scope"] = "operator-source-root"
+                item["source_root"] = "/definitely/missing-root"
+                item["source_path"] = "missing.md"
+                item["content_sha256"] = "0" * 64
+            record["discovery_scopes"] = [
+                {
+                    "id": "scope:missing",
+                    "kind": "operator-source-root",
+                    "root_role": "operator-provided",
+                    "path": "/definitely/missing-root",
+                    "status": "scanned",
+                    "equipment_group_count": 1,
+                    "snapshot_sha256": core_module._equipment_scope_snapshot_sha256(
+                        [decision],
+                        "operator-source-root",
+                        "/definitely/missing-root",
+                    ),
+                }
+            ]
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+            mcp = fork_ops_capability_report(str(repo_path))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["capability", "report", "--repo", str(repo_path), "--json"]
+                )
+            cli = json.loads(output.getvalue())
+
+        for capability in (report["capability"], mcp, cli):
+            equipment = capability["equipment_review"]
+            self.assertFalse(equipment["valid"])
+            self.assertEqual(equipment["retained_authority_paths"], [])
+            self.assertNotIn("activation_readiness", equipment)
+            self.assertIn("external", equipment["error"])
+        self.assertEqual(cli_exit, 1)
+
+    def test_equipment_review_record_cannot_certify_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            equipment_id = "equipment:self-review"
+            evidence_id = "equipment-evidence:self-review"
+            source = {
+                "source_scope": "repo-local",
+                "source_root": str(repo_path),
+                "source_path": "docs/agents/fork-ops-equipment-review.toml",
+                "source_kind": "doc",
+                "content_sha256": "0" * 64,
+            }
+            record["status"] = "reviewed"
+            record["unassessed_equipment_areas"].clear()
+            record["evidence"].append(
+                {"id": evidence_id, "equipment_id": equipment_id, **source}
+            )
+            record["equipment"].append(
+                {
+                    "id": f"{equipment_id}:decision",
+                    "equipment_id": equipment_id,
+                    **source,
+                    "disposition": "retain_authoritative_owner",
+                    "decision_status": "reviewed",
+                    "evidence_ids": [evidence_id],
+                }
+            )
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+            mcp = fork_ops_capability_report(str(repo_path))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["capability", "report", "--repo", str(repo_path), "--json"]
+                )
+            cli = json.loads(output.getvalue())
+
+        for capability in (report["capability"], mcp, cli):
+            equipment = capability["equipment_review"]
+            self.assertFalse(equipment["valid"])
+            self.assertEqual(equipment["retained_authority_paths"], [])
+            self.assertNotIn("activation_readiness", equipment)
+            self.assertIn("review record", equipment["error"])
+        self.assertEqual(cli_exit, 1)
+
+    def test_superseded_equipment_history_keeps_one_current_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / "docs/agents/lemonade-local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            plan_path = repo_path / "migration-plan.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            _append_superseding_equipment_decision(
+                record, "docs/agents/lemonade-local-policy.md"
+            )
+            review_path.write_text(record["toml"])
+            plan_path.write_text(json.dumps(plan))
+
+            report = build_status_report(repo_path, include_config=False)
+            capability_mcp = fork_ops_capability_report(str(repo_path))
+            direct = dry_run_migration_plan(plan)
+            migration_mcp = fork_ops_migration_dry_run(
+                str(repo_path), migration_plan=plan
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli_exit = cli_main(
+                    ["migration", "dry-run", "--plan", str(plan_path)]
+                )
+            cli = json.loads(output.getvalue())
+
+        for capability in (report["capability"], capability_mcp):
+            equipment = capability["equipment_review"]
+            self.assertTrue(equipment["valid"])
+            self.assertEqual(equipment["pending_decision_count"], 0)
+            self.assertEqual(
+                equipment["retained_authority_paths"],
+                ["docs/agents/lemonade-local-policy.md"],
+            )
+        for result in (direct, migration_mcp, cli):
+            self.assertEqual(result["outcome"], "completed")
+            self.assertIn(
+                "docs/agents/lemonade-local-policy.md",
+                {item["path"] for item in result["retained_authority"]},
+            )
+        self.assertEqual(cli_exit, 0)
+
+    def test_unresolved_discovery_scope_does_not_claim_activation_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            record["status"] = "reviewed"
+            for decision in record["equipment"]:
+                decision["decision_status"] = "reviewed"
+            record["discovery_scopes"][0]["status"] = "unresolvable"
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertNotIn("activation_readiness", equipment)
+
+    def test_repo_only_review_cannot_delete_the_user_global_gap(self) -> None:
+        for remove_accounting in (False, True):
+            with self.subTest(remove_accounting=remove_accounting):
+                with tempfile.TemporaryDirectory() as repo:
+                    repo_path = Path(repo)
+                    review_path = (
+                        repo_path / "docs/agents/fork-ops-equipment-review.toml"
+                    )
+                    record = generate_migration_plan(repo_path)[
+                        "equipment_review_record"
+                    ]
+                    record["status"] = "reviewed"
+                    record["unassessed_equipment_areas"].clear()
+                    if remove_accounting:
+                        record["accounting_records"] = [
+                            item
+                            for item in record["accounting_records"]
+                            if item["source_kind"] != "unassessed-area"
+                        ]
+                        record["follow_up_candidates"].clear()
+                    record["toml"] = core_module._equipment_review_record_toml(
+                        record
+                    )
+                    review_path.parent.mkdir(parents=True, exist_ok=True)
+                    review_path.write_text(record["toml"])
+
+                    report = build_status_report(repo_path, include_config=False)
+
+                equipment = report["capability"]["equipment_review"]
+                self.assertFalse(equipment["valid"])
+                self.assertNotIn("activation_readiness", equipment)
+                self.assertIn("unassessed", equipment["error"])
+
+    def test_default_equipment_follow_up_has_a_nonempty_scope_title(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            record = generate_migration_plan(Path(repo))["equipment_review_record"]
+
+        titles = [item["title"] for item in record["follow_up_candidates"]]
+        self.assertIn("Account for user-global", titles)
+        self.assertTrue(all(title.removeprefix("Account for ") for title in titles))
+
+    def test_reviewed_equipment_scope_detects_new_repo_equipment(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            record = plan["equipment_review_record"]
+            record["status"] = "reviewed"
+            record["unassessed_equipment_areas"].clear()
+            for decision in record["equipment"]:
+                decision["decision_status"] = "reviewed"
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(record["toml"])
+            new_path = repo_path / ".agents/skills/new-equipment/SKILL.md"
+            new_path.parent.mkdir(parents=True)
+            new_path.write_text(
+                "A fork-local upstream release policy remains authoritative.\n"
             )
 
             report = build_status_report(repo_path, include_config=False)
 
         equipment = report["capability"]["equipment_review"]
-        self.assertEqual(equipment["activation_readiness"], "pending_equipment_review")
-        self.assertEqual(equipment["pending_decision_count"], 1)
-        self.assertEqual(equipment["unassessed_equipment_area_count"], 1)
+        self.assertFalse(equipment["valid"])
+        self.assertNotIn("activation_readiness", equipment)
+
+    def test_equipment_review_requires_canonical_discovery_scope_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            review_path.parent.mkdir(parents=True)
+            review_path.write_text(
+                '''artifact_kind = "equipment_review"
+schema_version = "1.0"
+status = "reviewed"
+default_onboarding_intent = "migrate_toward_fork_ops"
+review_freshness_policy = "revalidate on source changes"
+
+[[discovery_scopes]]
+foo = "bar"
+'''
+            )
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertIn("discovery scope", equipment["error"])
+
+    def test_equipment_review_pending_decisions_take_activation_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / "docs/maintainers/upstream-notes.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            config_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            source_path.write_text(
+                "The upstream track policy is described narratively without refs.\n"
+            )
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            expected_pending_count = sum(
+                item["decision_status"] in {"pending_operator_decision", "proposed"}
+                for item in record["equipment"]
+            )
+            expected_unassessed_count = len(record["unassessed_equipment_areas"])
+            review_path.parent.mkdir(parents=True)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertEqual(equipment["activation_readiness"]["value"], "blocked")
+        self.assertEqual(equipment["replacement_coverage"]["value"], "blocked")
+        self.assertEqual(equipment["operational_continuity"]["value"], "unassessed")
+        self.assertEqual(equipment["pending_decision_count"], expected_pending_count)
+        self.assertEqual(
+            equipment["unassessed_equipment_area_count"], expected_unassessed_count
+        )
 
     def test_capability_report_rejects_malformed_equipment_review_sections(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4581,7 +6286,7 @@ reason_recommended = "Review before activation."
             config_path.write_text(TRACK_AWARE_CONFIG)
             review_path.write_text(
                 """artifact_kind = "equipment_review"
-schema_version = "0.1"
+schema_version = "1.0"
 equipment = "not-a-table"
 """
             )
@@ -4592,6 +6297,62 @@ equipment = "not-a-table"
         self.assertTrue(equipment["exists"])
         self.assertFalse(equipment["valid"])
         self.assertIn("equipment must be a TOML array of tables", equipment["error"])
+
+    def test_capability_report_rejects_invalid_equipment_review_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            source_path = repo_path / "docs/agents/local-policy.md"
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            config_path.parent.mkdir(parents=True)
+            source_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            source_path.write_text(
+                "Lemonade upstream policy remains fork-local authority.\n"
+            )
+            record = generate_migration_plan(repo_path)["equipment_review_record"]
+            decision = next(
+                item
+                for item in record["equipment"]
+                if item["source_path"] == "docs/agents/local-policy.md"
+            )
+            decision["decision_status"] = "bogus"
+            record["toml"] = core_module._equipment_review_record_toml(record)
+            review_path.write_text(record["toml"])
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertEqual(equipment["compatibility"], "invalid")
+        self.assertNotIn("activation_readiness", equipment)
+        self.assertIn("decision_status", equipment["error"])
+
+    def test_capability_report_identifies_legacy_equipment_review_without_semantics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            config_path = repo_path / CONFIG_RELATIVE_PATH
+            review_path = repo_path / "docs/agents/fork-ops-equipment-review.toml"
+            config_path.parent.mkdir(parents=True)
+            review_path.parent.mkdir(parents=True)
+            config_path.write_text(TRACK_AWARE_CONFIG)
+            review_path.write_text(
+                '''artifact_kind = "equipment_review"
+schema_version = "0.1"
+status = "reviewed"
+default_onboarding_intent = "migrate_toward_fork_ops"
+'''
+            )
+
+            report = build_status_report(repo_path, include_config=False)
+
+        equipment = report["capability"]["equipment_review"]
+        self.assertFalse(equipment["valid"])
+        self.assertEqual(equipment["compatibility"], "unsupported")
+        self.assertEqual(equipment["error"], "unsupported_artifact_version")
+        self.assertNotIn("activation_readiness", equipment)
 
     def test_capability_report_rejects_non_utf8_equipment_review_record(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4608,16 +6369,23 @@ equipment = "not-a-table"
         equipment = report["capability"]["equipment_review"]
         self.assertTrue(equipment["exists"])
         self.assertFalse(equipment["valid"])
-        self.assertEqual(equipment["activation_readiness"], "equipment_review_invalid")
+        self.assertEqual(equipment["compatibility"], "invalid")
+        self.assertNotIn("activation_readiness", equipment)
 
     def test_migration_execution_rejects_malformed_plan_before_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
 
-            with self.assertRaisesRegex(ForkOpsError, "operation='migration-plan'"):
-                execute_migration_plan({"operation": "not-a-migration-plan"}, repo_path=repo_path)
+            result = execute_migration_plan(
+                {"operation": "not-a-migration-plan"},
+                repo_path=repo_path,
+            )
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["mutation_state"], "not_started")
+        self.assertEqual(result["diagnostics"][0]["code"], "unsupported_artifact_version")
 
     def test_migration_execution_refuses_plan_blockers_without_mutating_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4634,7 +6402,8 @@ equipment = "not-a-table"
             self.assertEqual(source_path.read_text(), source_text)
 
         self.assertEqual(result["operation"], "migration-execution")
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["applied_edits"], [])
         blocker_codes = {blocker["code"] for blocker in result["blockers"]}
         self.assertIn("semantic_coverage.incomplete", blocker_codes)
@@ -4646,13 +6415,11 @@ equipment = "not-a-table"
         self.assertIn("docs/maintainers/upstream-notes.md", narrative["text"])
         self.assertIn("config creation is blocked", narrative["text"])
 
-        single_blocker_narrative = render_migration_narrative(
-            {
-                "operation": "migration-execution",
-                "status": "blocked",
-                "blockers": [{"code": "semantic_coverage.incomplete"}],
-            }
-        )
+        single_blocker_result = json.loads(json.dumps(result))
+        single_blocker_result["blockers"] = [
+            {"code": "semantic_coverage.incomplete"}
+        ]
+        single_blocker_narrative = render_migration_narrative(single_blocker_result)
         self.assertIn(
             "semantic_coverage.incomplete is present",
             single_blocker_narrative["text"],
@@ -4674,17 +6441,17 @@ equipment = "not-a-table"
 
             resolution = explain_migration_blocker(plan, "semantic_coverage.incomplete")
 
-        self.assertEqual(resolution["operation"], "blocker-resolution")
+        self.assertEqual(resolution["operation"], "migration-blocker-explanation")
         self.assertEqual(resolution["source_operation"], "migration-plan")
         self.assertEqual(resolution["originating_workflow"]["id"], "fork-authority-migration")
-        self.assertEqual(resolution["resolution_workflow"]["id"], "blocker-resolution")
+        self.assertEqual(resolution["resolution_workflow"]["id"], "migration-blocker-explanation")
         self.assertEqual(resolution["blocker"]["code"], "semantic_coverage.incomplete")
         self.assertEqual(
-            resolution["evidence"]["paths"],
+            resolution["blocker_evidence"]["paths"],
             ["docs/maintainers/upstream-notes.md"],
         )
         self.assertEqual(
-            resolution["evidence"]["migration_map_entries"][0]["source_path"],
+            resolution["blocker_evidence"]["migration_map_entries"][0]["source_path"],
             "docs/maintainers/upstream-notes.md",
         )
         self.assertIn(
@@ -4706,28 +6473,25 @@ equipment = "not-a-table"
         )
 
     def test_blocker_resolution_rejects_non_migration_payload(self) -> None:
-        with self.assertRaisesRegex(
-            ForkOpsError,
-            "requires migration workflow output",
-        ):
-            explain_migration_blocker({"operation": "plugin-health"})
+        result = explain_migration_blocker({"operation": "plugin-health"})
 
-        with self.assertRaisesRegex(
-            ForkOpsError,
-            "requires migration workflow output",
-        ):
-            explain_migration_blocker(
-                {
-                    "operation": "blocker-resolution",
-                    "blocker": {"code": "semantic_coverage.incomplete"},
-                }
-            )
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(
+            result["diagnostics"][0]["code"],
+            "unsupported_artifact_version",
+        )
+
+        result = explain_migration_blocker(
+            {
+                "operation": "migration-blocker-explanation",
+                "blocker": {"code": "semantic_coverage.incomplete"},
+            }
+        )
+        self.assertEqual(result["outcome"], "refused")
 
     def test_blocker_resolution_rejects_missing_requested_code(self) -> None:
-        plan = {
-            "operation": "migration-plan",
-            "blockers": [{"code": "semantic_coverage.incomplete"}],
-        }
+        with tempfile.TemporaryDirectory() as repo:
+            plan = generate_migration_plan(Path(repo))
 
         with self.assertRaisesRegex(
             ForkOpsError,
@@ -4753,7 +6517,8 @@ equipment = "not-a-table"
 
         self.assertEqual(result["mode"], "mutating")
         self.assertEqual(result["operation"], "migration-execution")
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
         self.assertEqual(result["summary"]["applied_edit_count"], 1)
         self.assertEqual(result["summary"]["blocker_count"], 0)
         self.assertEqual(result["summary"]["retained_material_count"], 1)
@@ -4784,7 +6549,7 @@ equipment = "not-a-table"
             result["verification_results"][0]["note"],
             "Status reflects Fork Ops capability verification; listed commands are not executed.",
         )
-        self.assertTrue(result["verification_results"][0]["required_level_available"])
+        self.assertTrue(result["verification_results"][0]["required_level_ready"])
         self.assertEqual(parsed["sync_policy"]["default_sync_baseline"], "upstream-stable")
 
     def test_migration_plan_hashes_retained_source_bytes(self) -> None:
@@ -4803,7 +6568,8 @@ equipment = "not-a-table"
                 hashlib.sha256(source_bytes).hexdigest(),
             )
 
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
 
     def test_migration_execution_rejects_existing_config_create(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4814,7 +6580,7 @@ equipment = "not-a-table"
             config_path = repo_path / CONFIG_RELATIVE_PATH
             config_path.write_text(TRACK_AWARE_CONFIG)
             plan = generate_migration_plan(repo_path)
-            plan["proposed_config_patch"]["operation"] = "create"
+            plan["proposed_config_patch"]["action"] = "create"
             empty_blockers: list[dict[str, Any]] = []
             plan["blockers"] = empty_blockers
             original_config = config_path.read_text()
@@ -4823,7 +6589,8 @@ equipment = "not-a-table"
 
             self.assertEqual(config_path.read_text(), original_config)
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
     def test_migration_execution_rejects_noncanonical_config_target(self) -> None:
@@ -4839,7 +6606,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / ".agents/not-fork-ops.toml").exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.unsupported_target_path",
@@ -4858,7 +6626,8 @@ equipment = "not-a-table"
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["mutation_state"], "applied")
 
     def test_migration_execution_does_not_overwrite_target_created_during_write(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4886,7 +6655,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["applied_edits"], [])
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
@@ -4904,8 +6674,12 @@ equipment = "not-a-table"
             result = execute_migration_plan(plan, repo_path)
 
         self.assertFalse(dry_run["can_execute"])
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
+        self.assertIn(
+            "migration_execution.target_exists",
+            {item["code"] for item in result["blockers"]},
+        )
 
     def test_migration_execution_rejects_target_parent_symlink_outside_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
@@ -4920,8 +6694,12 @@ equipment = "not-a-table"
 
             self.assertFalse((Path(outside) / "fork-ops.toml").exists())
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["blockers"][0]["code"], "migration_execution.unsafe_target_path")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
+        self.assertIn(
+            "migration_execution.unsafe_target_path",
+            {item["code"] for item in result["blockers"]},
+        )
 
     def test_migration_execution_rejects_target_parent_file(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -4934,7 +6712,8 @@ equipment = "not-a-table"
 
             result = execute_migration_plan(plan, repo_path)
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.target_parent_not_directory",
@@ -4963,7 +6742,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.target_parent_unavailable",
@@ -4985,7 +6765,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
         self.assertFalse(dry_run["can_execute"])
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.required_capability_unavailable",
@@ -5007,7 +6788,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
         self.assertFalse(dry_run["can_execute"])
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.validation_requirements_missing",
@@ -5032,7 +6814,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.validation_requirement_unsupported",
@@ -5051,7 +6834,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.validation_requirement_missing",
@@ -5071,7 +6855,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.proposed_config_patch_mismatch",
@@ -5090,10 +6875,11 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(
-            result["blockers"][0]["code"],
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
+        self.assertIn(
             "migration_execution.retained_source_changed",
+            {item["code"] for item in result["blockers"]},
         )
 
     def test_migration_execution_rejects_unreadable_retained_source_material(self) -> None:
@@ -5118,7 +6904,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.retained_source_changed",
@@ -5137,7 +6924,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.retained_source_hash_missing",
@@ -5156,7 +6944,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.unsafe_retained_source_path",
@@ -5193,7 +6982,8 @@ equipment = "not-a-table"
 
             self.assertEqual(target_path.read_text(), "created by another process")
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.target_exists")
 
     def test_migration_execution_preserves_parent_created_for_blocked_write(self) -> None:
@@ -5222,7 +7012,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertTrue((repo_path / ".agents").is_dir())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.target_parent_unverified",
@@ -5242,7 +7033,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((Path(other) / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_execute_migration_rejects_missing_selected_repo_for_supplied_plan(self) -> None:
@@ -5294,7 +7086,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((displaced_repo / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(
             result["blockers"][0]["code"],
             "migration_execution.repository_identity_changed",
@@ -5317,7 +7110,8 @@ equipment = "not-a-table"
 
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_execute_migration_plan_rejects_repo_path_mismatch(self) -> None:
@@ -5333,7 +7127,8 @@ equipment = "not-a-table"
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
             self.assertFalse((Path(other) / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_migration_verification_blocker_is_canonical_applied_unverified(self) -> None:
@@ -5349,7 +7144,8 @@ equipment = "not-a-table"
             ):
                 result = execute_migration_plan(plan, repo_path)
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
     def test_migration_post_write_exception_is_canonical_applied_unverified(self) -> None:
@@ -5367,7 +7163,8 @@ equipment = "not-a-table"
 
             self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
         self.assertEqual(result["blockers"][0]["code"], "migration_execution.post_write_error")
 
@@ -5391,7 +7188,8 @@ equipment = "not-a-table"
             ):
                 result = execute_migration_plan(plan, repo_path)
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
     def test_migration_descriptor_close_failure_is_applied_unverified(self) -> None:
@@ -5448,7 +7246,8 @@ equipment = "not-a-table"
 
                 self.assertTrue(target_path.is_file())
                 self.assertTrue(injected)
-                self.assertEqual(result["status"], "applied_unverified")
+                self.assertEqual(result["outcome"], "failed")
+                self.assertEqual(result["mutation_state"], "applied_unverified")
                 self.assertEqual(
                     result["applied_edits"][0]["status"],
                     "applied_unverified",
@@ -5476,8 +7275,10 @@ equipment = "not-a-table"
 
             status_report: dict[str, Any] = {
                 "capability": {
-                    "levels": {"track-aware": {"available": True}},
-                    "highest_available": "track-aware",
+                    "authority_readiness": {
+                        "levels": {"track-aware": {"ready": True}},
+                        "highest_authority_ready": "track-aware",
+                    },
                 },
                 "diagnostics": [],
             }
@@ -5499,7 +7300,8 @@ equipment = "not-a-table"
             self.assertTrue(target_path.is_file(), result)
             self.assertTrue(injected, result)
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
@@ -5574,19 +7376,175 @@ equipment = "not-a-table"
                     repo_path.rename(replacement_repo)
                     displaced_repo.rename(repo_path)
 
-            with patch(
-                "fork_ops.core._retained_source_material_blockers",
-                side_effect=swap_to_decoy_and_back,
+            with (
+                patch(
+                    "fork_ops.core._retained_source_material_blockers",
+                    side_effect=swap_to_decoy_and_back,
+                ),
+                patch(
+                    "fork_ops.core._migration_plan_repository_diagnostic",
+                    return_value=None,
+                ),
             ):
                 result = execute_migration_plan(plan, repo_path)
 
             self.assertTrue(swapped)
             self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
         self.assertIn(
             "migration_execution.repository_identity_changed",
             {blocker["code"] for blocker in result["blockers"]},
+        )
+
+    def test_equipment_scope_revalidation_uses_the_bound_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo_path = root_path / "repo"
+            repo_path.mkdir()
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            new_path = repo_path / ".agents/skills/new-equipment/SKILL.md"
+            new_path.parent.mkdir(parents=True)
+            new_path.write_text(
+                "A fork-local upstream release policy remains authoritative.\n"
+            )
+
+            replacement_repo = root_path / "repo-replacement"
+            replacement_source = (
+                replacement_repo
+                / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            )
+            replacement_source.parent.mkdir(parents=True)
+            replacement_source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            displaced_repo = root_path / "repo-original"
+            original_candidates = core_module._migration_candidates
+            swapped = False
+
+            def swap_to_planned_decoy(
+                repo: Path,
+                budget: Any = None,
+                *,
+                bound_repo: Any = None,
+            ) -> list[dict[str, Any]]:
+                nonlocal swapped
+                swapped = True
+                repo_path.rename(displaced_repo)
+                replacement_repo.rename(repo_path)
+                try:
+                    return original_candidates(
+                        repo,
+                        budget,
+                        bound_repo=bound_repo,
+                    )
+                finally:
+                    repo_path.rename(replacement_repo)
+                    displaced_repo.rename(repo_path)
+
+            with patch(
+                "fork_ops.core._migration_candidates",
+                side_effect=swap_to_planned_decoy,
+            ):
+                result = execute_migration_plan(plan, repo_path)
+
+            self.assertTrue(swapped)
+            self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertIn(
+            "migration_execution.equipment_scope_stale",
+            {item["code"] for item in result["blockers"]},
+        )
+
+    def test_migration_execution_reports_scope_drift_after_config_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source_path = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            original_apply = core_module._apply_migration_file_edits
+
+            def apply_then_add_equipment(*args: Any, **kwargs: Any) -> Any:
+                applied = original_apply(*args, **kwargs)
+                late_path = repo_path / ".agents/skills/late-equipment/SKILL.md"
+                late_path.parent.mkdir(parents=True)
+                late_path.write_text(
+                    "A late fork-local upstream policy remains authoritative.\n"
+                )
+                return applied
+
+            with patch(
+                "fork_ops.core._apply_migration_file_edits",
+                side_effect=apply_then_add_equipment,
+            ):
+                result = execute_migration_plan(plan, repo_path)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
+        self.assertIn(
+            "migration_execution.equipment_scope_stale",
+            {item["code"] for item in result["blockers"]},
+        )
+
+    def test_full_breadth_execution_reports_external_drift_after_config_creation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            _write_full_breadth_fixture(workspace_path)
+            repo_path = workspace_path / "selected-repo"
+            source = (
+                repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            )
+            source.parent.mkdir(parents=True)
+            source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            with (
+                patch.object(Path, "home", return_value=workspace_path),
+                patch.dict(os.environ, _full_breadth_env(workspace_path)),
+            ):
+                plan = generate_migration_plan(
+                    repo_path,
+                    scan_profile="full-breadth",
+                )
+                original_apply = core_module._apply_migration_file_edits
+
+                def apply_then_add_external_equipment(
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    applied = original_apply(*args, **kwargs)
+                    late_path = (
+                        workspace_path
+                        / ".agents"
+                        / "skills"
+                        / "late-equipment"
+                        / "SKILL.md"
+                    )
+                    late_path.parent.mkdir(parents=True)
+                    late_path.write_text(
+                        "A late review policy gates publication closeout.\n"
+                    )
+                    return applied
+
+                with patch(
+                    "fork_ops.core._apply_migration_file_edits",
+                    side_effect=apply_then_add_external_equipment,
+                ):
+                    result = execute_migration_plan(plan, repo_path)
+
+            self.assertTrue((repo_path / CONFIG_RELATIVE_PATH).is_file())
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
+        self.assertIn(
+            "migration_execution.equipment_scope_stale",
+            {item["code"] for item in result["blockers"]},
         )
 
     def test_workflow_directory_scan_marks_root_swap_during_yield_incomplete(self) -> None:
@@ -5668,7 +7626,8 @@ equipment = "not-a-table"
                     repository_name="repo",
                 )
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
@@ -5685,7 +7644,8 @@ equipment = "not-a-table"
                     repository_name="repo",
                 )
 
-        self.assertEqual(result["status"], "applied_unverified")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
 
@@ -5719,7 +7679,8 @@ equipment = "not-a-table"
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["operation"], "migration-execution")
-        self.assertEqual(payload["status"], "applied")
+        self.assertEqual(payload["outcome"], "completed")
+        self.assertEqual(payload["mutation_state"], "applied")
 
     def test_cli_requires_repo_with_migration_plan_file_for_execute(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -5762,7 +7723,8 @@ equipment = "not-a-table"
 
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["outcome"], "blocked")
+        self.assertEqual(payload["mutation_state"], "not_started")
         self.assertEqual(payload["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
     def test_mcp_exposes_migration_execute(self) -> None:
@@ -5775,7 +7737,8 @@ equipment = "not-a-table"
             payload = fork_ops_migration_execute(str(repo_path))
 
         self.assertEqual(payload["operation"], "migration-execution")
-        self.assertEqual(payload["status"], "applied")
+        self.assertEqual(payload["outcome"], "completed")
+        self.assertEqual(payload["mutation_state"], "applied")
 
 
 UPSTREAM_REF_PRESSURE_TEXT = """# Working With Upstream Refs
@@ -5898,6 +7861,19 @@ def _write_plugin_health_fixture(
     return repo_root, plugin_root
 
 
+def _workflow_catalog_probe(*, workflows: object = ()) -> dict[str, Any]:
+    payload = workflow_catalog()
+    payload["workflows"] = list(workflows) if isinstance(workflows, tuple) else workflows
+    return payload
+
+
+def _mcp_health_probe(*, dependency_available: bool = True) -> dict[str, Any]:
+    payload = mcp_healthcheck()
+    payload["mcp_dependency_available"] = dependency_available
+    payload["missing_dependency"] = None if dependency_available else "No module"
+    return payload
+
+
 def _plugin_health_runner(
     *,
     cli_exit_code: int = 0,
@@ -5922,12 +7898,9 @@ def _plugin_health_runner(
                 command,
                 0,
                 json.dumps(
-                    {
-                        "mcp_dependency_available": mcp_dependency_available,
-                        "missing_dependency": None if mcp_dependency_available else "No module",
-                        "server": "Fork Ops",
-                        "tools": list(MCP_TOOL_IDS),
-                    }
+                    _mcp_health_probe(
+                        dependency_available=mcp_dependency_available,
+                    )
                 ),
                 "",
             )
@@ -5936,7 +7909,7 @@ def _plugin_health_runner(
         return subprocess.CompletedProcess(
             command,
             0,
-            json.dumps({"operation": "workflow-catalog", "workflows": []}),
+            json.dumps(_workflow_catalog_probe()),
             "",
         )
 

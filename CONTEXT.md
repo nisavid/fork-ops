@@ -663,7 +663,7 @@ _Avoid_: Dry run, assessment.
 - The plugin exposes fork-ops workflows through CLI, MCP, skills, and agent-facing documentation surfaces.
 - A fork-ops workflow is defined by a workflow contract.
 - A workflow contract includes a human handoff contract when operator input may be required.
-- A workflow catalog can include planned workflows when each workflow's implementation status is recorded in that catalog.
+- A workflow catalog can include planned workflows when each workflow's implementation extent and available operations are recorded in that catalog.
 - Operator intents organize the workflow catalog before implementation entrypoints are selected.
 - Workflow entrypoints expose fork-ops workflows without replacing the workflow contracts.
 - The operator onboarding workflow reports plugin health before directing work into a maintained fork.
@@ -671,7 +671,7 @@ _Avoid_: Dry run, assessment.
 - **Prescriptive Fork Policies** guide agent behavior unless the user explicitly changes them.
 - **Mutation Gates** enforce **Prescriptive Fork Policies** for side-effecting workflows.
 - Refusal behavior is part of a fork-ops workflow contract, not only an error-reporting detail.
-- A blocker resolution workflow can continue from another workflow's refusal behavior.
+- A migration blocker explanation workflow can continue from another workflow's refusal behavior.
 - Operator-readable narratives should be generated from structured evidence.
 - A dogfood target validates fork-ops workflows against real fork-local authority, source materials, blockers, and operator workflows.
 - A **Maintained Fork** may define multiple **Upstream Tracks**.
@@ -694,8 +694,8 @@ _Avoid_: Dry run, assessment.
 - **Operational Continuity** does not authorize source-material removal.
 - **Replacement Coverage** applies to source-material behavior, not to entire files or whole workflows.
 - Config representation preserves authority in machine-readable form but does not establish **Replacement Coverage** until current Fork Ops behavior consumes and validates it.
-- Planned and next-slice workflows do not establish **Replacement Coverage**.
-- Diagnostic-only workflows establish **Replacement Coverage** only for diagnostic behavior, not for mutation or repair behavior.
+- Planned workflows do not establish **Replacement Coverage**.
+- A diagnostic operation establishes **Replacement Coverage** only for the named diagnostic behavior, not for mutation or repair behavior.
 - Shadow Mode and Advisory Mode output do not establish **Replacement Coverage** by themselves.
 - Source material with both covered and uncovered behavior remains retained authority until every behavior is covered, excluded, or deferred through reviewed disposition.
 - A **Migration Plan** should include a migration map.

@@ -68,6 +68,38 @@ MCP tools expose the same surface for agents:
 - `fork_ops_migration_config_patch`
 - `fork_ops_schema`
 
+## Machine Contract
+
+Fork Ops machine artifacts identify themselves at the root with
+`artifact_kind` and `schema_version`. Public operation results use schema 1.0
+and also carry `operation`, `outcome`, `plan_executability`, `mutation_state`,
+`diagnostics`, and `evidence`. The authored Fork Ops config remains schema 0.1;
+the JSON Schema document that describes it is a separate, versioned machine
+artifact.
+
+Persisted and replayed artifacts must match their exact supported kind and
+version before Fork Ops interprets domain fields or performs a mutation. A
+missing or unsupported identity is refused and directs the caller to regenerate
+the artifact. There are no legacy field aliases at the corrected boundary.
+Internal typed values inherit the identity of their enclosing artifact, and
+human-readable text or Markdown is a projection rather than a separate machine
+contract.
+
+CLI JSON and MCP tools return the same canonical domain object for the same
+operation and inputs. Protocol envelopes and human CLI rendering may differ,
+but they do not redefine fields. CLI exit status is 0 for a completed domain
+request, including a completed report whose plan is blocked; 1 for a trustworthy
+blocked, refused, or failed domain result; and 2 for invalid CLI input or when no
+trustworthy domain result can be formed.
+
+State dimensions remain independent. Activation readiness is `unassessed`,
+`blocked`, `ready`, or `not_applicable`; replacement coverage is `unassessed`,
+`blocked`, `covered`, or `not_applicable`; operational continuity is
+`unassessed`, `at_risk`, `continuous`, or `not_applicable`. Each state records a
+subject, evidence identifiers, and a named derivation rule when available.
+Workflow implementation extent is `implemented`, `partial`, or `planned`, and
+each operation mode is `diagnostic`, `read_only`, or `guarded_mutation`.
+
 ## Plugin Health
 
 Use plugin health when first bringing Fork Ops online or when one control
@@ -136,6 +168,20 @@ readiness and replacement coverage for overlapping behavior. Reviewed
 guarded config creation while source-material replacement and removal remain
 unavailable.
 
+Each discovery scope binds its equipment count and content snapshot. A
+persisted reviewed record supports readiness or continuity only when every
+scope is scanned, the complete repo-local snapshot can be reproduced within
+the scan bounds, and every reviewed decision still matches its attached
+evidence and source bytes. External scopes cannot be revalidated from the
+selected repository, so a record that marks them reviewed is invalid rather
+than a basis for readiness or continuity. Repo-only discovery keeps the
+user-global unassessed area and its accounting record. Plan replay rebuilds the
+repo-local snapshot, and guarded execution checks it again before writing.
+
+Superseded decisions remain linked audit history. Current capability and replay
+state uses the single non-superseded decision for each equipment identity and
+source.
+
 Use `--scan-profile full-breadth` when full-breadth accounting is required. The
 full-breadth preflight adds accounting records and follow-up candidates from the
 known user-global, maintained-fork, and adjacent-root surfaces to the repo-local
@@ -171,9 +217,14 @@ summary identifies whether the record is valid, how many equipment decisions
 are pending or reviewed, which reviewed paths remain retained authority, and
 whether unassessed equipment areas still limit activation readiness. When the
 record contains accounting records, the capability summary reports accounting
-record counts, status counts, and follow-up candidate counts. The summary does
-not by itself authorize equipment edits, disabling, redirects, replacement
-coverage claims, or source-material removal.
+record counts, verified status counts, follow-up candidate counts, and whether
+the accounting claims were verified. A proposed review retains its record and
+follow-up counts but reports zero verified status counts. The summary does not
+treat a proposed choice as reviewed authority. Reviewed repo-local decisions
+must still match their attached source identity and current content digest, and
+the discovery scope snapshot must still cover the current equipment set. The
+summary does not by itself authorize equipment edits, disabling, redirects,
+replacement coverage claims, or source-material removal.
 
 ## Mutation Policy
 

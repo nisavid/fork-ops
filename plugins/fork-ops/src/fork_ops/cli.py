@@ -27,8 +27,8 @@ from .core import (
     explain_migration_blocker,
     generate_migration_plan,
     initialize_config,
-    load_raw_config,
     propose_migration_config_patch,
+    read_config_result,
     schema_artifact_report,
     schema_json,
 )
@@ -259,45 +259,39 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     if args.normalized and output_format == "toml":
         raise ForkOpsError("--normalized requires JSON output; use --format json or omit --format.")
     if output_format == "json":
-        report = build_status_report(args.repo, include_config=True)
-        if "config" not in report:
-            print(json.dumps(report, indent=2, sort_keys=True), file=sys.stderr)
-            return 1
-        print(json.dumps(report["config"], indent=2, sort_keys=True))
-        return 0
-    print(load_raw_config(args.repo), end="")
-    return 0
+        result = read_config_result(args.repo, normalized=True)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return _domain_exit(result)
+    result = read_config_result(args.repo, normalized=False)
+    raw = result.get("raw")
+    if isinstance(raw, str):
+        print(raw, end="")
+    if result.get("diagnostics"):
+        _print_diagnostics(result, file=sys.stderr)
+    return _domain_exit(result)
 
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
-    report = build_status_report(args.repo, include_config=args.json)
-    required_available = True
-    if args.required_level:
-        level = report["capability"]["levels"][args.required_level]
-        required_available = bool(level["available"])
-        report["required_level"] = {
-            "level": args.required_level,
-            "available": required_available,
-            "missing": level["missing"],
-        }
+    report = build_status_report(
+        args.repo,
+        include_config=args.json,
+        required_level=args.required_level or "",
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         _print_diagnostics(report)
-        highest = report["capability"]["highest_available"] or "none"
-        print(f"highest_available={highest}")
-    if args.required_level:
-        if not required_available:
-            if not args.json:
-                missing = report["required_level"]["missing"]
-                print(f"required_level={args.required_level}: unavailable")
-                print(f"missing_for_required_level={', '.join(missing) or 'none'}")
-    if _has_errors(report):
-        return 1
-    if args.required_level:
-        if not required_available:
-            return 1
-    return 0
+        highest = (
+            report["capability"]["authority_readiness"]["highest_authority_ready"]
+            or "none"
+        )
+        print(f"highest_authority_ready={highest}")
+    if args.required_level and report["required_level"]["authority_ready"] is not True:
+        if not args.json:
+            missing = report["required_level"]["missing"]
+            print(f"required_level={args.required_level}: not_ready")
+            print(f"missing_for_required_level={', '.join(missing) or 'none'}")
+    return _domain_exit(report)
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
@@ -320,8 +314,16 @@ def cmd_config_init(args: argparse.Namespace) -> int:
         upstream_name=args.upstream_name,
         default_branch=args.default_branch,
     )
-    if result["status"] != "applied":
-        raise ForkOpsError(_config_initialization_failure_message(result))
+    if (
+        result.get("artifact_kind") != "config_initialization_result"
+        or result.get("schema_version") != "1.0"
+    ):
+        raise ForkOpsError(
+            "Config initialization returned an unsupported artifact identity or version."
+        )
+    if result["outcome"] != "completed" or result["mutation_state"] != "applied":
+        print(_config_initialization_failure_message(result), file=sys.stderr)
+        return _domain_exit(result)
     print(result["target_path"])
     return 0
 
@@ -333,10 +335,10 @@ def _config_initialization_failure_message(result: dict[str, Any]) -> str:
         if isinstance(blockers, list) and blockers and isinstance(blockers[0], dict)
         else "Config initialization failed."
     )
-    status = result.get("status")
-    if status == "rolled_back":
+    mutation_state = result.get("mutation_state")
+    if mutation_state == "rolled_back":
         return f"Config initialization failed and the task-created config was rolled back: {detail}"
-    if status == "applied_unverified":
+    if mutation_state == "applied_unverified":
         mutation = result.get("mutation")
         applied_edits = result.get("applied_edits")
         parent_only = (
@@ -363,20 +365,27 @@ def _config_initialization_failure_message(result: dict[str, Any]) -> str:
 
 
 def cmd_capability_report(args: argparse.Namespace) -> int:
-    report = build_status_report(args.repo, include_config=args.json)
+    report = build_status_report(args.repo, include_config=True)
+    capability = report["capability"]
     if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
+        print(json.dumps(capability, indent=2, sort_keys=True))
     else:
-        capability = report["capability"]
-        print(f"highest_available={capability['highest_available'] or 'none'}")
-        for level, details in capability["levels"].items():
-            status = "available" if details["available"] else "unavailable"
+        authority = capability["authority_readiness"]
+        print(f"highest_authority_ready={authority['highest_authority_ready'] or 'none'}")
+        for level, details in authority["levels"].items():
+            status = (
+                "ready"
+                if details["ready"] is True
+                else "not_ready"
+                if details["ready"] is False
+                else "unassessed"
+            )
             print(f"{level}: {status}")
             if details["missing"]:
                 print(f"  missing: {', '.join(details['missing'])}")
-        if report.get("diagnostics"):
-            _print_diagnostics(report)
-    return 1 if _has_errors(report) else 0
+        if capability.get("diagnostics"):
+            _print_diagnostics(capability)
+    return _domain_exit(capability)
 
 
 def cmd_migration_assess(args: argparse.Namespace) -> int:
@@ -423,22 +432,11 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
     if args.plan:
         if args.scan_profile != "custom":
             raise ForkOpsError("--scan-profile cannot be used with --plan.")
-        print(
-            json.dumps(
-                dry_run_migration_plan(_read_json_plan(args.plan)),
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        result = dry_run_migration_plan(_read_json_plan(args.plan))
     else:
-        print(
-            json.dumps(
-                dry_run_migration(args.repo, scan_profile=args.scan_profile),
-                indent=2,
-                sort_keys=True,
-            )
-        )
-    return 0
+        result = dry_run_migration(args.repo, scan_profile=args.scan_profile)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return _domain_exit(result)
 
 
 def cmd_migration_execute(args: argparse.Namespace) -> int:
@@ -447,21 +445,16 @@ def cmd_migration_execute(args: argparse.Namespace) -> int:
     else:
         result = execute_migration(args.repo)
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["status"] == "applied" else 1
+    return _domain_exit(result)
 
 
 def cmd_migration_explain_blocker(args: argparse.Namespace) -> int:
-    print(
-        json.dumps(
-            explain_migration_blocker(
-                _read_json_workflow_output(args.input),
-                args.blocker_code,
-            ),
-            indent=2,
-            sort_keys=True,
-        )
+    result = explain_migration_blocker(
+        _read_json_workflow_output(args.input),
+        args.blocker_code,
     )
-    return 0
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return _domain_exit(result)
 
 
 def cmd_migration_propose_config(args: argparse.Namespace) -> int:
@@ -472,7 +465,7 @@ def cmd_migration_propose_config(args: argparse.Namespace) -> int:
             print(json.dumps(patch["diagnostics"], indent=2, sort_keys=True), file=sys.stderr)
     else:
         print(json.dumps(patch, indent=2, sort_keys=True))
-    return 1 if _diagnostics_have_errors(patch["diagnostics"]) else 0
+    return _domain_exit(patch)
 
 
 def cmd_workflow_catalog(args: argparse.Namespace) -> int:
@@ -508,7 +501,7 @@ def cmd_plugin_health(args: argparse.Namespace) -> int:
         ui_visible=ui_visible,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 1 if report["summary"]["status"] == "failed" else 0
+    return _domain_exit(report)
 
 
 def cmd_schema_print(args: argparse.Namespace) -> int:
@@ -529,17 +522,25 @@ def cmd_schema_check(args: argparse.Namespace) -> int:
             else:
                 status = "drift"
             print(f"{status}\t{artifact['path']}")
-    return 0 if report["ok"] else 1
+    return _domain_exit(report)
 
 
-def _print_diagnostics(report: dict[str, Any]) -> None:
+def _print_diagnostics(report: dict[str, Any], *, file: Any = None) -> None:
+    destination = sys.stdout if file is None else file
     diagnostics = report.get("diagnostics", [])
     if not diagnostics:
-        print("diagnostics=none")
+        print("diagnostics=none", file=destination)
         return
     for item in diagnostics:
         path = f" {item['path']}" if item.get("path") else ""
-        print(f"{item['severity']} {item['code']}{path}: {item['message']}")
+        print(
+            f"{item['severity']} {item['code']}{path}: {item['message']}",
+            file=destination,
+        )
+
+
+def _domain_exit(payload: dict[str, Any]) -> int:
+    return 0 if payload.get("outcome") == "completed" else 1
 
 
 def _has_errors(report: dict[str, Any]) -> bool:

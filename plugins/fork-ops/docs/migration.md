@@ -87,7 +87,7 @@ scan roots.
 Accounting statuses are:
 
 - `implemented_workflow`
-- `diagnostic_only_workflow`
+- `partial_workflow`
 - `planned_workflow`
 - `fork_local_config`
 - `retained_fork_local_authority`
@@ -99,6 +99,8 @@ Full-breadth preflight and migration plan output carry the same accounting
 records into the proposed equipment review record. Replacement coverage remains
 false until equivalent Fork Ops-owned behavior exists, validates, and is
 reported as covered behavior.
+On replay, the equipment review record is the authoritative accounting
+projection; duplicate plan and preflight lists are not trusted independently.
 
 The foundation also exposes a non-mutating proposed config patch. It converts
 migration assessment candidates into a draft `.agents/fork-ops.toml` payload for
@@ -182,7 +184,47 @@ classifications, dispositions, decision status, and activation impact. A
 reviewed `retain_authoritative_owner` equipment disposition records that the
 source remains authoritative for guarded config creation. Proposed dispositions
 guide review only; they do not establish replacement coverage or authorize
-equipment edits.
+equipment edits. Replay binds each decision to its discovery evidence and to the
+embedded TOML projection. A persisted reviewed decision supports readiness or
+continuity only while its repo-local source is still a regular file with the
+recorded content digest. The reviewed record also binds each discovery scope to
+an equipment count and content snapshot; a new, removed, changed, unresolved,
+or incompletely scanned repo-local item invalidates the record. Plan replay
+rebuilds the repo-local snapshot, and guarded execution repeats that check
+immediately before mutation and after config creation. Discovery excludes the
+expected `.agents/fork-ops.toml` target and the equipment review record itself;
+neither generated Fork Ops output can invalidate the source snapshot it records.
+Late source drift after a write yields `applied_unverified`. Reviewed external
+scopes cannot establish readiness or continuity because their current bytes
+cannot be verified from the selected repository. A repo-only review retains the
+user-global unassessed gap and its exact accounting record. Every other
+accounting row must match one current equipment decision and its canonical
+workflow or migration evidence; follow-up rows are derived from those records.
+Migration-plan replay accepts workflow accounting only when it matches a newly
+generated full-breadth inventory from the currently authorized source roots.
+The recorded root statuses, scope snapshots, workflow entries, projections, and
+safety-relevant scan completeness, limits, and incomplete reasons must match
+that fresh inventory in both directions; embedded evidence or accounting cannot
+omit a newly discovered source or certify a different target or coverage state.
+Counters for generated Fork Ops outputs are not replay identity. Custom plans
+cannot use externally scoped equipment to authorize replay because they do not
+carry an independently bound source-root manifest. Standalone proposed external
+reviews remain valid review artifacts, but their accounting claims remain
+unverified and do not establish readiness or continuity.
+
+During replay, the equipment review record is authoritative over duplicate
+preflight decision, accounting, follow-up, and unassessed-area projections.
+Fork Ops rebuilds equipment groups, operator prompts, and every derived preflight
+count from that record, then rebuilds states and state evidence from the current
+record and blockers before deriving readiness or continuity. Any current
+equipment decision that is not reviewed keeps activation readiness unassessed
+without by itself making an otherwise guarded write non-executable.
+
+Disposition history uses reciprocal `supersedes` and `superseded_by` links.
+Every history chain is acyclic and terminates at exactly one current decision.
+Superseded rows remain audit history; scope snapshots, pending counts, readiness,
+continuity, and replay use only that current decision per equipment identity and
+source.
 
 Migration dry run previews a migration plan without mutating the repository.
 When no plan file is supplied, the CLI generates the current plan internally.
@@ -204,6 +246,11 @@ decisions in the migration review artifact or reviewed
 guarded config creation can proceed while source-material replacement and
 removal stay unavailable. It does not edit config, source material, equipment,
 or branch state.
+
+Library and MCP dry runs with a supplied plan use an explicitly selected
+repository when one is provided; omitting the repository uses the plan's bound
+repository. The CLI `--plan` form uses the plan's bound repository because
+`--plan` and `--repo` are mutually exclusive.
 
 Migration execution applies a migration plan through guarded operations when
 the dry-run preview has no blockers. When no plan file is supplied, the CLI
@@ -243,7 +290,7 @@ Use blocker explanation for an existing migration output JSON object:
 uv run --package fork-ops fork-ops migration explain-blocker --input /path/to/migration-output.json --blocker-code semantic_coverage.incomplete
 ```
 
-For `semantic_coverage.incomplete`, blocker-resolution output lists the affected
+For `semantic_coverage.incomplete`, blocker-explanation output lists the affected
 source material paths, links them back to migration map entries when present,
 explains that deterministic extraction did not produce structured facts, and
 keeps source-material replacement/removal unavailable until coverage is

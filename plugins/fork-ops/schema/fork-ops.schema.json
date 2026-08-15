@@ -2,6 +2,7 @@
   "$id": "https://github.com/nisavid/fork-ops/plugins/fork-ops/schema/fork-ops.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": true,
+  "artifact_kind": "fork_ops_config_schema",
   "properties": {
     "authority": {
       "additionalProperties": true,
@@ -289,7 +290,7 @@
       "type": "object"
     },
     "schema_version": {
-      "pattern": "^[0-9]+\\.[0-9]+$",
+      "const": "0.1",
       "type": "string"
     },
     "sync_policy": {
@@ -494,6 +495,7 @@
     "authority",
     "change_targets"
   ],
+  "schema_version": "1.0",
   "title": "Fork Ops Config",
   "type": "object"
 }

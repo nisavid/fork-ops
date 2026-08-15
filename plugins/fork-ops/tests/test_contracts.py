@@ -28,6 +28,7 @@ from fork_ops import _payload_inventory as payload_inventory_module
 from fork_ops import core as core_module
 from fork_ops import mcp_server
 from fork_ops._contracts import (
+    ARTIFACT_CONTRACTS,
     ArtifactKind,
     Compatibility,
     CompatibilityState,
@@ -42,6 +43,7 @@ from fork_ops._contracts import (
     SchemaVersion,
     State,
     StateDimension,
+    artifact_contract,
 )
 from fork_ops._payload_inventory import (
     PAYLOAD_FAMILIES,
@@ -56,6 +58,7 @@ from fork_ops.cli import build_parser
 from fork_ops.cli import main as cli_main
 from fork_ops.core import (
     CONFIG_RELATIVE_PATH,
+    ForkOpsError,
     assess_migration,
     build_equipment_migration_preflight,
     build_plugin_health_report,
@@ -100,7 +103,7 @@ _PYTHON_ENDPOINT_NODE = (
 )
 _PERSISTENCE_ENDPOINT_NODE = (
     "plugins/fork-ops/tests/test_contracts.py::"
-    "test_legacy_replay_and_persisted_payloads_remain_accepted_and_exact"
+    "test_canonical_replay_and_persisted_payloads_are_exact"
 )
 _SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
@@ -430,38 +433,30 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
         )
         for consumer in config_family.consumers
     }
-    permissive_reported = (
-        ObservedVersionHandling.PERMISSIVE,
-        ObservedVersionOutcome.REPORTED,
-        ObservedVersionOutcome.ACCEPTED,
-        SchemaVersion.parse("0.1"),
-        LegacyPolicy.REFUSE,
-    )
-    permissive_accepted = (
-        ObservedVersionHandling.PERMISSIVE,
-        ObservedVersionOutcome.ACCEPTED,
-        ObservedVersionOutcome.ACCEPTED,
-        SchemaVersion.parse("0.1"),
-        LegacyPolicy.REFUSE,
-    )
-    permissive_refusing_missing = (
-        ObservedVersionHandling.PERMISSIVE,
+    enforced = (
+        ObservedVersionHandling.ENFORCED,
         ObservedVersionOutcome.REFUSED,
-        ObservedVersionOutcome.ACCEPTED,
+        ObservedVersionOutcome.REFUSED,
         SchemaVersion.parse("0.1"),
         LegacyPolicy.REFUSE,
     )
-    uninspected_refusing = (
+    uninspected_identifying = (
         ObservedVersionHandling.UNINSPECTED,
         ObservedVersionOutcome.ACCEPTED,
         ObservedVersionOutcome.ACCEPTED,
         SchemaVersion.parse("0.1"),
-        LegacyPolicy.REFUSE,
+        LegacyPolicy.IDENTIFY_ONLY,
     )
-    uninspected_identifying = (*uninspected_refusing[:-1], LegacyPolicy.IDENTIFY_ONLY)
+    permissive_identifying = (
+        ObservedVersionHandling.PERMISSIVE,
+        ObservedVersionOutcome.REPORTED,
+        ObservedVersionOutcome.REPORTED,
+        SchemaVersion.parse("0.1"),
+        LegacyPolicy.IDENTIFY_ONLY,
+    )
     assert config_behavior == {
-        ("fork_ops.core:load_config", Transport.PYTHON): uninspected_refusing,
-        ("fork_ops.core:build_status_report", Transport.PYTHON): permissive_reported,
+        ("fork_ops.core:load_config", Transport.PYTHON): enforced,
+        ("fork_ops.core:build_status_report", Transport.PYTHON): enforced,
         (
             "fork-ops config show [--format toml]",
             Transport.CLI_TEXT,
@@ -469,24 +464,24 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
         (
             "fork-ops config show --format json|--normalized",
             Transport.CLI_JSON,
-        ): permissive_accepted,
+        ): enforced,
         (
             "fork-ops config validate (without --json)",
             Transport.CLI_TEXT,
-        ): permissive_refusing_missing,
+        ): enforced,
         (
             "fork-ops config validate --json",
             Transport.CLI_JSON,
-        ): permissive_refusing_missing,
+        ): enforced,
         (
             "fork_ops_config_read(normalized=False)",
             Transport.MCP,
-        ): uninspected_identifying,
+        ): permissive_identifying,
         (
             "fork_ops_config_read(normalized=True)",
             Transport.MCP,
-        ): permissive_reported,
-        ("fork_ops_config_validate", Transport.MCP): permissive_reported,
+        ): enforced,
+        ("fork_ops_config_validate", Transport.MCP): enforced,
     }
 
     config_text = create_initial_config_text(tmp_path, discover_git_remotes=False)
@@ -502,11 +497,12 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
         path.parent.mkdir()
         path.write_text(raw, encoding="utf-8")
 
-        loaded = load_config(repo)
-        assert loaded.get("schema_version") == version
+        with pytest.raises(ForkOpsError, match="supports config schema version 0.1"):
+            load_config(repo)
         report = build_status_report(repo)
         diagnostic_codes = {item["code"] for item in report["diagnostics"]}
-        assert ("schema.invalid" in diagnostic_codes) is (version is None)
+        assert report["outcome"] == "refused"
+        assert diagnostic_codes == {"unsupported_schema_version"}
 
         raw_exit, raw_stdout, _ = _invoke_cli(
             ["config", "show", "--repo", str(repo)]
@@ -520,25 +516,28 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
         json_validate_exit, json_validate_stdout, _ = _invoke_cli(
             ["config", "validate", "--repo", str(repo), "--json"]
         )
-        assert raw_exit == normalized_exit == 0
+        assert raw_exit == 0
+        assert normalized_exit == 1
         assert raw_stdout == raw
-        assert json.loads(normalized_stdout).get("schema_version") == version
-        assert text_validate_exit == json_validate_exit == (1 if version is None else 0)
-        assert (
-            "schema.invalid"
-            in {item["code"] for item in json.loads(json_validate_stdout)["diagnostics"]}
-        ) is (version is None)
+        assert json.loads(normalized_stdout)["outcome"] == "refused"
+        assert text_validate_exit == json_validate_exit == 1
+        assert {
+            item["code"] for item in json.loads(json_validate_stdout)["diagnostics"]
+        } == {"unsupported_schema_version"}
 
         raw_mcp = mcp_server.fork_ops_config_read(str(repo), normalized=False)
         normalized_mcp = mcp_server.fork_ops_config_read(str(repo), normalized=True)
         validated_mcp = mcp_server.fork_ops_config_validate(str(repo))
         assert raw_mcp["raw"] == raw
-        assert raw_mcp["diagnostics"] == []
+        assert raw_mcp["outcome"] == "completed"
+        assert {item["code"] for item in raw_mcp["diagnostics"]} == {
+            "unsupported_schema_version"
+        }
         for mcp_report in (normalized_mcp, validated_mcp):
-            assert (
-                "schema.invalid"
-                in {item["code"] for item in mcp_report["diagnostics"]}
-            ) is (version is None)
+            assert mcp_report["outcome"] == "refused"
+            assert {item["code"] for item in mcp_report["diagnostics"]} == {
+                "unsupported_schema_version"
+            }
 
     observed_rows.update(
         _consumer_row(config_family.kind, consumer.id, consumer.transport)
@@ -564,24 +563,24 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
             "fork_ops.core:_equipment_review_record_report",
             Transport.PYTHON,
         ): (
-            ObservedVersionHandling.PERMISSIVE,
-            ObservedVersionOutcome.ACCEPTED,
-            ObservedVersionOutcome.ACCEPTED,
+            ObservedVersionHandling.ENFORCED,
+            ObservedVersionOutcome.REFUSED,
+            ObservedVersionOutcome.REFUSED,
             SchemaVersion.parse("1.0"),
             LegacyPolicy.REFUSE,
         ),
         ("fork_ops.core:build_status_report", Transport.PYTHON): (
-            ObservedVersionHandling.PERMISSIVE,
-            ObservedVersionOutcome.ACCEPTED,
-            ObservedVersionOutcome.ACCEPTED,
+            ObservedVersionHandling.ENFORCED,
+            ObservedVersionOutcome.REFUSED,
+            ObservedVersionOutcome.REFUSED,
             SchemaVersion.parse("1.0"),
             LegacyPolicy.REFUSE,
         ),
         **{
             (consumer.id, consumer.transport): (
-                ObservedVersionHandling.UNINSPECTED,
-                ObservedVersionOutcome.ACCEPTED,
-                ObservedVersionOutcome.ACCEPTED,
+                ObservedVersionHandling.ENFORCED,
+                ObservedVersionOutcome.REFUSED,
+                ObservedVersionOutcome.REFUSED,
                 SchemaVersion.parse("1.0"),
                 LegacyPolicy.REFUSE,
             )
@@ -605,18 +604,20 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
     for label, version in (("missing", None), ("unknown", "9.9")):
         review_toml = plan["equipment_review_record"]["toml"]
         if version is None:
-            review_toml = review_toml.replace('schema_version = "0.1"\n', "")
+            review_toml = review_toml.replace('schema_version = "1.0"\n', "")
         else:
             review_toml = review_toml.replace(
-                'schema_version = "0.1"',
+                'schema_version = "1.0"',
                 f'schema_version = "{version}"',
             )
         review_path.write_text(review_toml, encoding="utf-8")
         direct_report = core_module._equipment_review_record_report(equipment_repo)
         status_report = build_status_report(equipment_repo)["capability"]["equipment_review"]
-        assert direct_report["valid"] is status_report["valid"] is True
-        assert direct_report.get("schema_version") == version
-        assert status_report.get("schema_version") == version
+        assert direct_report["valid"] is status_report["valid"] is False
+        assert direct_report["compatibility"] == "unsupported"
+        assert status_report["compatibility"] == "unsupported"
+        assert "activation_readiness" not in direct_report
+        assert "replacement_coverage" not in status_report
 
         replay_plan = json.loads(json.dumps(plan))
         if version is None:
@@ -627,16 +628,10 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
         plan_path = tmp_path / f"equipment-plan-{label}.json"
         plan_path.write_text(json.dumps(replay_plan), encoding="utf-8")
 
-        assert dry_run_migration(equipment_repo, plan=replay_plan)["operation"] == (
-            "migration-dry-run"
-        )
-        assert dry_run_migration_plan(replay_plan)["operation"] == "migration-dry-run"
-        assert execute_migration(equipment_repo, plan=replay_plan)["operation"] == (
-            "migration-execution"
-        )
-        assert execute_migration_plan(replay_plan, equipment_repo)["operation"] == (
-            "migration-execution"
-        )
+        assert dry_run_migration(equipment_repo, plan=replay_plan)["outcome"] == "refused"
+        assert dry_run_migration_plan(replay_plan)["outcome"] == "refused"
+        assert execute_migration(equipment_repo, plan=replay_plan)["outcome"] == "refused"
+        assert execute_migration_plan(replay_plan, equipment_repo)["outcome"] == "refused"
         cli_dry_exit, _, _ = _invoke_cli(
             ["migration", "dry-run", "--plan", str(plan_path)]
         )
@@ -650,14 +645,14 @@ def test_config_and_equipment_version_behavior_is_characterized_per_consumer(
                 str(plan_path),
             ]
         )
-        assert cli_dry_exit == 0
+        assert cli_dry_exit == 1
         assert cli_execute_exit == 1
         assert fork_ops_migration_dry_run(
             str(equipment_repo), migration_plan=replay_plan
-        )["operation"] == "migration-dry-run"
+        )["outcome"] == "refused"
         assert fork_ops_migration_execute(
             str(equipment_repo), migration_plan=replay_plan
-        )["operation"] == "migration-execution"
+        )["outcome"] == "refused"
 
     observed_rows.update(
         _consumer_row(equipment_family.kind, consumer.id, consumer.transport)
@@ -704,6 +699,24 @@ def test_shared_diagnostic_evidence_state_and_outcome_primitives_are_independent
     assert outcome.states[0].dimension is StateDimension.PLAN_EXECUTABILITY
     assert outcome.value is OutcomeValue.BLOCKED
     assert outcome.evidence[0].id == "git:upstream-main"
+
+
+def test_state_values_are_scoped_to_their_dimension() -> None:
+    with pytest.raises(ValueError, match="activation_readiness"):
+        State(
+            dimension=StateDimension.ACTIVATION_READINESS,
+            value="continuous",
+        )
+    with pytest.raises(ValueError, match="operational_continuity"):
+        State(
+            dimension=StateDimension.OPERATIONAL_CONTINUITY,
+            value="ready",
+        )
+
+    assert State(
+        dimension=StateDimension.ACTIVATION_READINESS,
+        value="ready",
+    ).value == "ready"
 
 
 def test_sequence_backed_contract_primitives_detach_caller_owned_lists() -> None:
@@ -768,34 +781,22 @@ def test_evidence_detail_is_a_detached_canonical_immutable_value() -> None:
 
 
 def test_payload_inventory_is_complete_for_current_legacy_and_versioned_families() -> None:
-    expected_legacy = {
-        ArtifactKind.PLUGIN_HEALTH_REPORT,
-        ArtifactKind.FORK_OPS_CONFIG_SCHEMA,
-        ArtifactKind.CONFIG_READ_RESULT,
-        ArtifactKind.STATUS_REPORT,
-        ArtifactKind.CAPABILITY_REPORT,
-        ArtifactKind.CONFIG_INITIALIZATION_RESULT,
-        ArtifactKind.MIGRATION_ASSESSMENT,
-        ArtifactKind.EQUIPMENT_MIGRATION_PREFLIGHT,
-        ArtifactKind.EMBEDDED_EQUIPMENT_MIGRATION_PREFLIGHT,
-        ArtifactKind.MIGRATION_CONFIG_PATCH,
-        ArtifactKind.MIGRATION_PLAN,
-        ArtifactKind.MIGRATION_DRY_RUN,
-        ArtifactKind.MIGRATION_EXECUTION_RESULT,
-        ArtifactKind.MIGRATION_BLOCKER_EXPLANATION,
-        ArtifactKind.MIGRATION_NARRATIVE,
-        ArtifactKind.MIGRATION_REVIEW_ARTIFACT,
-        ArtifactKind.WORKFLOW_CATALOG,
-        ArtifactKind.WORKFLOW_CONTRACT_SET,
-        ArtifactKind.WORKFLOW_MIGRATION_INVENTORY,
-        ArtifactKind.SCHEMA_ARTIFACT_REPORT,
-        ArtifactKind.MCP_HEALTHCHECK,
-        ArtifactKind.SECURITY_EXCEPTION_GUIDE,
-    }
+    expected_legacy = {ArtifactKind.SECURITY_EXCEPTION_GUIDE}
     expected_versioned = set(ArtifactKind) - expected_legacy
 
     assert len(PAYLOAD_FAMILIES) == len(ArtifactKind)
     assert {family.kind for family in PAYLOAD_FAMILIES} == set(ArtifactKind)
+    assert set(ARTIFACT_CONTRACTS) == set(ArtifactKind)
+    for family in PAYLOAD_FAMILIES:
+        contract = artifact_contract(family.kind)
+        assert family.emitted_artifact_kind == contract.emitted_artifact_kind
+        assert family.emitted_version == contract.current_version
+        assert family.version_field == contract.version_field
+        assert all(
+            consumer.cutover_compatibility is None
+            or consumer.cutover_compatibility.current == contract.current_version
+            for consumer in family.consumers
+        )
     assert {
         family.kind
         for family in PAYLOAD_FAMILIES
@@ -1194,7 +1195,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
                 Transport.CLI_TEXT,
             )
         },
-        expected_exit=2,
+        expected_exit=1,
     )
     assert "must be rebound on a subsequent invocation" in init_stderr
     init_stdout, _ = execute(
@@ -1242,6 +1243,11 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
             "fork-ops config show --format json|--normalized",
             Transport.CLI_JSON,
         ),
+        _producer_row(
+            ArtifactKind.CONFIG_READ_RESULT,
+            "fork-ops config show --format json|--normalized",
+            Transport.CLI_JSON,
+        ),
     }
     for suffix in (["--format", "json"], ["--normalized"]):
         stdout, _ = execute(
@@ -1250,8 +1256,9 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
             expected_exit=0,
         )
         normalized_config = json.loads(stdout)
-        assert normalized_config["schema_version"] == "0.1"
-        assert "capability" not in normalized_config
+        assert normalized_config["artifact_kind"] == "config_read_result"
+        assert normalized_config["schema_version"] == "1.0"
+        assert normalized_config["config"]["schema_version"] == "0.1"
 
     stdout, _ = execute(
         ["config", "validate", "--repo", str(config_repo)],
@@ -1264,7 +1271,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         },
         expected_exit=0,
     )
-    assert "highest_available=" in stdout
+    assert "highest_authority_ready=" in stdout
 
     stdout, _ = execute(
         ["config", "validate", "--repo", str(config_repo), "--json"],
@@ -1283,7 +1290,8 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         expected_exit=0,
     )
     status_report = json.loads(stdout)
-    assert set(status_report) >= {"capability", "config", "diagnostics"}
+    assert status_report["artifact_kind"] == "status_report"
+    assert set(status_report) >= {"capability", "config", "diagnostics", "outcome"}
 
     stdout, _ = execute(
         ["capability", "report", "--repo", str(config_repo)],
@@ -1296,13 +1304,13 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         },
         expected_exit=0,
     )
-    assert "highest_available=" in stdout
+    assert "highest_authority_ready=" in stdout
 
     stdout, _ = execute(
         ["capability", "report", "--repo", str(config_repo), "--json"],
         rows={
             _producer_row(
-                ArtifactKind.STATUS_REPORT,
+                ArtifactKind.CAPABILITY_REPORT,
                 "fork-ops capability report --json",
                 Transport.CLI_JSON,
             )
@@ -1310,7 +1318,8 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         expected_exit=0,
     )
     capability_json = json.loads(stdout)
-    assert set(capability_json) >= {"capability", "config", "diagnostics"}
+    assert capability_json["artifact_kind"] == "capability_report"
+    assert "authority_readiness" in capability_json
     assert "highest_available" not in capability_json
 
     migration_repo = tmp_path / "migration"
@@ -1347,7 +1356,9 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         },
         expected_exit=0,
     )
-    assert json.loads(stdout)["proposed_config_patch"]["operation"] == "create"
+    proposed_patch = json.loads(stdout)["proposed_config_patch"]
+    assert proposed_patch["operation"] == "migration-config-patch"
+    assert proposed_patch["action"] == "create"
 
     stdout, _ = execute(
         ["migration", "preflight", "--repo", str(migration_repo)],
@@ -1518,7 +1529,9 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         },
         expected_exit=0,
     )
-    assert json.loads(stdout)["operation"] == "create"
+    config_patch = json.loads(stdout)
+    assert config_patch["operation"] == "migration-config-patch"
+    assert config_patch["action"] == "create"
 
     stdout, _ = execute(
         [
@@ -1602,7 +1615,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
     )
     schema = json.loads(stdout)
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-    assert "const" not in schema["properties"]["schema_version"]
+    assert schema["properties"]["schema_version"]["const"] == "0.1"
 
     stdout, _ = execute(
         ["schema", "check", "--plugin-root", str(plugin_root)],
@@ -1747,13 +1760,14 @@ def test_real_mcp_stdio_executes_every_payload_tool_with_exact_family_attributio
                             Transport.MCP,
                         ),
                         _producer_row(
-                            ArtifactKind.STATUS_REPORT,
+                            ArtifactKind.CONFIG_READ_RESULT,
                             "fork_ops_config_read(normalized=True)",
                             Transport.MCP,
                         ),
                     },
                 )
-                assert set(normalized_config) >= {"capability", "config", "diagnostics"}
+                assert normalized_config["artifact_kind"] == "config_read_result"
+                assert set(normalized_config) >= {"config", "diagnostics", "outcome"}
 
                 validated = await call(
                     "fork_ops_config_validate",
@@ -1772,7 +1786,7 @@ def test_real_mcp_stdio_executes_every_payload_tool_with_exact_family_attributio
                     },
                 )
                 assert set(validated) >= {"capability", "diagnostics"}
-                assert "config" not in validated
+                assert validated["config"]["schema_version"] == "0.1"
 
                 capability = await call(
                     "fork_ops_capability_report",
@@ -1785,12 +1799,12 @@ def test_real_mcp_stdio_executes_every_payload_tool_with_exact_family_attributio
                         )
                     },
                 )
-                assert set(capability) == {
-                    "accounting",
-                    "equipment_review",
-                    "highest_available",
-                    "levels",
-                }
+                assert capability["artifact_kind"] == "capability_report"
+                assert capability["schema_version"] == "1.0"
+                assert capability["authority_readiness"][
+                    "highest_authority_ready"
+                ] == "track-aware"
+                assert "highest_available" not in capability
 
                 migration_repo = tmp_path / "mcp-migration"
                 migration_repo.mkdir()
@@ -1964,7 +1978,8 @@ def test_real_mcp_stdio_executes_every_payload_tool_with_exact_family_attributio
                         )
                     },
                 )
-                assert config_patch["operation"] == "create"
+                assert config_patch["operation"] == "migration-config-patch"
+                assert config_patch["action"] == "create"
 
                 schema_result = await call(
                     "fork_ops_schema",
@@ -2016,7 +2031,7 @@ def test_real_mcp_stdio_executes_every_payload_tool_with_exact_family_attributio
     assert called_tools == set(mcp_server._REGISTERED_TOOL_IDS)
 
 
-def test_legacy_plan_consumers_separate_observed_acceptance_from_cutover_policy() -> None:
+def test_plan_consumers_enforce_the_atomic_cutover_policy() -> None:
     plan = payload_family(ArtifactKind.MIGRATION_PLAN)
     assert not hasattr(plan, "compatibility")
     assert not hasattr(LegacyPolicy, "READ_ONLY")
@@ -2052,12 +2067,12 @@ def test_legacy_plan_consumers_separate_observed_acceptance_from_cutover_policy(
     assert set(replay_consumers) == expected_replay_ids
     assert all(
         consumer.observed_compatibility.version_handling
-        is ObservedVersionHandling.UNINSPECTED
+        is ObservedVersionHandling.ENFORCED
         and consumer.observed_compatibility.missing_version
-        is ObservedVersionOutcome.ACCEPTED
+        is ObservedVersionOutcome.REFUSED
         and consumer.observed_compatibility.unknown_version
-        is ObservedVersionOutcome.ACCEPTED
-        and consumer.observed_compatibility.legacy_policy is LegacyPolicy.ACCEPT
+        is ObservedVersionOutcome.REFUSED
+        and consumer.observed_compatibility.legacy_policy is LegacyPolicy.REFUSE
         and consumer.cutover_compatibility is not None
         and consumer.cutover_compatibility.current == SchemaVersion.parse("1.0")
         and consumer.cutover_compatibility.legacy_policy is LegacyPolicy.REFUSE
@@ -2070,6 +2085,15 @@ def test_legacy_plan_consumers_separate_observed_acceptance_from_cutover_policy(
         "fork_ops_migration_blocker_resolution(workflow_output=)",
         "fork_ops:render_migration_narrative(workflow_output)",
     }
+    assert all(
+        consumer.observed_compatibility.version_handling
+        is ObservedVersionHandling.ENFORCED
+        and consumer.observed_compatibility.missing_version
+        is ObservedVersionOutcome.REFUSED
+        and consumer.observed_compatibility.unknown_version
+        is ObservedVersionOutcome.REFUSED
+        for consumer in diagnostic_consumers.values()
+    )
     for kind in replayed_families:
         replay_consumers = {
             consumer.id: consumer
@@ -2091,6 +2115,30 @@ def test_legacy_plan_consumers_separate_observed_acceptance_from_cutover_policy(
         if family.external_identity is ExternalIdentity.LEGACY_UNVERSIONED
         for consumer in family.consumers
         if consumer.purpose is ConsumerPurpose.DIAGNOSTIC
+    )
+
+
+def test_every_versioned_artifact_consumer_enforces_its_current_identity() -> None:
+    consumers = [
+        (family, consumer)
+        for family in PAYLOAD_FAMILIES
+        if family.external_identity is ExternalIdentity.VERSIONED_ARTIFACT
+        for consumer in family.consumers
+    ]
+
+    assert consumers
+    assert all(
+        consumer.observed_compatibility.version_handling
+        is ObservedVersionHandling.ENFORCED
+        and consumer.observed_compatibility.missing_version
+        is ObservedVersionOutcome.REFUSED
+        and consumer.observed_compatibility.unknown_version
+        is ObservedVersionOutcome.REFUSED
+        and consumer.observed_compatibility.legacy_policy is LegacyPolicy.REFUSE
+        and consumer.cutover_compatibility is not None
+        and consumer.cutover_compatibility.current == family.emitted_version
+        and consumer.cutover_compatibility.supported == (family.emitted_version,)
+        for family, consumer in consumers
     )
 
 
@@ -2129,9 +2177,11 @@ def test_inventory_identifies_every_legacy_persistence_boundary() -> None:
         )
 
     assert payload_family(ArtifactKind.MIGRATION_PLAN).external_identity is (
-        ExternalIdentity.LEGACY_UNVERSIONED
+        ExternalIdentity.VERSIONED_ARTIFACT
     )
-    assert payload_family(ArtifactKind.MIGRATION_PLAN).emitted_version is None
+    assert payload_family(ArtifactKind.MIGRATION_PLAN).emitted_version == (
+        SchemaVersion.parse("1.0")
+    )
 
 
 def test_workflow_aggregate_variants_remain_versioned_and_shape_compatible() -> None:
@@ -2458,7 +2508,7 @@ def test_python_payload_endpoints_execute_with_exact_role_attribution(
         tmp_path,
         include_proposed_config_patch=True,
     )
-    assert assessment_with_patch["proposed_config_patch"]["operation"] == "create"
+    assert assessment_with_patch["proposed_config_patch"]["action"] == "create"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("FORK_OPS_FULL_BREADTH_REPO_BASE", str(tmp_path))
     monkeypatch.setenv("FORK_OPS_FULL_BREADTH_MAINTAINED_REPOS", "")
@@ -2475,7 +2525,7 @@ def test_python_payload_endpoints_execute_with_exact_role_attribution(
         )
     blocker_explanation = explain_migration_blocker(plan)
     assert fork_ops.render_migration_narrative(blocker_explanation)["workflow_id"] == (
-        "blocker-resolution"
+            "migration-blocker-explanation"
     )
 
     payloads = {
@@ -2513,281 +2563,48 @@ def test_python_payload_endpoints_execute_with_exact_role_attribution(
         ArtifactKind.SCHEMA_ARTIFACT_REPORT: schema_artifact_report(plugin_root),
         ArtifactKind.MCP_HEALTHCHECK: mcp_server.mcp_healthcheck(),
     }
-    expected_root_keys = {
-        ArtifactKind.PLUGIN_HEALTH_REPORT: {
-            "checks",
-            "cli_fallback",
-            "model",
-            "mutation_policy",
-            "operation",
-            "plugin_root",
-            "repo_root",
-            "status_values",
-            "summary",
-        },
-        ArtifactKind.CONFIG_READ_RESULT: {"diagnostics", "path", "raw"},
-        ArtifactKind.STATUS_REPORT: {
-            "capability",
-            "config_exists",
-            "config_path",
-            "diagnostics",
-            "repo_path",
-        },
-        ArtifactKind.CAPABILITY_REPORT: {"highest_available", "levels"},
-        ArtifactKind.CONFIG_INITIALIZATION_RESULT: {
-            "applied_edits",
-            "blockers",
-            "mode",
-            "mutation",
-            "operation",
-            "repo_path",
-            "status",
-            "target_path",
-            "verification",
-        },
-        ArtifactKind.MIGRATION_ASSESSMENT: {
-            "candidates",
-            "complete",
-            "mode",
-            "narrative",
-            "next_actions",
-            "operation",
-            "repo_path",
-            "scan_accounting",
-            "summary",
-        },
-        ArtifactKind.EQUIPMENT_MIGRATION_PREFLIGHT: {
-            "accounting_records",
-            "activation_readiness",
-            "complete",
-            "default_onboarding_intent",
-            "discovery_scopes",
-            "equipment_groups",
-            "equipment_review_record",
-            "evidence",
-            "follow_up_candidates",
-            "limitations",
-            "mode",
-            "operation",
-            "operator_prompts",
-            "repo_path",
-            "scan_accounting",
-            "scan_profile",
-            "summary",
-            "unassessed_equipment_areas",
-        },
-        ArtifactKind.EMBEDDED_EQUIPMENT_MIGRATION_PREFLIGHT: {
-            "accounting_records",
-            "default_onboarding_intent",
-            "discovery_scopes",
-            "equipment_groups",
-            "evidence",
-            "follow_up_candidates",
-            "limitations",
-            "mode",
-            "operation",
-            "operator_prompts",
-            "repo_path",
-            "scan_profile",
-            "summary",
-            "unassessed_equipment_areas",
-        },
-        ArtifactKind.MIGRATION_CONFIG_PATCH: {
-            "complete",
-            "config",
-            "contract_tags",
-            "diagnostics",
-            "evidence",
-            "limitations",
-            "mode",
-            "operation",
-            "purpose",
-            "requires_review",
-            "scan_accounting",
-            "target_path",
-            "target_path_kind",
-            "toml",
-        },
-        ArtifactKind.MIGRATION_PLAN: {
-            "accounting_records",
-            "accounting_status_types",
-            "activation_readiness",
-            "blockers",
-            "complete",
-            "deferred_removals",
-            "equipment_disposition_types",
-            "equipment_migration_preflight",
-            "equipment_review_record",
-            "evidence",
-            "follow_up_candidates",
-            "limitations",
-            "migration_map",
-            "migration_review_artifact",
-            "mode",
-            "narrative",
-            "next_actions",
-            "operation",
-            "proposed_config_patch",
-            "repo_path",
-            "required_review",
-            "requires_review",
-            "retained_source_materials",
-            "scan_accounting",
-            "scan_profile",
-            "source_material_disposition_types",
-            "summary",
-            "validation_requirements",
-            "workflow_run_mode",
-        },
-        ArtifactKind.MIGRATION_DRY_RUN: {
-            "accounting_records",
-            "activation_readiness",
-            "blocked_steps",
-            "can_execute",
-            "config_changes",
-            "deferred_removals",
-            "equipment_migration_preflight",
-            "equipment_review_record",
-            "expected_verification_commands",
-            "file_edits",
-            "follow_up_candidates",
-            "limitations",
-            "migration_map",
-            "migration_review_artifact",
-            "mode",
-            "narrative",
-            "next_actions",
-            "operation",
-            "plan_operation",
-            "replayable_wet_run",
-            "repo_path",
-            "retained_authority",
-            "retained_materials",
-            "summary",
-            "unavailable_work",
-            "workflow_run_mode",
-        },
-        ArtifactKind.MIGRATION_EXECUTION_RESULT: {
-            "activation_readiness",
-            "applied_edits",
-            "blockers",
-            "deferred_removals",
-            "equipment_migration_preflight",
-            "equipment_review_record",
-            "migration_map",
-            "migration_review_artifact",
-            "mode",
-            "narrative",
-            "operation",
-            "plan_operation",
-            "replayable_wet_run",
-            "repo_path",
-            "retained_authority",
-            "retained_materials",
-            "skipped_edits",
-            "status",
-            "summary",
-            "unavailable_work",
-            "verification_results",
-            "workflow_run_mode",
-        },
-        ArtifactKind.MIGRATION_BLOCKER_EXPLANATION: {
-            "blocker",
-            "evidence",
-            "mode",
-            "narrative",
-            "operation",
-            "originating_workflow",
-            "resolution_workflow",
-            "safe_continuations",
-            "source_operation",
-            "unavailable_work",
-        },
-        ArtifactKind.MIGRATION_NARRATIVE: {
-            "blocker_explanations",
-            "kind",
-            "refusal",
-            "safe_continuations",
-            "sections",
-            "summary",
-            "text",
-            "title",
-            "unavailable_work",
-            "workflow_id",
-        },
-        ArtifactKind.MIGRATION_REVIEW_ARTIFACT: {
-            "content_kind",
-            "entries",
-            "markdown",
-            "source_material_review_decision_types",
-            "status",
-            "target_path",
-        },
-        ArtifactKind.EQUIPMENT_REVIEW: {
-            "accounting_records",
-            "accounting_status_types",
-            "artifact_kind",
-            "content_kind",
-            "default_onboarding_intent",
-            "discovery_scopes",
-            "equipment",
-            "equipment_decision_status_types",
-            "equipment_disposition_types",
-            "evidence",
-            "follow_up_candidates",
-            "review_freshness_policy",
-            "schema_version",
-            "status",
-            "target_path",
-            "toml",
-            "unassessed_equipment_areas",
-        },
-        ArtifactKind.WORKFLOW_CATALOG: {
-            "model",
-            "operation",
-            "status_values",
-            "workflows",
-        },
-        ArtifactKind.WORKFLOW_MIGRATION_INVENTORY: {
-            "accounting_records",
-            "backlog_candidates",
-            "catalog_evidence",
-            "complete",
-            "entries",
-            "follow_up_candidates",
-            "limit_reached",
-            "limitations",
-            "mode",
-            "mutation_policy",
-            "operation",
-            "profile_notes",
-            "scan_accounting",
-            "scan_profile",
-            "source_root_records",
-            "source_roots",
-            "summary",
-            "unresolvable_source_roots",
-        },
-        ArtifactKind.SCHEMA_ARTIFACT_REPORT: {
-            "artifacts",
-            "ok",
-            "plugin_root",
-            "runtime_schema_sha256",
-        },
-        ArtifactKind.MCP_HEALTHCHECK: {
-            "mcp_dependency_available",
-            "missing_dependency",
-            "server",
-            "tools",
-        },
+    operation_root = {
+        "artifact_kind",
+        "schema_version",
+        "operation",
+        "outcome",
+        "plan_executability",
+        "mutation_state",
+        "diagnostics",
+        "evidence",
     }
-
-    assert payloads.keys() == expected_root_keys.keys()
+    nested_artifact_kinds = {
+        ArtifactKind.MIGRATION_NARRATIVE,
+        ArtifactKind.MIGRATION_REVIEW_ARTIFACT,
+        ArtifactKind.EQUIPMENT_REVIEW,
+    }
+    assert payloads.keys() == {
+        ArtifactKind.PLUGIN_HEALTH_REPORT,
+        ArtifactKind.CONFIG_READ_RESULT,
+        ArtifactKind.STATUS_REPORT,
+        ArtifactKind.CAPABILITY_REPORT,
+        ArtifactKind.CONFIG_INITIALIZATION_RESULT,
+        ArtifactKind.MIGRATION_ASSESSMENT,
+        ArtifactKind.EQUIPMENT_MIGRATION_PREFLIGHT,
+        ArtifactKind.EMBEDDED_EQUIPMENT_MIGRATION_PREFLIGHT,
+        ArtifactKind.MIGRATION_CONFIG_PATCH,
+        ArtifactKind.MIGRATION_PLAN,
+        ArtifactKind.MIGRATION_DRY_RUN,
+        ArtifactKind.MIGRATION_EXECUTION_RESULT,
+        ArtifactKind.MIGRATION_BLOCKER_EXPLANATION,
+        ArtifactKind.MIGRATION_NARRATIVE,
+        ArtifactKind.MIGRATION_REVIEW_ARTIFACT,
+        ArtifactKind.EQUIPMENT_REVIEW,
+        ArtifactKind.WORKFLOW_CATALOG,
+        ArtifactKind.WORKFLOW_MIGRATION_INVENTORY,
+        ArtifactKind.SCHEMA_ARTIFACT_REPORT,
+        ArtifactKind.MCP_HEALTHCHECK,
+    }
     for kind, payload in payloads.items():
-        assert set(payload) == expected_root_keys[kind]
-        family = payload_family(kind)
-        if family.external_identity is ExternalIdentity.LEGACY_UNVERSIONED:
-            assert "artifact_kind" not in payload
+        assert payload["artifact_kind"] == kind.value
+        assert payload["schema_version"] == "1.0"
+        if kind not in nested_artifact_kinds:
+            assert operation_root <= set(payload)
 
     producer_edges = (
         (ArtifactKind.FORK_OPS_CONFIG, "fork_ops.core:create_initial_config_text"),
@@ -2942,12 +2759,12 @@ def test_python_payload_endpoints_execute_with_exact_role_attribution(
     assert observed_rows == _inventory_rows_characterized_by(_PYTHON_ENDPOINT_NODE)
 
 
-def test_legacy_replay_and_persisted_payloads_remain_accepted_and_exact(
+def test_canonical_replay_and_persisted_payloads_are_exact(
     tmp_path: Path,
 ) -> None:
     plan = generate_migration_plan(tmp_path)
-    assert "artifact_kind" not in plan
-    assert "schema_version" not in plan
+    assert plan["artifact_kind"] == "migration_plan"
+    assert plan["schema_version"] == "1.0"
 
     plan_path = tmp_path / "migration-plan.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
@@ -2995,6 +2812,21 @@ def test_legacy_replay_and_persisted_payloads_remain_accepted_and_exact(
         == python_plan_execution
     )
 
+    legacy_plan = json.loads(json.dumps(plan))
+    legacy_plan.pop("artifact_kind")
+    legacy_plan.pop("schema_version")
+    legacy_results = (
+        dry_run_migration(tmp_path, plan=legacy_plan),
+        dry_run_migration_plan(legacy_plan),
+        execute_migration(tmp_path, plan=legacy_plan),
+        execute_migration_plan(legacy_plan, tmp_path),
+    )
+    assert all(result["outcome"] == "refused" for result in legacy_results)
+    assert all(
+        result["diagnostics"][0]["code"] == "unsupported_artifact_version"
+        for result in legacy_results
+    )
+
     workflow_outputs = (
         assess_migration(tmp_path),
         persisted_plan,
@@ -3022,7 +2854,7 @@ def test_legacy_replay_and_persisted_payloads_remain_accepted_and_exact(
     equipment_path.write_text(equipment_toml, encoding="utf-8")
     persisted_review = build_status_report(tmp_path)["capability"]["equipment_review"]
     assert persisted_review["artifact_kind"] == "equipment_review"
-    assert persisted_review["schema_version"] == "0.1"
+    assert persisted_review["schema_version"] == "1.0"
 
     review_artifact = plan["migration_review_artifact"]
     review_path = tmp_path / review_artifact["target_path"]
