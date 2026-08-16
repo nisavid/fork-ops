@@ -586,7 +586,7 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
     ),
     WorkflowContract(
         id="migration-blocker-explanation",
-        title="Blocker explanation or resolution",
+        title="Migration blocker explanation",
         operator_intent="Explain a Fork Ops blocker and route the smallest safe continuation.",
         trigger_phrases=("explain this blocker", "resolve fork ops blocker"),
         capability_gate="identified",

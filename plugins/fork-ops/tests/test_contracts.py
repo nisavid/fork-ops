@@ -44,6 +44,7 @@ from fork_ops._contracts import (
     State,
     StateDimension,
     artifact_contract,
+    artifact_identity_diagnostic,
 )
 from fork_ops._payload_inventory import (
     PAYLOAD_FAMILIES,
@@ -80,8 +81,12 @@ from fork_ops.core import (
 )
 from fork_ops.dependency_security import collect_uv_audit_evidence, evaluate_dependency_security
 from fork_ops.mcp_server import fork_ops_migration_dry_run, fork_ops_migration_execute
+from fork_ops.schema import (
+    CONFIG_SCHEMA_ARTIFACT_KIND,
+    CONFIG_SCHEMA_VERSION,
+    schema_diagnostics,
+)
 from fork_ops.schema import Diagnostic as SchemaDiagnostic
-from fork_ops.schema import schema_diagnostics
 from fork_ops.security_exceptions import (
     SecurityExceptionValidationError,
     validate_authority_migration_projection,
@@ -699,6 +704,39 @@ def test_shared_diagnostic_evidence_state_and_outcome_primitives_are_independent
     assert outcome.states[0].dimension is StateDimension.PLAN_EXECUTABILITY
     assert outcome.value is OutcomeValue.BLOCKED
     assert outcome.evidence[0].id == "git:upstream-main"
+
+
+def test_artifact_identity_diagnostic_names_the_registered_version_field() -> None:
+    schema_diagnostic = artifact_identity_diagnostic(
+        {},
+        expected_kind=ArtifactKind.MIGRATION_PLAN,
+        path="migration_plan",
+        label="Migration plan",
+    )
+    contract_diagnostic = artifact_identity_diagnostic(
+        {},
+        expected_kind=ArtifactKind.SECURITY_EXCEPTION_CONTRACT,
+        path="security_exception_contract",
+        label="Security exception contract",
+    )
+
+    assert schema_diagnostic is not None
+    assert schema_diagnostic.detail is not None
+    assert schema_diagnostic.detail["observed_schema_version"] is None
+    assert schema_diagnostic.detail["supported_schema_versions"] == ["1.0"]
+    assert "observed_contract_version" not in schema_diagnostic.detail
+    assert contract_diagnostic is not None
+    assert contract_diagnostic.detail is not None
+    assert contract_diagnostic.detail["observed_contract_version"] is None
+    assert contract_diagnostic.detail["supported_contract_versions"] == ["1.0"]
+    assert "observed_schema_version" not in contract_diagnostic.detail
+
+
+def test_config_schema_identity_constants_match_the_artifact_registry() -> None:
+    contract = artifact_contract(ArtifactKind.FORK_OPS_CONFIG_SCHEMA)
+
+    assert CONFIG_SCHEMA_ARTIFACT_KIND == contract.emitted_artifact_kind
+    assert CONFIG_SCHEMA_VERSION == str(contract.current_version)
 
 
 def test_state_values_are_scoped_to_their_dimension() -> None:
