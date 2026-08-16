@@ -50,7 +50,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         workflow_catalog_check = namespace["_workflow_catalog_check"]
         contract_ids = namespace["WORKFLOW_CONTRACT_IDS"]
-        payload = {
+        payload: dict[str, Any] = {
             "artifact_kind": "workflow_catalog",
             "schema_version": "1.0",
             "contracts": [
@@ -84,6 +84,19 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 "implementation_extent": "planned",
             },
         )
+
+        payload["contracts"][0]["available_operation_ids"] = [
+            "duplicate-operation",
+            "duplicate-operation",
+        ]
+        with mock.patch.dict(
+            workflow_catalog_check.__globals__,
+            {"_run_command": run_command},
+        ):
+            duplicate_check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
+
+        self.assertEqual(duplicate_check["status"], "failed")
+        self.assertIn("extent is invalid", duplicate_check["stderr_tail"])
 
     @unittest.skipIf(os.name == "nt", "This test requires POSIX process groups.")
     def test_bounded_process_caps_combined_output_and_terminates_pipe_holders(self) -> None:

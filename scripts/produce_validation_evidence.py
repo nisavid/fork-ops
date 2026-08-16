@@ -1737,9 +1737,10 @@ def _workflow_catalog_check(
                     extent not in {"implemented", "partial", "planned"}
                     or not isinstance(available_operation_ids, list)
                     or not all(
-                        isinstance(operation_id, str)
+                        isinstance(operation_id, str) and bool(operation_id)
                         for operation_id in available_operation_ids
                     )
+                    or len(available_operation_ids) != len(set(available_operation_ids))
                 ):
                     raise ValueError("workflow contract extent is invalid")
                 contracts[contract_id] = {
