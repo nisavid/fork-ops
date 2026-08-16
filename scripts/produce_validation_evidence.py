@@ -1542,10 +1542,12 @@ contracts = []
 for workflow in catalog.get("workflows", []):
     if canonical:
         contracts.append({
-            "available_operation_ids": [
-                operation.get("id")
+            "operations": [
+                {
+                    "available": operation.get("available"),
+                    "id": operation.get("id"),
+                }
                 for operation in workflow.get("operations", [])
-                if operation.get("available") is True
             ],
             "id": workflow.get("id"),
             "implementation_extent": workflow.get("implementation_extent"),
@@ -1732,20 +1734,45 @@ def _workflow_catalog_check(
                 raise ValueError("workflow contract identity is invalid")
             if canonical:
                 extent = record.get("implementation_extent")
-                available_operation_ids = record.get("available_operation_ids")
+                operations = record.get("operations")
                 if (
                     extent not in {"implemented", "partial", "planned"}
-                    or not isinstance(available_operation_ids, list)
-                    or not all(
-                        isinstance(operation_id, str) and bool(operation_id)
-                        for operation_id in available_operation_ids
-                    )
-                    or len(available_operation_ids) != len(set(available_operation_ids))
+                    or not isinstance(operations, list)
+                    or not operations
                 ):
                     raise ValueError("workflow contract extent is invalid")
+                operation_ids: list[str] = []
+                availability: set[bool] = set()
+                canonical_operations: list[dict[str, str | bool]] = []
+                for operation in operations:
+                    if not isinstance(operation, dict):
+                        raise ValueError("workflow contract extent is invalid")
+                    operation_id = operation.get("id")
+                    available = operation.get("available")
+                    if (
+                        not isinstance(operation_id, str)
+                        or not operation_id
+                        or type(available) is not bool
+                    ):
+                        raise ValueError("workflow contract extent is invalid")
+                    operation_ids.append(operation_id)
+                    availability.add(available)
+                    canonical_operations.append(
+                        {"available": available, "id": operation_id}
+                    )
+                if len(operation_ids) != len(set(operation_ids)):
+                    raise ValueError("workflow contract extent is invalid")
+                if availability == {True}:
+                    expected_extent = "implemented"
+                elif availability == {False}:
+                    expected_extent = "planned"
+                else:
+                    expected_extent = "partial"
+                if extent != expected_extent:
+                    raise ValueError("workflow contract extent is invalid")
                 contracts[contract_id] = {
-                    "available_operation_ids": available_operation_ids,
                     "implementation_extent": extent,
+                    "operations": canonical_operations,
                 }
             else:
                 status = record.get("implementation_status")
