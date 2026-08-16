@@ -984,8 +984,13 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(
                 workflow_catalog["contracts"]["guarded-sync-execution"],
                 {
-                    "available_operation_ids": [],
                     "implementation_extent": "planned",
+                    "operations": [
+                        {
+                            "available": False,
+                            "id": "guarded-sync-execution",
+                        }
+                    ],
                 },
             )
             self.assertIn("runtime", inventories["3.11"]["typing-extensions"])
@@ -4000,9 +4005,27 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         "schema_version": "1.0",
                         "contracts": [
                             {{
-                                "available_operation_ids": available_operation_ids,
                                 "id": contract_id,
                                 "implementation_extent": extent,
+                                "operations": [
+                                    *[
+                                        {{"available": True, "id": operation_id}}
+                                        for operation_id in available_operation_ids
+                                    ],
+                                    *(
+                                        [{{
+                                            "available": False,
+                                            "id": f"{{contract_id}}-unavailable",
+                                        }}]
+                                        if extent == "partial"
+                                        else []
+                                    ),
+                                    *(
+                                        [{{"available": False, "id": contract_id}}]
+                                        if extent == "planned"
+                                        else []
+                                    ),
+                                ],
                             }}
                             for contract_id, extent, available_operation_ids in records
                         ],
@@ -4368,9 +4391,27 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         "schema_version": "1.0",
                         "contracts": [
                             {{
-                                "available_operation_ids": available_operation_ids,
                                 "id": contract_id,
                                 "implementation_extent": extent,
+                                "operations": [
+                                    *[
+                                        {{"available": True, "id": operation_id}}
+                                        for operation_id in available_operation_ids
+                                    ],
+                                    *(
+                                        [{{
+                                            "available": False,
+                                            "id": f"{{contract_id}}-unavailable",
+                                        }}]
+                                        if extent == "partial"
+                                        else []
+                                    ),
+                                    *(
+                                        [{{"available": False, "id": contract_id}}]
+                                        if extent == "planned"
+                                        else []
+                                    ),
+                                ],
                             }}
                             for contract_id, extent, available_operation_ids in records
                         ],
