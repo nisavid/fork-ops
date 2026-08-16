@@ -33,28 +33,55 @@ from fork_ops.core import (
 )
 from fork_ops.workflow_catalog import workflow_catalog, workflow_contracts
 
+_STATE_FIELDS = {
+    "activation_readiness",
+    "replacement_coverage",
+    "operational_continuity",
+}
+_STATE_CONTAINERS = {
+    "accounting",
+    "capability",
+    "equipment_migration_preflight",
+    "equipment_review",
+    "equipment_review_record",
+    "migration_plan",
+    "preview",
+}
 
-def _state_evidence_ids(value: object) -> set[str]:
+
+def _state_value_evidence_ids(value: object) -> set[str]:
     if isinstance(value, dict):
-        current = set()
-        if {"value", "evidence_ids"}.issubset(value) and isinstance(
-            value["evidence_ids"], list
-        ):
-            current.update(
+        evidence_ids = value.get("evidence_ids")
+        return (
+            {
                 evidence_id
-                for evidence_id in value["evidence_ids"]
+                for evidence_id in evidence_ids
                 if isinstance(evidence_id, str)
-            )
-        for nested in value.values():
-            current.update(_state_evidence_ids(nested))
-        return current
+            }
+            if isinstance(evidence_ids, list)
+            else set()
+        )
     if isinstance(value, list):
         return {
             evidence_id
             for nested in value
-            for evidence_id in _state_evidence_ids(nested)
+            for evidence_id in _state_value_evidence_ids(nested)
         }
     return set()
+
+
+def _state_evidence_ids(value: object, *, state_container: bool = True) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    references: set[str] = set()
+    for key, nested in value.items():
+        if state_container and key in _STATE_FIELDS:
+            references.update(_state_value_evidence_ids(nested))
+        elif key in _STATE_CONTAINERS or (
+            isinstance(nested, dict) and isinstance(nested.get("artifact_kind"), str)
+        ):
+            references.update(_state_evidence_ids(nested))
+    return references
 
 
 def _root_evidence_ids(payload: dict[str, Any]) -> set[str]:
@@ -579,6 +606,35 @@ def test_config_validation_exit_and_required_level_are_canonical(
     assert cli_result["required_level"]["missing"]
 
 
+@pytest.mark.parametrize("schema_version", [None, "9.9"])
+def test_text_config_validation_renders_unassessed_required_level(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    schema_version: str | None,
+) -> None:
+    _write_initial_config(tmp_path, schema_version=schema_version or "0.1")
+    if schema_version is None:
+        path = tmp_path / CONFIG_RELATIVE_PATH
+        path.write_text(
+            path.read_text().replace('schema_version = "0.1"\n\n', ""),
+            encoding="utf-8",
+        )
+
+    assert cli_main(
+        [
+            "config",
+            "validate",
+            "--repo",
+            str(tmp_path),
+            "--required-level",
+            "sync-ready",
+        ]
+    ) == 1
+    stdout = capsys.readouterr().out
+    assert "required_level=sync-ready: unassessed" in stdout
+    assert "missing_for_required_level=" not in stdout
+
+
 def test_cli_exit_status_matches_canonical_operation_outcome(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -623,14 +679,39 @@ def test_canonical_wrapper_rejects_reserved_field_collisions() -> None:
 
 def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependency(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     config = parse_config_text(
         create_initial_config_text(tmp_path, discover_git_remotes=False)
     )
-    config["x_vendor"] = {"guard": "opaque"}
+    config["x_vendor"] = {
+        "guard": "opaque",
+        "value": "ready",
+        "evidence_ids": ["foreign-evidence"],
+    }
 
     normalized = core_module.normalize_config(config)
-    assert normalized["x_vendor"] == {"guard": "opaque"}
+    assert normalized["x_vendor"] == {
+        "guard": "opaque",
+        "value": "ready",
+        "evidence_ids": ["foreign-evidence"],
+    }
+
+    target = tmp_path / CONFIG_RELATIVE_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        create_initial_config_text(tmp_path, discover_git_remotes=False)
+        + '\n[x_vendor]\nvalue = "ready"\nevidence_ids = ["foreign-evidence"]\n',
+        encoding="utf-8",
+    )
+    python_result = core_module.read_config_result(tmp_path, normalized=True)
+    mcp_result = mcp_server.fork_ops_config_read(str(tmp_path), normalized=True)
+    assert cli_main(
+        ["config", "show", "--repo", str(tmp_path), "--format", "json"]
+    ) == 0
+    cli_result = json.loads(capsys.readouterr().out)
+    assert cli_result == mcp_result == python_result
+    assert cli_result["config"]["x_vendor"]["value"] == "ready"
 
     without_extension = deepcopy(config)
     without_extension.pop("x_vendor")

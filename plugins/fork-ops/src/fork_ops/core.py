@@ -893,14 +893,20 @@ def build_plugin_health_report(
 
     checks.append(mcp_config_check)
 
-    mcp_startup_check, mcp_startup_payload = _mcp_process_startup_check(
+    mcp_startup_check, mcp_startup_payload = _mcp_healthcheck_process_check(
         mcp_config_check,
         runner,
         timeout,
         cli_ready=cli_ready,
     )
     checks.append(mcp_startup_check)
-    checks.append(_mcp_tool_listing_check(mcp_startup_check, mcp_startup_payload, cli_ready))
+    checks.append(
+        _mcp_declared_tool_inventory_check(
+            mcp_startup_check,
+            mcp_startup_payload,
+            cli_ready,
+        )
+    )
     checks.append(_ui_visibility_check(ui_visible))
 
     summary = _plugin_health_summary(checks)
@@ -1349,7 +1355,7 @@ def _mcp_config_resolution_check(
     )
 
 
-def _mcp_process_startup_check(
+def _mcp_healthcheck_process_check(
     config_check: dict[str, Any],
     command_runner: CommandRunner,
     timeout: float,
@@ -1359,10 +1365,10 @@ def _mcp_process_startup_check(
     if config_check["status"] != "ready":
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "unavailable",
-                "MCP startup was not probed because MCP config is not ready.",
+                "MCP health check was not probed because MCP config is not ready.",
                 evidence={"blocked_by": "mcp_config_resolution"},
                 next_steps=_mcp_failure_next_steps(cli_ready),
             ),
@@ -1379,8 +1385,8 @@ def _mcp_process_startup_check(
     if completed.returncode != 0:
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process failed.",
                 evidence=evidence,
@@ -1394,8 +1400,8 @@ def _mcp_process_startup_check(
         evidence["error"] = str(exc)
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process did not return JSON.",
                 evidence=evidence,
@@ -1407,8 +1413,8 @@ def _mcp_process_startup_check(
         evidence["json_type"] = type(payload).__name__
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process did not return a JSON object.",
                 evidence=evidence,
@@ -1420,8 +1426,8 @@ def _mcp_process_startup_check(
         evidence["server"] = payload.get("server")
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process returned an unexpected server name.",
                 evidence=evidence,
@@ -1439,8 +1445,8 @@ def _mcp_process_startup_check(
         evidence["artifact_identity"] = identity_diagnostic.to_dict()
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process returned an unsupported contract.",
                 evidence=evidence,
@@ -1454,8 +1460,8 @@ def _mcp_process_startup_check(
         evidence["missing_dependency"] = payload.get("missing_dependency")
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP health-check process returned malformed dependency metadata.",
                 evidence=evidence,
@@ -1467,8 +1473,8 @@ def _mcp_process_startup_check(
         evidence["missing_dependency"] = payload.get("missing_dependency")
         return (
             _health_check(
-                "mcp_process_startup",
-                "MCP process startup",
+                "mcp_healthcheck_process",
+                "MCP health-check process",
                 "failed",
                 "Fork Ops MCP optional dependency is not installed.",
                 evidence=evidence,
@@ -1481,35 +1487,35 @@ def _mcp_process_startup_check(
     evidence.pop("stderr", None)
     return (
         _health_check(
-            "mcp_process_startup",
-            "MCP process startup",
+            "mcp_healthcheck_process",
+            "MCP health-check process",
             "ready",
-            "Fork Ops MCP health-check process starts successfully.",
+            "Fork Ops MCP health-check process executes successfully.",
             evidence=evidence,
         ),
         payload,
     )
 
 
-def _mcp_tool_listing_check(
+def _mcp_declared_tool_inventory_check(
     startup_check: dict[str, Any],
     startup_payload: dict[str, Any] | None,
     cli_ready: bool,
 ) -> dict[str, Any]:
     if startup_check["status"] != "ready" or startup_payload is None:
         return _health_check(
-            "mcp_tool_listing",
-            "MCP tool listing",
+            "mcp_declared_tool_inventory",
+            "MCP declared tool inventory",
             "unavailable",
-            "MCP tool listing was not inspected because MCP startup is not ready.",
-            evidence={"blocked_by": "mcp_process_startup"},
+            "MCP declared tool inventory was not inspected because MCP health check is not ready.",
+            evidence={"blocked_by": "mcp_healthcheck_process"},
             next_steps=_mcp_failure_next_steps(cli_ready),
         )
     tools = startup_payload.get("tools")
     if not isinstance(tools, list) or not all(isinstance(item, str) for item in tools):
         return _health_check(
-            "mcp_tool_listing",
-            "MCP tool listing",
+            "mcp_declared_tool_inventory",
+            "MCP declared tool inventory",
             "failed",
             "MCP health-check output does not include a string tool list.",
             evidence={"tools": tools},
@@ -1518,16 +1524,16 @@ def _mcp_tool_listing_check(
     missing_tools = [tool for tool in MCP_TOOL_IDS if tool not in tools]
     if missing_tools:
         return _health_check(
-            "mcp_tool_listing",
-            "MCP tool listing",
+            "mcp_declared_tool_inventory",
+            "MCP declared tool inventory",
             "failed",
             "MCP health-check output is missing expected Fork Ops tools.",
             evidence={"tools": tools, "missing_tools": missing_tools},
             next_steps=_mcp_failure_next_steps(cli_ready),
         )
     return _health_check(
-        "mcp_tool_listing",
-        "MCP tool listing",
+        "mcp_declared_tool_inventory",
+        "MCP declared tool inventory",
         "ready",
         "Fork Ops MCP health-check output lists the expected tools.",
         evidence={"tools": tools},
@@ -2343,12 +2349,26 @@ def _migration_workflow_identity_diagnostic(
     if kind is None or (
         not allow_explanation and kind is ArtifactKind.MIGRATION_BLOCKER_EXPLANATION
     ):
+        expected_artifact_kinds = sorted(
+            artifact_kind
+            for artifact_kind, registered_kind in _MIGRATION_ARTIFACT_KIND_BY_VALUE.items()
+            if allow_explanation
+            or registered_kind is not ArtifactKind.MIGRATION_BLOCKER_EXPLANATION
+        )
+        supported_schema_versions = sorted(
+            {
+                str(current_artifact_version(_MIGRATION_ARTIFACT_KIND_BY_VALUE[value]))
+                for value in expected_artifact_kinds
+            }
+        )
         return Diagnostic(
             severity="error",
             code="unsupported_artifact_version",
             message="Workflow output uses an unsupported artifact identity or version.",
             path="workflow_output",
             detail={
+                "expected_artifact_kind": expected_artifact_kinds,
+                "supported_schema_versions": supported_schema_versions,
                 "observed_artifact_kind": observed_kind,
                 "observed_schema_version": payload.get("schema_version"),
                 "regeneration": "Regenerate the workflow output with Fork Ops 1.0.",
@@ -3739,9 +3759,11 @@ def execute_migration_plan(
                 completed_result.clear()
                 completed_result.update(fallback)
             else:
-                completed_result["outcome"] = OutcomeValue.BLOCKED
-                completed_result["plan_executability"] = PlanExecutabilityValue.BLOCKED
-                completed_result["mutation_state"] = MutationStateValue.NOT_STARTED
+                completed_result["outcome"] = OutcomeValue.BLOCKED.value
+                completed_result["plan_executability"] = (
+                    PlanExecutabilityValue.BLOCKED.value
+                )
+                completed_result["mutation_state"] = MutationStateValue.NOT_STARTED.value
                 blockers = completed_result.setdefault("blockers", [])
                 if isinstance(blockers, list):
                     blockers.append(
@@ -3821,7 +3843,12 @@ def explain_migration_blocker(
         "mode": "read-only",
         "source_operation": workflow_output.get("operation"),
         "originating_workflow": _workflow_contract_dict(_originating_migration_workflow_id()),
-        "resolution_workflow": _workflow_contract_dict("migration-blocker-explanation"),
+        "continuation_workflow": _workflow_contract_dict(
+            _originating_migration_workflow_id()
+        ),
+        "explanation_workflow": _workflow_contract_dict(
+            "migration-blocker-explanation"
+        ),
         "blocker": copy.deepcopy(blocker),
         "blocker_evidence": evidence,
         "safe_continuations": _safe_continuations_for_blocker(blocker, evidence),
@@ -7617,7 +7644,7 @@ def _attach_equipment_review(
             }
         )
     if capability.get("outcome") == OutcomeValue.COMPLETED:
-        capability["outcome"] = OutcomeValue.BLOCKED
+        capability["outcome"] = OutcomeValue.BLOCKED.value
 
 
 def _activation_readiness_report(
@@ -9118,8 +9145,8 @@ def initialize_config(
             first_edit = next((edit for edit in applied if isinstance(edit, dict)), None)
             if first_edit is not None:
                 return _minimal_applied_unverified_config_result(repo, first_edit, exc)
-        result["outcome"] = OutcomeValue.BLOCKED
-        result["mutation_state"] = MutationStateValue.NOT_STARTED
+        result["outcome"] = OutcomeValue.BLOCKED.value
+        result["mutation_state"] = MutationStateValue.NOT_STARTED.value
         blockers = result.setdefault("blockers", [])
         if isinstance(blockers, list):
             blockers.append(

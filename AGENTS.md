@@ -37,8 +37,8 @@ The merged foundation supports:
 - Capability reporting for all defined levels, with implemented operations
   centered on `track-aware`.
 - Operator onboarding plugin health diagnostics for independent readiness paths:
-  plugin registration, skill discovery, CLI execution, MCP config, MCP startup,
-  MCP tool listing, and UI visibility when inspectable.
+  plugin registration, skill discovery, CLI execution, MCP config, MCP health check,
+  MCP declared tool inventory, and UI visibility when inspectable.
 - Local Git diagnostics for configured remotes and upstream track refs.
 - Read-only workflow migration inventory reporting for operator-provided source
   roots, with catalog evidence references and backlog candidates.

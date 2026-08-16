@@ -9,11 +9,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from ._contracts import ArtifactKind
 from .core import (
     MAX_FILE_BYTES,
     SCAN_PROFILES,
     ForkOpsError,
     _read_absolute_regular_file,
+    _require_current_artifact,
     _validate_bounded_object,
     assess_migration,
     build_equipment_migration_preflight,
@@ -288,9 +290,12 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
         print(f"highest_authority_ready={highest}")
     if args.required_level and report["required_level"]["authority_ready"] is not True:
         if not args.json:
+            authority_ready = report["required_level"]["authority_ready"]
             missing = report["required_level"]["missing"]
-            print(f"required_level={args.required_level}: not_ready")
-            print(f"missing_for_required_level={', '.join(missing) or 'none'}")
+            status = "not_ready" if authority_ready is False else "unassessed"
+            print(f"required_level={args.required_level}: {status}")
+            if isinstance(missing, list):
+                print(f"missing_for_required_level={', '.join(missing) or 'none'}")
     return _domain_exit(report)
 
 
@@ -314,13 +319,11 @@ def cmd_config_init(args: argparse.Namespace) -> int:
         upstream_name=args.upstream_name,
         default_branch=args.default_branch,
     )
-    if (
-        result.get("artifact_kind") != "config_initialization_result"
-        or result.get("schema_version") != "1.0"
-    ):
-        raise ForkOpsError(
-            "Config initialization returned an unsupported artifact identity or version."
-        )
+    _require_current_artifact(
+        result,
+        ArtifactKind.CONFIG_INITIALIZATION_RESULT,
+        "Config initialization result",
+    )
     if result["outcome"] != "completed" or result["mutation_state"] != "applied":
         print(_config_initialization_failure_message(result), file=sys.stderr)
         return _domain_exit(result)
@@ -371,6 +374,15 @@ def cmd_capability_report(args: argparse.Namespace) -> int:
         print(json.dumps(capability, indent=2, sort_keys=True))
     else:
         authority = capability["authority_readiness"]
+        for field in ("outcome", "plan_executability", "mutation_state"):
+            print(f"{field}={capability[field]}")
+        print(f"baseline_assurance={capability['baseline_assurance']}")
+        for field in (
+            "activation_readiness",
+            "replacement_coverage",
+            "operational_continuity",
+        ):
+            print(f"{field}={capability[field]['value']}")
         print(f"highest_authority_ready={authority['highest_authority_ready'] or 'none'}")
         for level, details in authority["levels"].items():
             status = (
@@ -383,6 +395,17 @@ def cmd_capability_report(args: argparse.Namespace) -> int:
             print(f"{level}: {status}")
             if details["missing"]:
                 print(f"  missing: {', '.join(details['missing'])}")
+        for workflow in capability["workflow_availability"]:
+            workflow_id = workflow["workflow_id"]
+            print(
+                f"workflow.{workflow_id}.implementation_extent="
+                f"{workflow['implementation_extent']}"
+            )
+            available_operations = workflow["available_operations"]
+            print(
+                f"workflow.{workflow_id}.available_operations="
+                f"{','.join(available_operations) or 'none'}"
+            )
         if capability.get("diagnostics"):
             _print_diagnostics(capability)
     return _domain_exit(capability)

@@ -87,7 +87,8 @@ contract.
 
 CLI JSON and MCP tools return the same canonical domain object for the same
 operation and inputs. Protocol envelopes and human CLI rendering may differ,
-but they do not redefine fields. CLI exit status is 0 for a completed domain
+but human status rendering must not omit or redefine the independent domain
+states. CLI exit status is 0 for a completed domain
 request, including a completed report whose plan is blocked; 1 for a trustworthy
 blocked, refused, or failed domain result; and 2 for invalid CLI input or when no
 trustworthy domain result can be formed.
@@ -104,7 +105,7 @@ each operation mode is `diagnostic`, `read_only`, or `guarded_mutation`.
 
 Use plugin health when first bringing Fork Ops online or when one control
 surface works while another is missing. The report checks plugin registration,
-skill discovery, CLI execution, MCP config, MCP startup, MCP tool listing, and
+skill discovery, CLI execution, MCP config, MCP health check, MCP declared tool inventory, and
 UI visibility when inspectable.
 
 ```bash
@@ -112,11 +113,14 @@ uv run --package fork-ops fork-ops plugin health
 ```
 
 Registration, skill, and MCP config checks are observational. MCP config must
-exactly match the reviewed plugin registration before the MCP runtime probe
-starts. The independent CLI probe still runs when MCP config is absent, malformed,
-or changed. Both runtime probes use the current Python interpreter in isolated
+exactly match the reviewed plugin registration before the MCP health-check process
+runs. The independent CLI probe still runs when MCP config is absent, malformed,
+or changed. Both process probes use the current Python interpreter in isolated
 mode to run the installed `fork_ops.cli` and `fork_ops.mcp_server` modules; they
 never run a wrapper script or command metadata from the inspected plugin root.
+The MCP probe verifies dependency import, the private health-check process, and
+the server's declared tool inventory. It does not claim stdio initialization,
+protocol tool listing or invocation, or shutdown readiness.
 
 Each readiness path reports one status: `ready`, `failed`, `unavailable`, or
 `uninspectable`. MCP failures include next paths, and the report provides CLI
