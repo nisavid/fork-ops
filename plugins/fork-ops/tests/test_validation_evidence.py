@@ -55,9 +55,14 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             "schema_version": "1.0",
             "contracts": [
                 {
-                    "available_operation_ids": list[str](),
                     "id": contract_id,
                     "implementation_extent": "planned",
+                    "operations": [
+                        {
+                            "available": False,
+                            "id": "planned-operation",
+                        }
+                    ],
                 }
                 for contract_id in contract_ids
             ],
@@ -80,23 +85,99 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         self.assertEqual(
             check["contracts"]["guarded-sync-execution"],
             {
-                "available_operation_ids": [],
                 "implementation_extent": "planned",
+                "operations": [
+                    {
+                        "available": False,
+                        "id": "planned-operation",
+                    }
+                ],
             },
         )
 
-        payload["contracts"][0]["available_operation_ids"] = [
-            "duplicate-operation",
-            "duplicate-operation",
-        ]
-        with mock.patch.dict(
-            workflow_catalog_check.__globals__,
-            {"_run_command": run_command},
-        ):
-            duplicate_check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
+        successful_contracts = (
+            {
+                "implementation_extent": "implemented",
+                "operations": [{"available": True, "id": "implemented-operation"}],
+            },
+            {
+                "implementation_extent": "partial",
+                "operations": [
+                    {"available": True, "id": "implemented-operation"},
+                    {"available": False, "id": "planned-operation"},
+                ],
+            },
+        )
+        first_contract_id = contract_ids[0]
+        for successful_contract in successful_contracts:
+            with self.subTest(contract=successful_contract):
+                payload["contracts"][0].update(successful_contract)
+                with mock.patch.dict(
+                    workflow_catalog_check.__globals__,
+                    {"_run_command": run_command},
+                ):
+                    successful_check = workflow_catalog_check(
+                        REPOSITORY_ROOT,
+                        ["uv", "run"],
+                    )
 
-        self.assertEqual(duplicate_check["status"], "failed")
-        self.assertIn("extent is invalid", duplicate_check["stderr_tail"])
+                self.assertEqual(
+                    successful_check["status"],
+                    "passed",
+                    successful_check.get("stderr_tail"),
+                )
+                self.assertEqual(
+                    successful_check["contracts"][first_contract_id],
+                    successful_contract,
+                )
+
+        invalid_contracts = (
+            {
+                "implementation_extent": "implemented",
+                "operations": [{"available": False, "id": "operation"}],
+            },
+            {
+                "implementation_extent": "planned",
+                "operations": [{"available": True, "id": "operation"}],
+            },
+            {
+                "implementation_extent": "partial",
+                "operations": [{"available": True, "id": "operation"}],
+            },
+            {
+                "implementation_extent": "partial",
+                "operations": [{"available": False, "id": "operation"}],
+            },
+            {
+                "implementation_extent": "partial",
+                "operations": [
+                    {"available": True, "id": "duplicate"},
+                    {"available": False, "id": "duplicate"},
+                ],
+            },
+            {
+                "implementation_extent": "planned",
+                "operations": list[dict[str, object]](),
+            },
+            {
+                "implementation_extent": "planned",
+                "operations": [{"available": "false", "id": "operation"}],
+            },
+        )
+        for invalid_contract in invalid_contracts:
+            with self.subTest(contract=invalid_contract):
+                payload["contracts"][0].update(invalid_contract)
+                with mock.patch.dict(
+                    workflow_catalog_check.__globals__,
+                    {"_run_command": run_command},
+                ):
+                    invalid_check = workflow_catalog_check(
+                        REPOSITORY_ROOT,
+                        ["uv", "run"],
+                    )
+
+                self.assertEqual(invalid_check["status"], "failed")
+                self.assertIn("extent is invalid", invalid_check["stderr_tail"])
 
     @unittest.skipIf(os.name == "nt", "This test requires POSIX process groups.")
     def test_bounded_process_caps_combined_output_and_terminates_pipe_holders(self) -> None:
