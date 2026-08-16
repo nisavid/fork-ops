@@ -635,6 +635,36 @@ def test_text_config_validation_renders_unassessed_required_level(
     assert "missing_for_required_level=" not in stdout
 
 
+@pytest.mark.parametrize(
+    ("failure_kind", "diagnostic_code"),
+    [
+        ("missing", "config.missing"),
+        ("uninspectable", "config.uninspectable"),
+        ("parse-failed", "config.parse_failed"),
+    ],
+)
+def test_text_config_validation_renders_canonical_error_status(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure_kind: str,
+    diagnostic_code: str,
+) -> None:
+    target = tmp_path / CONFIG_RELATIVE_PATH
+    if failure_kind == "uninspectable":
+        target.mkdir(parents=True)
+    elif failure_kind == "parse-failed":
+        target.parent.mkdir(parents=True)
+        target.write_text("[invalid", encoding="utf-8")
+
+    assert cli_main(["config", "validate", "--repo", str(tmp_path)]) == 1
+    stdout = capsys.readouterr().out
+    assert diagnostic_code in stdout
+    assert "outcome=blocked" in stdout
+    assert "plan_executability=not_applicable" in stdout
+    assert "mutation_state=not_requested" in stdout
+    assert "capability.outcome=blocked" in stdout
+
+
 def test_cli_exit_status_matches_canonical_operation_outcome(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -675,6 +705,31 @@ def test_canonical_wrapper_rejects_reserved_field_collisions() -> None:
                 },
             },
         )
+    for list_state in (
+        {
+            "replacement_coverage": [
+                {
+                    "value": "covered",
+                    "evidence_ids": ["missing-list-evidence"],
+                }
+            ]
+        },
+        {
+            "preview": {
+                "operational_continuity": [
+                    {
+                        "value": "continuous",
+                        "evidence_ids": ["missing-nested-list-evidence"],
+                    }
+                ]
+            }
+        },
+    ):
+        with pytest.raises(ValueError, match="unattached evidence"):
+            core_module._canonical_operation_result(
+                core_module.ArtifactKind.MIGRATION_ASSESSMENT,
+                {"operation": "migration-assessment", **list_state},
+            )
 
 
 def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependency(
@@ -689,6 +744,11 @@ def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependenc
         "value": "ready",
         "evidence_ids": ["foreign-evidence"],
     }
+    config["artifact_kind"] = "foreign-extension"
+    config["activation_readiness"] = {
+        "value": "ready",
+        "evidence_ids": ["foreign-artifact-evidence"],
+    }
 
     normalized = core_module.normalize_config(config)
     assert normalized["x_vendor"] == {
@@ -696,11 +756,26 @@ def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependenc
         "value": "ready",
         "evidence_ids": ["foreign-evidence"],
     }
+    assert normalized["artifact_kind"] == "foreign-extension"
+    assert normalized["activation_readiness"] == {
+        "value": "ready",
+        "evidence_ids": ["foreign-artifact-evidence"],
+    }
 
     target = tmp_path / CONFIG_RELATIVE_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
+    config_text = create_initial_config_text(tmp_path, discover_git_remotes=False)
+    config_text = config_text.replace(
+        'schema_version = "0.1"\n',
+        'schema_version = "0.1"\n'
+        'artifact_kind = "foreign-extension"\n\n'
+        '[activation_readiness]\n'
+        'value = "ready"\n'
+        'evidence_ids = ["foreign-artifact-evidence"]\n',
+        1,
+    )
     target.write_text(
-        create_initial_config_text(tmp_path, discover_git_remotes=False)
+        config_text
         + '\n[x_vendor]\nvalue = "ready"\nevidence_ids = ["foreign-evidence"]\n',
         encoding="utf-8",
     )
@@ -712,6 +787,10 @@ def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependenc
     cli_result = json.loads(capsys.readouterr().out)
     assert cli_result == mcp_result == python_result
     assert cli_result["config"]["x_vendor"]["value"] == "ready"
+    assert cli_result["config"]["artifact_kind"] == "foreign-extension"
+    assert cli_result["config"]["activation_readiness"]["evidence_ids"] == [
+        "foreign-artifact-evidence"
+    ]
 
     without_extension = deepcopy(config)
     without_extension.pop("x_vendor")
