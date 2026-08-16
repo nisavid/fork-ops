@@ -1533,15 +1533,34 @@ import json
 
 from fork_ops.workflow_catalog import workflow_catalog
 
-contracts = [
-    {
-        "available": workflow.get("available"),
-        "id": workflow.get("id"),
-        "implementation_status": workflow.get("implementation_status"),
-    }
-    for workflow in workflow_catalog().get("workflows", [])
-]
-print(json.dumps({"contracts": contracts}, sort_keys=True))
+catalog = workflow_catalog()
+canonical = (
+    catalog.get("artifact_kind") == "workflow_catalog"
+    and catalog.get("schema_version") == "1.0"
+)
+contracts = []
+for workflow in catalog.get("workflows", []):
+    if canonical:
+        contracts.append({
+            "available_operation_ids": [
+                operation.get("id")
+                for operation in workflow.get("operations", [])
+                if operation.get("available") is True
+            ],
+            "id": workflow.get("id"),
+            "implementation_extent": workflow.get("implementation_extent"),
+        })
+    else:
+        contracts.append({
+            "available": workflow.get("available"),
+            "id": workflow.get("id"),
+            "implementation_status": workflow.get("implementation_status"),
+        })
+payload = {"contracts": contracts}
+if "artifact_kind" in catalog or "schema_version" in catalog:
+    payload["artifact_kind"] = catalog.get("artifact_kind")
+    payload["schema_version"] = catalog.get("schema_version")
+print(json.dumps(payload, sort_keys=True))
 """
 
 
@@ -1695,6 +1714,12 @@ def _workflow_catalog_check(
         return check
     try:
         payload = json.loads(check["_stdout_complete"])
+        canonical = "artifact_kind" in payload or "schema_version" in payload
+        if canonical and (
+            payload.get("artifact_kind") != "workflow_catalog"
+            or payload.get("schema_version") != "1.0"
+        ):
+            raise ValueError("workflow catalog artifact identity is unsupported")
         records = payload["contracts"]
         if not isinstance(records, list):
             raise TypeError("workflow contracts must be an array")
@@ -1703,19 +1728,37 @@ def _workflow_catalog_check(
             if not isinstance(record, dict):
                 raise TypeError("workflow contract entries must be objects")
             contract_id = record.get("id")
-            status = record.get("implementation_status")
-            available = record.get("available")
-            if (
-                not isinstance(contract_id, str)
-                or status not in {"current", "diagnostic-only", "next-slice", "planned"}
-                or not isinstance(available, bool)
-                or contract_id in contracts
-            ):
-                raise ValueError("workflow contract identity or status is invalid")
-            contracts[contract_id] = {
-                "available": available,
-                "implementation_status": status,
-            }
+            if not isinstance(contract_id, str) or contract_id in contracts:
+                raise ValueError("workflow contract identity is invalid")
+            if canonical:
+                extent = record.get("implementation_extent")
+                available_operation_ids = record.get("available_operation_ids")
+                if (
+                    extent not in {"implemented", "partial", "planned"}
+                    or not isinstance(available_operation_ids, list)
+                    or not all(
+                        isinstance(operation_id, str)
+                        for operation_id in available_operation_ids
+                    )
+                ):
+                    raise ValueError("workflow contract extent is invalid")
+                contracts[contract_id] = {
+                    "available_operation_ids": available_operation_ids,
+                    "implementation_extent": extent,
+                }
+            else:
+                status = record.get("implementation_status")
+                available = record.get("available")
+                if (
+                    status
+                    not in {"current", "diagnostic-only", "next-slice", "planned"}
+                    or not isinstance(available, bool)
+                ):
+                    raise ValueError("workflow contract status is invalid")
+                contracts[contract_id] = {
+                    "available": available,
+                    "implementation_status": status,
+                }
     except (KeyError, json.JSONDecodeError, TypeError, ValueError) as exc:
         check["status"] = "failed"
         check["exit_code"] = 1

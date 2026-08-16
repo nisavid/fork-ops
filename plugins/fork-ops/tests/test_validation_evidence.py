@@ -46,6 +46,45 @@ MCP_TOOL_NAMES = [
 
 
 class ValidationEvidenceEntrypointTests(unittest.TestCase):
+    def test_workflow_catalog_check_accepts_canonical_contracts(self) -> None:
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        workflow_catalog_check = namespace["_workflow_catalog_check"]
+        contract_ids = namespace["WORKFLOW_CONTRACT_IDS"]
+        payload = {
+            "artifact_kind": "workflow_catalog",
+            "schema_version": "1.0",
+            "contracts": [
+                {
+                    "available_operation_ids": list[str](),
+                    "id": contract_id,
+                    "implementation_extent": "planned",
+                }
+                for contract_id in contract_ids
+            ],
+        }
+
+        def run_command(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "_stdout_complete": json.dumps(payload),
+                "exit_code": 0,
+                "status": "passed",
+            }
+
+        with mock.patch.dict(
+            workflow_catalog_check.__globals__,
+            {"_run_command": run_command},
+        ):
+            check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
+
+        self.assertEqual(check["status"], "passed", check.get("stderr_tail"))
+        self.assertEqual(
+            check["contracts"]["guarded-sync-execution"],
+            {
+                "available_operation_ids": [],
+                "implementation_extent": "planned",
+            },
+        )
+
     @unittest.skipIf(os.name == "nt", "This test requires POSIX process groups.")
     def test_bounded_process_caps_combined_output_and_terminates_pipe_holders(self) -> None:
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
