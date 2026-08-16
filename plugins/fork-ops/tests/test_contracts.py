@@ -45,6 +45,7 @@ from fork_ops._contracts import (
     StateDimension,
     artifact_contract,
     artifact_identity_diagnostic,
+    operation_artifact,
 )
 from fork_ops._payload_inventory import (
     PAYLOAD_FAMILIES,
@@ -732,6 +733,34 @@ def test_artifact_identity_diagnostic_names_the_registered_version_field() -> No
     assert "observed_schema_version" not in contract_diagnostic.detail
 
 
+def test_unknown_migration_artifact_diagnostic_has_stable_expected_identity() -> None:
+    diagnostic = core_module._migration_workflow_identity_diagnostic(
+        {"artifact_kind": "unknown", "schema_version": "9.9"},
+        allow_explanation=False,
+    )
+
+    assert diagnostic is not None
+    assert diagnostic.detail is not None
+    assert diagnostic.detail["expected_artifact_kind"] == sorted(
+        artifact_kind
+        for artifact_kind, kind in core_module._MIGRATION_ARTIFACT_KIND_BY_VALUE.items()
+        if kind is not ArtifactKind.MIGRATION_BLOCKER_EXPLANATION
+    )
+    assert diagnostic.detail["supported_schema_versions"] == ["1.0"]
+
+
+def test_versioned_inventory_distinguishes_omitted_and_explicit_artifact_kind() -> None:
+    with pytest.raises(ValueError, match="inventory artifact kind differs"):
+        payload_inventory_module._versioned(
+            ArtifactKind.MIGRATION_PLAN,
+            emitted_artifact_kind=None,
+            producers=(),
+            consumers=(),
+            docs=(),
+            tests=(),
+        )
+
+
 def test_config_schema_identity_constants_match_the_artifact_registry() -> None:
     contract = artifact_contract(ArtifactKind.FORK_OPS_CONFIG_SCHEMA)
 
@@ -816,6 +845,34 @@ def test_evidence_detail_is_a_detached_canonical_immutable_value() -> None:
         evidence.detail["changed"] = True  # type: ignore[index]
     with pytest.raises(ValueError, match="canonical"):
         Evidence(id="invalid", source="test", detail={"ratio": 0.5})
+
+
+def test_evidence_detail_does_not_masquerade_as_canonical_state() -> None:
+    payload = operation_artifact(
+        ArtifactKind.MIGRATION_ASSESSMENT,
+        "migration-assessment",
+        {
+            "evidence": [
+                Evidence(
+                    id="upstream:opaque",
+                    source="upstream",
+                    detail={
+                        "value": "ready",
+                        "evidence_ids": ["foreign-evidence"],
+                    },
+                ).to_dict()
+            ]
+        },
+    )
+
+    evidence = payload["evidence"]
+    assert isinstance(evidence, list)
+    first_evidence = evidence[0]
+    assert isinstance(first_evidence, dict)
+    assert first_evidence["detail"] == {
+        "value": "ready",
+        "evidence_ids": ["foreign-evidence"],
+    }
 
 
 def test_payload_inventory_is_complete_for_current_legacy_and_versioned_families() -> None:
@@ -1343,6 +1400,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         expected_exit=0,
     )
     assert "highest_authority_ready=" in stdout
+    capability_text = stdout
 
     stdout, _ = execute(
         ["capability", "report", "--repo", str(config_repo), "--json"],
@@ -1359,6 +1417,29 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
     assert capability_json["artifact_kind"] == "capability_report"
     assert "authority_readiness" in capability_json
     assert "highest_available" not in capability_json
+    for field in (
+        "outcome",
+        "plan_executability",
+        "mutation_state",
+        "baseline_assurance",
+    ):
+        assert f"{field}={capability_json[field]}" in capability_text
+    for field in (
+        "activation_readiness",
+        "replacement_coverage",
+        "operational_continuity",
+    ):
+        assert f"{field}={capability_json[field]['value']}" in capability_text
+    for workflow in capability_json["workflow_availability"]:
+        workflow_id = workflow["workflow_id"]
+        assert (
+            f"workflow.{workflow_id}.implementation_extent="
+            f"{workflow['implementation_extent']}"
+        ) in capability_text
+        assert (
+            f"workflow.{workflow_id}.available_operations="
+            f"{','.join(workflow['available_operations']) or 'none'}"
+        ) in capability_text
 
     migration_repo = tmp_path / "migration"
     migration_repo.mkdir()

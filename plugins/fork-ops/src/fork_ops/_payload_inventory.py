@@ -374,6 +374,13 @@ def _legacy(
     )
 
 
+class _OmittedArtifactKind:
+    pass
+
+
+_OMITTED_ARTIFACT_KIND = _OmittedArtifactKind()
+
+
 def _versioned(
     kind: ArtifactKind,
     *,
@@ -384,7 +391,7 @@ def _versioned(
     tests: tuple[str, ...],
     external_identity: ExternalIdentity = ExternalIdentity.VERSIONED_ARTIFACT,
     version_field: str | None = "schema_version",
-    emitted_artifact_kind: str | None = None,
+    emitted_artifact_kind: str | None | _OmittedArtifactKind = _OMITTED_ARTIFACT_KIND,
     producer_gap: str = "",
     consumer_gap: str = "",
     persistence_gap: str = "",
@@ -393,7 +400,7 @@ def _versioned(
     parsed_version = current_artifact_version(kind)
     selected_artifact_kind = (
         contract.emitted_artifact_kind
-        if emitted_artifact_kind is None
+        if isinstance(emitted_artifact_kind, _OmittedArtifactKind)
         else emitted_artifact_kind
     )
     if version_field != contract.version_field:

@@ -176,7 +176,7 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
             "Check plugin registration.",
             "Check skill discovery.",
             "Check CLI execution.",
-            "Check MCP config, startup, and tool listing.",
+            "Check MCP config, health-check process, and declared tool inventory.",
             "Report UI visibility only when an inspection surface exists.",
         ),
         mutation_gates=("No repository mutation is allowed during onboarding diagnostics.",),
@@ -622,7 +622,10 @@ WORKFLOW_CONTRACTS: tuple[WorkflowContract, ...] = (
         handoff_expectations=(
             "Ask for a concrete operator decision when multiple safe paths exist.",
         ),
-        closeout_criteria=("Blocker is resolved, deferred, or routed to a named follow-up.",),
+        closeout_criteria=(
+            "Blocker evidence is explained and each continuation is routed through the "
+            "originating workflow, deferred, or unavailable.",
+        ),
     ),
 )
 

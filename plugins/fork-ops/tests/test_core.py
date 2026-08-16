@@ -525,12 +525,15 @@ class ForkOpsCoreTests(unittest.TestCase):
                 "skill_discovery": "ready",
                 "cli_execution": "ready",
                 "mcp_config_resolution": "ready",
-                "mcp_process_startup": "ready",
-                "mcp_tool_listing": "ready",
+                "mcp_healthcheck_process": "ready",
+                "mcp_declared_tool_inventory": "ready",
                 "ui_visibility": "ready",
             },
         )
-        self.assertIn("fork_ops_plugin_health", checks["mcp_tool_listing"]["evidence"]["tools"])
+        self.assertIn(
+            "fork_ops_plugin_health",
+            checks["mcp_declared_tool_inventory"]["evidence"]["tools"],
+        )
 
     def test_plugin_health_report_keeps_mcp_failure_independent_from_cli(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -546,14 +549,14 @@ class ForkOpsCoreTests(unittest.TestCase):
         self.assertEqual(report["summary"]["status"], "failed")
         self.assertEqual(report["outcome"], "failed")
         self.assertEqual(checks["cli_execution"]["status"], "ready")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
-        self.assertEqual(checks["mcp_tool_listing"]["status"], "unavailable")
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "failed")
+        self.assertEqual(checks["mcp_declared_tool_inventory"]["status"], "unavailable")
         self.assertEqual(checks["ui_visibility"]["status"], "uninspectable")
         self.assertTrue(report["cli_fallback"]["usable"])
         self.assertTrue(
             any(
                 "fork-ops workflow catalog" in step
-                for step in checks["mcp_process_startup"]["next_steps"]
+                for step in checks["mcp_healthcheck_process"]["next_steps"]
             )
         )
 
@@ -635,7 +638,7 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         checks = {check["id"]: check for check in report["checks"]}
         self.assertEqual(checks["mcp_config_resolution"]["status"], "failed")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "unavailable")
         self.assertIn("reviewed registration shape", checks["mcp_config_resolution"]["summary"])
 
     def test_plugin_health_report_refuses_changed_mcp_registration_without_mcp_launching(
@@ -697,7 +700,7 @@ class ForkOpsCoreTests(unittest.TestCase):
                 checks = {check["id"]: check for check in report["checks"]}
                 self.assertEqual(checks["mcp_config_resolution"]["status"], "failed")
                 self.assertEqual(checks["cli_execution"]["status"], "ready")
-                self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+                self.assertEqual(checks["mcp_healthcheck_process"]["status"], "unavailable")
                 self.assertEqual(
                     launches,
                     [[sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"]],
@@ -742,7 +745,7 @@ class ForkOpsCoreTests(unittest.TestCase):
 
         next_checks = {check["id"]: check for check in next_report["checks"]}
         self.assertEqual(next_checks["mcp_config_resolution"]["status"], "failed")
-        self.assertEqual(next_checks["mcp_process_startup"]["status"], "unavailable")
+        self.assertEqual(next_checks["mcp_healthcheck_process"]["status"], "unavailable")
 
     def test_plugin_health_report_uses_isolated_package_modules_instead_of_plugin_scripts(
         self,
@@ -801,7 +804,7 @@ class ForkOpsCoreTests(unittest.TestCase):
         checks = {check["id"]: check for check in report["checks"]}
         trusted_cwd = Path(mcp_server.__file__).resolve().parent
         self.assertEqual(checks["cli_execution"]["status"], "ready")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "ready")
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "ready")
         self.assertEqual(
             launches,
             [
@@ -850,7 +853,7 @@ class ForkOpsCoreTests(unittest.TestCase):
         checks = {check["id"]: check for check in report["checks"]}
         trusted_cwd = Path(mcp_server.__file__).resolve().parent
         self.assertEqual(checks["cli_execution"]["status"], "ready")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "unavailable")
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "unavailable")
         self.assertEqual([cwd for _, cwd in launches], [trusted_cwd])
         self.assertEqual(checks["skill_discovery"]["status"], "uninspectable")
         self.assertEqual(checks["mcp_config_resolution"]["status"], "uninspectable")
@@ -886,9 +889,9 @@ class ForkOpsCoreTests(unittest.TestCase):
             )
 
         checks = {check["id"]: check for check in report["checks"]}
-        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
-        self.assertEqual(checks["mcp_tool_listing"]["status"], "unavailable")
-        self.assertFalse(checks["mcp_process_startup"]["evidence"]["mcp_dependency_available"])
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "failed")
+        self.assertEqual(checks["mcp_declared_tool_inventory"]["status"], "unavailable")
+        self.assertFalse(checks["mcp_healthcheck_process"]["evidence"]["mcp_dependency_available"])
 
     def test_plugin_health_report_requires_mcp_dependency_metadata(self) -> None:
         def missing_dependency_metadata_runner(
@@ -923,8 +926,8 @@ class ForkOpsCoreTests(unittest.TestCase):
             )
 
         checks = {check["id"]: check for check in report["checks"]}
-        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
-        self.assertIn("dependency metadata", checks["mcp_process_startup"]["summary"])
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "failed")
+        self.assertIn("dependency metadata", checks["mcp_healthcheck_process"]["summary"])
 
     def test_plugin_health_report_rejects_non_object_json_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -964,8 +967,8 @@ class ForkOpsCoreTests(unittest.TestCase):
         checks = {check["id"]: check for check in report["checks"]}
         self.assertEqual(checks["cli_execution"]["status"], "failed")
         self.assertEqual(checks["cli_execution"]["evidence"]["json_type"], "list")
-        self.assertEqual(checks["mcp_process_startup"]["status"], "failed")
-        self.assertEqual(checks["mcp_process_startup"]["evidence"]["json_type"], "list")
+        self.assertEqual(checks["mcp_healthcheck_process"]["status"], "failed")
+        self.assertEqual(checks["mcp_healthcheck_process"]["evidence"]["json_type"], "list")
 
     def test_plugin_health_report_rejects_malformed_cli_workflows_metadata(self) -> None:
         def malformed_workflows_runner(
@@ -1095,7 +1098,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             [sys.executable, "-I", "-m", "fork_ops.cli", "workflow", "catalog"],
         )
         self.assertEqual(
-            checks["mcp_process_startup"]["evidence"]["command"],
+            checks["mcp_healthcheck_process"]["evidence"]["command"],
             [sys.executable, "-I", "-m", "fork_ops.mcp_server", "--health-check"],
         )
         self.assertEqual(
@@ -1103,7 +1106,7 @@ class ForkOpsCoreTests(unittest.TestCase):
             "current-interpreter-isolated-package-module",
         )
         self.assertEqual(
-            checks["mcp_process_startup"]["evidence"]["launch_provenance"],
+            checks["mcp_healthcheck_process"]["evidence"]["launch_provenance"],
             "current-interpreter-isolated-package-module",
         )
 
@@ -6444,7 +6447,15 @@ default_onboarding_intent = "migrate_toward_fork_ops"
         self.assertEqual(resolution["operation"], "migration-blocker-explanation")
         self.assertEqual(resolution["source_operation"], "migration-plan")
         self.assertEqual(resolution["originating_workflow"]["id"], "fork-authority-migration")
-        self.assertEqual(resolution["resolution_workflow"]["id"], "migration-blocker-explanation")
+        self.assertEqual(
+            resolution["continuation_workflow"]["id"],
+            "fork-authority-migration",
+        )
+        self.assertEqual(
+            resolution["explanation_workflow"]["id"],
+            "migration-blocker-explanation",
+        )
+        self.assertNotIn("resolution_workflow", resolution)
         self.assertEqual(resolution["blocker"]["code"], "semantic_coverage.incomplete")
         self.assertEqual(
             resolution["blocker_evidence"]["paths"],
@@ -7304,6 +7315,42 @@ default_onboarding_intent = "migrate_toward_fork_ops"
         self.assertEqual(result["mutation_state"], "applied_unverified")
         self.assertTrue(result["mutation"]["occurred"])
         self.assertEqual(result["applied_edits"][0]["status"], "applied_unverified")
+
+    def test_blocked_config_initialization_close_failure_keeps_json_scalar_types(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            target_path = repo_path / CONFIG_RELATIVE_PATH
+            target_path.parent.mkdir()
+            target_path.write_text("existing\n")
+            original_close = core_module._BoundRepository.close
+            injected = False
+
+            def close_root_then_fail(bound_repo: Any) -> None:
+                nonlocal injected
+                original_close(bound_repo)
+                if not injected:
+                    injected = True
+                    raise OSError("injected root descriptor close failure")
+
+            with patch.object(
+                core_module._BoundRepository,
+                "close",
+                side_effect=close_root_then_fail,
+                autospec=True,
+            ):
+                result = initialize_config(
+                    repo_path,
+                    repository_owner="owner",
+                    repository_name="repo",
+                )
+
+        self.assertTrue(injected)
+        self.assertIs(type(result["outcome"]), str)
+        self.assertIs(type(result["mutation_state"]), str)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["mutation_state"], "not_started")
 
     def test_migration_scan_discards_evidence_when_root_identity_changes(self) -> None:
         with tempfile.TemporaryDirectory() as root:

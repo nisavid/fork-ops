@@ -178,7 +178,7 @@ A fork-ops workflow that verifies plugin installation, CLI access, MCP registrat
 _Avoid_: Fork authority migration, target fork assessment.
 
 **Plugin Health**:
-The readiness state of Fork Ops plugin surfaces, including plugin registration, skill discovery, CLI execution, MCP config resolution, MCP process startup, MCP tool listing, and Codex UI visibility where a control surface exists.
+The readiness state of Fork Ops plugin surfaces, including plugin registration, skill discovery, CLI execution, MCP config resolution, MCP health-check process, MCP declared tool inventory, and Codex UI visibility where a control surface exists.
 _Avoid_: Plugin installed flag, single all-or-nothing readiness status.
 
 **Dogfood Target**:

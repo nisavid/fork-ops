@@ -691,24 +691,64 @@ def _validate_operation_payload(payload: Mapping[str, object]) -> None:
         )
 
 
-def _referenced_state_evidence_ids(value: object) -> set[str]:
+_STATE_FIELD_NAMES = frozenset(
+    {
+        "activation_readiness",
+        "replacement_coverage",
+        "operational_continuity",
+    }
+)
+_STATE_CONTAINER_NAMES = frozenset(
+    {
+        "accounting",
+        "capability",
+        "equipment_migration_preflight",
+        "equipment_review",
+        "equipment_review_record",
+        "migration_plan",
+        "preview",
+    }
+)
+
+
+def _state_evidence_ids(value: object) -> set[str]:
     if isinstance(value, Mapping):
-        references: set[str] = set()
-        if {"value", "evidence_ids"}.issubset(value) and isinstance(
-            value.get("evidence_ids"), list
-        ):
-            references.update(
+        evidence_ids = value.get("evidence_ids")
+        return (
+            {
                 evidence_id
-                for evidence_id in value["evidence_ids"]
+                for evidence_id in evidence_ids
                 if isinstance(evidence_id, str)
-            )
-        for nested in value.values():
-            references.update(_referenced_state_evidence_ids(nested))
-        return references
+            }
+            if isinstance(evidence_ids, list)
+            else set()
+        )
     if isinstance(value, (list, tuple)):
         return {
             evidence_id
             for nested in value
-            for evidence_id in _referenced_state_evidence_ids(nested)
+            for evidence_id in _state_evidence_ids(nested)
         }
     return set()
+
+
+def _referenced_state_evidence_ids(
+    value: object,
+    *,
+    state_container: bool = True,
+) -> set[str]:
+    if not isinstance(value, Mapping):
+        return set()
+    references: set[str] = set()
+    for key, nested in value.items():
+        if state_container and key in _STATE_FIELD_NAMES:
+            references.update(_state_evidence_ids(nested))
+            continue
+        nested_is_artifact = isinstance(nested, Mapping) and isinstance(
+            nested.get("artifact_kind"), str
+        )
+        if key in _STATE_CONTAINER_NAMES or nested_is_artifact:
+            references.update(
+                _referenced_state_evidence_ids(nested, state_container=True)
+            )
+    return references
