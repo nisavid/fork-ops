@@ -46,6 +46,61 @@ MCP_TOOL_NAMES = [
 
 
 class ValidationEvidenceEntrypointTests(unittest.TestCase):
+    def test_workflow_catalog_check_accepts_blocker_explanation_id_cutover(self) -> None:
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        workflow_catalog_check = namespace["_workflow_catalog_check"]
+        contract_ids = tuple(
+            sorted(
+                "migration-blocker-explanation"
+                if item == "blocker-resolution"
+                else item
+                for item in namespace["WORKFLOW_CONTRACT_IDS"]
+            )
+        )
+        payload = {
+            "artifact_kind": "workflow_catalog",
+            "schema_version": "1.0",
+            "contracts": [
+                {
+                    "id": contract_id,
+                    "implementation_extent": "planned",
+                    "operations": [
+                        {
+                            "available": False,
+                            "id": "planned-operation",
+                        }
+                    ],
+                }
+                for contract_id in contract_ids
+            ],
+        }
+
+        def run_command(
+            _check_id: str,
+            _arguments: list[str],
+            required_ids: list[str],
+            _command: list[str],
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "_stdout_complete": json.dumps(payload),
+                "exit_code": 0,
+                "required_ids": required_ids,
+                "status": "passed",
+            }
+
+        with mock.patch.dict(
+            workflow_catalog_check.__globals__,
+            {"_run_command": run_command},
+        ):
+            check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
+
+        self.assertEqual(check["status"], "passed", check.get("stderr_tail"))
+        self.assertEqual(
+            check["required_ids"],
+            [f"workflow.catalog_contract.{contract_id}" for contract_id in contract_ids],
+        )
+
     def test_workflow_catalog_check_accepts_canonical_contracts(self) -> None:
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         workflow_catalog_check = namespace["_workflow_catalog_check"]
