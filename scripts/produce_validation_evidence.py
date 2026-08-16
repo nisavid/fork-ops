@@ -87,15 +87,6 @@ WORKFLOW_CONTRACT_IDS = (
     "upstream-sync-planning",
     "workflow-migration-inventory",
 )
-WORKFLOW_CONTRACT_ID_SETS = (
-    WORKFLOW_CONTRACT_IDS,
-    tuple(
-        sorted(
-            "migration-blocker-explanation" if item == "blocker-resolution" else item
-            for item in WORKFLOW_CONTRACT_IDS
-        )
-    ),
-)
 MCP_TOOL_NAMES = (
     "fork_ops_capability_report",
     "fork_ops_config_read",
@@ -1801,17 +1792,11 @@ def _workflow_catalog_check(
         check["exit_code"] = 1
         check["stderr_tail"] = f"Workflow catalog discovery was not usable: {exc}"
         return check
-    observed_contract_ids = tuple(sorted(contracts))
     check["contracts"] = dict(sorted(contracts.items()))
-    if observed_contract_ids not in WORKFLOW_CONTRACT_ID_SETS:
+    if tuple(sorted(contracts)) != WORKFLOW_CONTRACT_IDS:
         check["status"] = "failed"
         check["exit_code"] = 1
         check["stderr_tail"] = "Workflow catalog IDs did not match the validation contract."
-    else:
-        check["required_ids"] = [
-            f"workflow.catalog_contract.{contract_id}"
-            for contract_id in observed_contract_ids
-        ]
     return check
 
 

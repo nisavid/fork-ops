@@ -539,6 +539,18 @@ _STATE_VALUES_BY_DIMENSION = {
 }
 
 
+def _validate_state_value_registry(
+    registry: Mapping[StateDimension, object],
+) -> None:
+    if set(registry) != set(StateDimension):
+        raise RuntimeError(
+            "state value registry must explicitly cover every state dimension"
+        )
+
+
+_validate_state_value_registry(_STATE_VALUES_BY_DIMENSION)
+
+
 @dataclass(frozen=True)
 class State:
     """One value in one state dimension, bound to named evidence when available."""

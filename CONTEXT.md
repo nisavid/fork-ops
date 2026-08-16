@@ -694,8 +694,8 @@ _Avoid_: Dry run, assessment.
 - **Operational Continuity** does not authorize source-material removal.
 - **Replacement Coverage** applies to source-material behavior, not to entire files or whole workflows.
 - Config representation preserves authority in machine-readable form but does not establish **Replacement Coverage** until current Fork Ops behavior consumes and validates it.
-- Planned workflows do not establish **Replacement Coverage**.
-- A diagnostic operation establishes **Replacement Coverage** only for the named diagnostic behavior, not for mutation or repair behavior.
+- Planned workflows do not establish replacement coverage.
+- A diagnostic operation establishes replacement coverage only for the named diagnostic behavior, not for mutation or repair behavior.
 - Shadow Mode and Advisory Mode output do not establish **Replacement Coverage** by themselves.
 - Source material with both covered and uncovered behavior remains retained authority until every behavior is covered, excluded, or deferred through reviewed disposition.
 - A **Migration Plan** should include a migration map.

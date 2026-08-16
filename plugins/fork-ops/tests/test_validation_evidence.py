@@ -46,18 +46,11 @@ MCP_TOOL_NAMES = [
 
 
 class ValidationEvidenceEntrypointTests(unittest.TestCase):
-    def test_workflow_catalog_check_accepts_blocker_explanation_id_cutover(self) -> None:
+    def test_workflow_catalog_check_accepts_canonical_contracts(self) -> None:
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         workflow_catalog_check = namespace["_workflow_catalog_check"]
-        contract_ids = tuple(
-            sorted(
-                "migration-blocker-explanation"
-                if item == "blocker-resolution"
-                else item
-                for item in namespace["WORKFLOW_CONTRACT_IDS"]
-            )
-        )
-        payload = {
+        contract_ids = namespace["WORKFLOW_CONTRACT_IDS"]
+        payload: dict[str, Any] = {
             "artifact_kind": "workflow_catalog",
             "schema_version": "1.0",
             "contracts": [
@@ -100,43 +93,6 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             check["required_ids"],
             [f"workflow.catalog_contract.{contract_id}" for contract_id in contract_ids],
         )
-
-    def test_workflow_catalog_check_accepts_canonical_contracts(self) -> None:
-        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
-        workflow_catalog_check = namespace["_workflow_catalog_check"]
-        contract_ids = namespace["WORKFLOW_CONTRACT_IDS"]
-        payload: dict[str, Any] = {
-            "artifact_kind": "workflow_catalog",
-            "schema_version": "1.0",
-            "contracts": [
-                {
-                    "id": contract_id,
-                    "implementation_extent": "planned",
-                    "operations": [
-                        {
-                            "available": False,
-                            "id": "planned-operation",
-                        }
-                    ],
-                }
-                for contract_id in contract_ids
-            ],
-        }
-
-        def run_command(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {
-                "_stdout_complete": json.dumps(payload),
-                "exit_code": 0,
-                "status": "passed",
-            }
-
-        with mock.patch.dict(
-            workflow_catalog_check.__globals__,
-            {"_run_command": run_command},
-        ):
-            check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
-
-        self.assertEqual(check["status"], "passed", check.get("stderr_tail"))
         self.assertEqual(
             check["contracts"]["guarded-sync-execution"],
             {
@@ -233,6 +189,30 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
                 self.assertEqual(invalid_check["status"], "failed")
                 self.assertIn("extent is invalid", invalid_check["stderr_tail"])
+
+        payload["contracts"][0].update(
+            {
+                "implementation_extent": "planned",
+                "operations": [{"available": False, "id": "planned-operation"}],
+            }
+        )
+        blocker_contract = next(
+            contract
+            for contract in payload["contracts"]
+            if contract["id"] == "migration-blocker-explanation"
+        )
+        blocker_contract["id"] = "blocker-resolution"
+        with mock.patch.dict(
+            workflow_catalog_check.__globals__,
+            {"_run_command": run_command},
+        ):
+            legacy_check = workflow_catalog_check(REPOSITORY_ROOT, ["uv", "run"])
+
+        self.assertEqual(legacy_check["status"], "failed")
+        self.assertEqual(
+            legacy_check["stderr_tail"],
+            "Workflow catalog IDs did not match the validation contract.",
+        )
 
     @unittest.skipIf(os.name == "nt", "This test requires POSIX process groups.")
     def test_bounded_process_caps_combined_output_and_terminates_pipe_holders(self) -> None:

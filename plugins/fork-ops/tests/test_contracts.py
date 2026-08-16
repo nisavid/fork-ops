@@ -43,6 +43,7 @@ from fork_ops._contracts import (
     SchemaVersion,
     State,
     StateDimension,
+    _validate_state_value_registry,
     artifact_contract,
     artifact_identity_diagnostic,
     operation_artifact,
@@ -867,6 +868,14 @@ def test_state_values_are_scoped_to_their_dimension() -> None:
     )
     assert type(enum_backed_state.value) is str
     assert type(enum_backed_state.to_dict()["value"]) is str
+
+
+def test_state_value_registry_requires_exact_dimension_coverage() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="state value registry must explicitly cover every state dimension",
+    ):
+        _validate_state_value_registry({})
 
 
 def test_sequence_backed_contract_primitives_detach_caller_owned_lists() -> None:
