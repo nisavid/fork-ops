@@ -249,8 +249,9 @@ or branch state.
 
 Library and MCP dry runs with a supplied plan use an explicitly selected
 repository when one is provided; omitting the repository uses the plan's bound
-repository. The CLI `--plan` form uses the plan's bound repository because
-`--plan` and `--repo` are mutually exclusive.
+repository. The CLI `migration dry-run --plan` form uses the plan's bound repository
+because `migration dry-run --plan` and `migration dry-run --repo` are mutually
+exclusive.
 
 Migration execution applies a migration plan through guarded operations when
 the dry-run preview has no blockers. When no plan file is supplied, the CLI

@@ -37,11 +37,9 @@ from fork_ops.workflow_catalog import workflow_catalog, workflow_contracts
 def _state_evidence_ids(value: object) -> set[str]:
     if isinstance(value, dict):
         current = set()
-        if {
-            "value",
-            "evidence_ids",
-            "derivation_rule",
-        }.issubset(value) and isinstance(value["evidence_ids"], list):
+        if {"value", "evidence_ids"}.issubset(value) and isinstance(
+            value["evidence_ids"], list
+        ):
             current.update(
                 evidence_id
                 for evidence_id in value["evidence_ids"]
@@ -91,6 +89,9 @@ def test_workflow_catalog_uses_the_canonical_versioned_contract() -> None:
     assert "blocker-resolution" not in workflows
     assert workflows["migration-blocker-explanation"]["implementation_extent"] == (
         "implemented"
+    )
+    assert workflows["migration-blocker-explanation"]["title"] == (
+        "Migration blocker explanation"
     )
     assert workflows["fork-authority-migration"]["implementation_extent"] == "partial"
     assert workflows["upstream-sync-planning"]["implementation_extent"] == "planned"
@@ -207,12 +208,12 @@ def _write_initial_config(repo: Path, *, schema_version: str = "0.1") -> None:
 
 def test_cli_and_mcp_share_config_status_and_capability_payloads(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_initial_config(tmp_path)
 
     assert cli_main(["config", "show", "--repo", str(tmp_path), "--format", "json"]) == 0
-    cli_config_read = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_config_read = json.loads(capsys.readouterr().out)
     mcp_config_read = mcp_server.fork_ops_config_read(str(tmp_path), normalized=True)
     assert cli_config_read == mcp_config_read
     assert cli_config_read["artifact_kind"] == "config_read_result"
@@ -220,14 +221,14 @@ def test_cli_and_mcp_share_config_status_and_capability_payloads(
     assert cli_config_read["config"]["schema_version"] == "0.1"
 
     assert cli_main(["config", "validate", "--repo", str(tmp_path), "--json"]) == 0
-    cli_status = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_status = json.loads(capsys.readouterr().out)
     mcp_status = mcp_server.fork_ops_config_validate(str(tmp_path))
     assert cli_status == mcp_status == build_status_report(tmp_path, include_config=True)
     assert cli_status["artifact_kind"] == "status_report"
     assert cli_status["schema_version"] == "1.0"
 
     assert cli_main(["capability", "report", "--repo", str(tmp_path), "--json"]) == 0
-    cli_capability = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_capability = json.loads(capsys.readouterr().out)
     mcp_capability = mcp_server.fork_ops_capability_report(str(tmp_path))
     assert cli_capability == mcp_capability == cli_status["capability"]
     assert cli_capability["artifact_kind"] == "capability_report"
@@ -265,7 +266,7 @@ def test_unsupported_config_version_is_identified_raw_and_refused_before_semanti
 
 def test_unsupported_config_never_mints_identity_or_readiness_semantics(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     text = create_initial_config_text(tmp_path, discover_git_remotes=False)
     text = text.replace('schema_version = "0.1"', 'schema_version = "9.9"')
@@ -285,7 +286,7 @@ def test_unsupported_config_never_mints_identity_or_readiness_semantics(
         "--json",
     ]
     assert cli_main(args) == 1
-    cli_result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_result = json.loads(capsys.readouterr().out)
     mcp_result = mcp_server.fork_ops_config_validate(
         str(tmp_path), required_level="sync-ready"
     )
@@ -303,7 +304,7 @@ def test_unsupported_config_never_mints_identity_or_readiness_semantics(
 
 def test_missing_config_version_never_mints_identity_or_readiness_semantics(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     text = create_initial_config_text(tmp_path, discover_git_remotes=False)
     text = text.replace('schema_version = "0.1"\n\n', "")
@@ -323,7 +324,7 @@ def test_missing_config_version_never_mints_identity_or_readiness_semantics(
         "--json",
     ]
     assert cli_main(args) == 1
-    cli_result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_result = json.loads(capsys.readouterr().out)
     mcp_result = mcp_server.fork_ops_config_validate(
         str(tmp_path), required_level="sync-ready"
     )
@@ -505,7 +506,7 @@ def test_unassessed_equipment_does_not_claim_activation_ready(tmp_path: Path) ->
 
 def test_diagnostic_consumers_refuse_legacy_workflow_outputs(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     plan = generate_migration_plan(tmp_path)
     legacy = deepcopy(plan)
@@ -519,7 +520,7 @@ def test_diagnostic_consumers_refuse_legacy_workflow_outputs(
     input_path = tmp_path / "legacy-plan.json"
     input_path.write_text(json.dumps(legacy))
     assert cli_main(["migration", "explain-blocker", "--input", str(input_path)]) == 1
-    cli_result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_result = json.loads(capsys.readouterr().out)
     assert cli_result == mcp_server.fork_ops_migration_blocker_resolution(legacy)
 
     with pytest.raises(ForkOpsError, match="unsupported artifact identity or version"):
@@ -550,10 +551,10 @@ def test_public_state_evidence_references_are_attached(tmp_path: Path) -> None:
 
 def test_config_validation_exit_and_required_level_are_canonical(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert cli_main(["config", "validate", "--repo", str(tmp_path), "--json"]) == 1
-    missing = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    missing = json.loads(capsys.readouterr().out)
     assert missing["outcome"] == "blocked"
 
     _write_initial_config(tmp_path)
@@ -567,7 +568,7 @@ def test_config_validation_exit_and_required_level_are_canonical(
         "--json",
     ]
     assert cli_main(args) == 1
-    cli_result = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    cli_result = json.loads(capsys.readouterr().out)
     mcp_result = mcp_server.fork_ops_config_validate(
         str(tmp_path),
         required_level="sync-ready",
@@ -580,12 +581,12 @@ def test_config_validation_exit_and_required_level_are_canonical(
 
 def test_cli_exit_status_matches_canonical_operation_outcome(
     tmp_path: Path,
-    capsys: object,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = cli_main(
         ["schema", "check", "--plugin-root", str(tmp_path), "--json"]
     )
-    report = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    report = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert report["outcome"] == "failed"
 
@@ -606,6 +607,18 @@ def test_canonical_wrapper_rejects_reserved_field_collisions() -> None:
                 core_module.ArtifactKind.MIGRATION_NARRATIVE,
                 {**collision, "text": "x"},
             )
+
+    with pytest.raises(ValueError, match="unattached evidence"):
+        core_module._canonical_operation_result(
+            core_module.ArtifactKind.MIGRATION_ASSESSMENT,
+            {
+                "operation": "migration-assessment",
+                "activation_readiness": {
+                    "value": "blocked",
+                    "evidence_ids": ["missing-evidence"],
+                },
+            },
+        )
 
 
 def test_unknown_config_extensions_are_preserved_ignored_or_refused_by_dependency(

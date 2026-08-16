@@ -317,9 +317,9 @@ def artifact_identity_diagnostic(
         path=path,
         detail={
             "expected_artifact_kind": contract.emitted_artifact_kind,
-            "supported_schema_versions": [expected_version],
+            f"supported_{contract.version_field}s": [expected_version],
             "observed_artifact_kind": observed_kind,
-            "observed_schema_version": observed_version,
+            f"observed_{contract.version_field}": observed_version,
             "regeneration": f"Regenerate the {label.lower()} with Fork Ops {expected_version}.",
         },
     )
@@ -694,11 +694,9 @@ def _validate_operation_payload(payload: Mapping[str, object]) -> None:
 def _referenced_state_evidence_ids(value: object) -> set[str]:
     if isinstance(value, Mapping):
         references: set[str] = set()
-        if {
-            "value",
-            "evidence_ids",
-            "derivation_rule",
-        }.issubset(value) and isinstance(value.get("evidence_ids"), list):
+        if {"value", "evidence_ids"}.issubset(value) and isinstance(
+            value.get("evidence_ids"), list
+        ):
             references.update(
                 evidence_id
                 for evidence_id in value["evidence_ids"]
