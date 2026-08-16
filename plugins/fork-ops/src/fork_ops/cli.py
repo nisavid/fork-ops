@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from ._contracts import ArtifactKind
+from ._contracts import ArtifactKind, _canonical_state_payloads
 from .core import (
     MAX_FILE_BYTES,
     SCAN_PROFILES,
@@ -283,11 +283,8 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         _print_diagnostics(report)
-        highest = (
-            report["capability"]["authority_readiness"]["highest_authority_ready"]
-            or "none"
-        )
-        print(f"highest_authority_ready={highest}")
+        _print_operation_status(report)
+        _print_capability_status(report["capability"], prefix="capability.")
     if args.required_level and report["required_level"]["authority_ready"] is not True:
         if not args.json:
             authority_ready = report["required_level"]["authority_ready"]
@@ -373,42 +370,75 @@ def cmd_capability_report(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(capability, indent=2, sort_keys=True))
     else:
-        authority = capability["authority_readiness"]
-        for field in ("outcome", "plan_executability", "mutation_state"):
-            print(f"{field}={capability[field]}")
-        print(f"baseline_assurance={capability['baseline_assurance']}")
-        for field in (
-            "activation_readiness",
-            "replacement_coverage",
-            "operational_continuity",
-        ):
-            print(f"{field}={capability[field]['value']}")
-        print(f"highest_authority_ready={authority['highest_authority_ready'] or 'none'}")
-        for level, details in authority["levels"].items():
-            status = (
-                "ready"
-                if details["ready"] is True
-                else "not_ready"
-                if details["ready"] is False
-                else "unassessed"
-            )
-            print(f"{level}: {status}")
-            if details["missing"]:
-                print(f"  missing: {', '.join(details['missing'])}")
-        for workflow in capability["workflow_availability"]:
-            workflow_id = workflow["workflow_id"]
-            print(
-                f"workflow.{workflow_id}.implementation_extent="
-                f"{workflow['implementation_extent']}"
-            )
-            available_operations = workflow["available_operations"]
-            print(
-                f"workflow.{workflow_id}.available_operations="
-                f"{','.join(available_operations) or 'none'}"
-            )
+        _print_capability_status(capability)
         if capability.get("diagnostics"):
             _print_diagnostics(capability)
     return _domain_exit(capability)
+
+
+def _print_operation_status(payload: dict[str, Any], *, prefix: str = "") -> None:
+    for field in ("outcome", "plan_executability", "mutation_state"):
+        print(f"{prefix}{field}={payload[field]}")
+
+
+def _print_capability_status(
+    capability: dict[str, Any],
+    *,
+    prefix: str = "",
+) -> None:
+    authority = capability["authority_readiness"]
+    _print_operation_status(capability, prefix=prefix)
+    print(f"{prefix}baseline_assurance={capability['baseline_assurance']}")
+    _print_canonical_states(
+        capability,
+        path_prefix=tuple(part for part in prefix.rstrip(".").split(".") if part),
+    )
+    print(
+        f"{prefix}highest_authority_ready="
+        f"{authority['highest_authority_ready'] or 'none'}"
+    )
+    for level, details in authority["levels"].items():
+        status = (
+            "ready"
+            if details["ready"] is True
+            else "not_ready"
+            if details["ready"] is False
+            else "unassessed"
+        )
+        print(f"{prefix}authority.{level}={status}")
+        if details["missing"]:
+            print(f"{prefix}authority.{level}.missing={','.join(details['missing'])}")
+    for workflow in capability["workflow_availability"]:
+        workflow_id = workflow["workflow_id"]
+        print(
+            f"{prefix}workflow.{workflow_id}.implementation_extent="
+            f"{workflow['implementation_extent']}"
+        )
+        available_operations = workflow["available_operations"]
+        print(
+            f"{prefix}workflow.{workflow_id}.available_operations="
+            f"{','.join(available_operations) or 'none'}"
+        )
+
+
+def _print_canonical_states(
+    payload: dict[str, Any],
+    *,
+    path_prefix: tuple[str, ...] = (),
+) -> None:
+    for path, state in _canonical_state_payloads(payload):
+        prefix = f"state.{'.'.join((*path_prefix, *path))}"
+        print(f"{prefix}.value={state['value']}")
+        evidence_ids = state.get("evidence_ids")
+        rendered_evidence = (
+            ",".join(str(item) for item in evidence_ids)
+            if isinstance(evidence_ids, list) and evidence_ids
+            else "none"
+        )
+        print(f"{prefix}.evidence_ids={rendered_evidence}")
+        for field in ("subject", "derivation_rule"):
+            if field in state:
+                print(f"{prefix}.{field}={state[field]}")
 
 
 def cmd_migration_assess(args: argparse.Namespace) -> int:

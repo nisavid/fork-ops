@@ -103,6 +103,83 @@ EndpointRow = tuple[
     PersistenceRole | None,
 ]
 
+_CANONICAL_STATE_FIELD_NAMES = frozenset(
+    {
+        "activation_readiness",
+        "replacement_coverage",
+        "operational_continuity",
+    }
+)
+_CANONICAL_STATE_CONTAINER_NAMES = frozenset(
+    {
+        "accounting",
+        "capability",
+        "equipment_migration_preflight",
+        "equipment_review",
+        "equipment_review_record",
+        "migration_plan",
+        "preview",
+    }
+)
+
+
+def _canonical_state_payloads(
+    value: object,
+    path: tuple[str, ...] = (),
+    *,
+    state_container: bool = True,
+) -> list[tuple[tuple[str, ...], dict[str, object]]]:
+    states: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            nested_path = (*path, str(key))
+            if (
+                state_container
+                and key in _CANONICAL_STATE_FIELD_NAMES
+            ):
+                if isinstance(nested, dict):
+                    states.append((nested_path, nested))
+                elif isinstance(nested, list):
+                    states.extend(
+                        ((*nested_path, str(index)), item)
+                        for index, item in enumerate(nested)
+                        if isinstance(item, dict)
+                    )
+                continue
+            if key in _CANONICAL_STATE_CONTAINER_NAMES:
+                states.extend(
+                    _canonical_state_payloads(
+                        nested,
+                        nested_path,
+                        state_container=True,
+                    )
+                )
+    return states
+
+
+def _assert_human_state_coverage(text: str, payload: dict[str, object]) -> None:
+    states = _canonical_state_payloads(payload)
+    assert states
+    for path, state in states:
+        prefix = f"state.{'.'.join(path)}"
+        assert f"{prefix}.value={state['value']}" in text
+        evidence_ids = state["evidence_ids"]
+        assert isinstance(evidence_ids, list)
+        assert f"{prefix}.evidence_ids={','.join(evidence_ids) or 'none'}" in text
+        for field in ("subject", "derivation_rule"):
+            if field in state:
+                assert f"{prefix}.{field}={state[field]}" in text
+
+
+def _assert_exact_state_scalars(payload: dict[str, object]) -> None:
+    states = _canonical_state_payloads(payload)
+    assert states
+    for _, state in states:
+        assert type(state["value"]) is str
+        evidence_ids = state["evidence_ids"]
+        assert isinstance(evidence_ids, list)
+        assert all(type(evidence_id) is str for evidence_id in evidence_ids)
+
 _PYTHON_ENDPOINT_NODE = (
     "plugins/fork-ops/tests/test_contracts.py::"
     "test_python_payload_endpoints_execute_with_exact_role_attribution"
@@ -784,6 +861,12 @@ def test_state_values_are_scoped_to_their_dimension() -> None:
         dimension=StateDimension.ACTIVATION_READINESS,
         value="ready",
     ).value == "ready"
+    enum_backed_state = State(
+        dimension=StateDimension.EXECUTION_OUTCOME,
+        value=OutcomeValue.COMPLETED,
+    )
+    assert type(enum_backed_state.value) is str
+    assert type(enum_backed_state.to_dict()["value"]) is str
 
 
 def test_sequence_backed_contract_primitives_detach_caller_owned_lists() -> None:
@@ -825,6 +908,29 @@ def test_sequence_backed_contract_primitives_detach_caller_owned_lists() -> None
     assert outcome.states == (state,)
     assert outcome.diagnostics == (diagnostic,)
     assert outcome.evidence == (evidence,)
+
+
+def test_public_state_payloads_use_exact_json_scalar_types(tmp_path: Path) -> None:
+    review_policy = tmp_path / "docs/agents/review-policy.md"
+    review_policy.parent.mkdir(parents=True)
+    review_policy.write_text(
+        "Review bot policy lives here. Before publication closeout, validate "
+        "CodeQL code scanning and review threads.\n",
+        encoding="utf-8",
+    )
+    plan = generate_migration_plan(tmp_path)
+    assert plan["replacement_coverage"]
+    assert plan["operational_continuity"]
+    payloads = (
+        build_status_report(tmp_path),
+        plan,
+        build_equipment_migration_preflight(tmp_path),
+        dry_run_migration_plan(plan),
+        execute_migration_plan(plan, tmp_path),
+    )
+
+    for payload in payloads:
+        _assert_exact_state_scalars(payload)
 
 
 def test_evidence_detail_is_a_detached_canonical_immutable_value() -> None:
@@ -873,6 +979,20 @@ def test_evidence_detail_does_not_masquerade_as_canonical_state() -> None:
         "value": "ready",
         "evidence_ids": ["foreign-evidence"],
     }
+    assert _canonical_state_payloads(payload) == []
+
+    nested_artifact = {
+        "preview": {
+            "artifact_kind": "migration_dry_run",
+            "activation_readiness": {
+                "value": "unassessed",
+                "evidence_ids": ["preview-evidence"],
+            },
+        }
+    }
+    assert [path for path, _ in _canonical_state_payloads(nested_artifact)] == [
+        ("preview", "activation_readiness")
+    ]
 
 
 def test_payload_inventory_is_complete_for_current_legacy_and_versioned_families() -> None:
@@ -1367,6 +1487,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         expected_exit=0,
     )
     assert "highest_authority_ready=" in stdout
+    status_text = stdout
 
     stdout, _ = execute(
         ["config", "validate", "--repo", str(config_repo), "--json"],
@@ -1387,6 +1508,26 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
     status_report = json.loads(stdout)
     assert status_report["artifact_kind"] == "status_report"
     assert set(status_report) >= {"capability", "config", "diagnostics", "outcome"}
+    _assert_human_state_coverage(status_text, status_report)
+    for field in ("outcome", "plan_executability", "mutation_state"):
+        assert f"{field}={status_report[field]}" in status_text
+        assert (
+            f"capability.{field}={status_report['capability'][field]}" in status_text
+        )
+    assert (
+        "capability.baseline_assurance="
+        f"{status_report['capability']['baseline_assurance']}"
+    ) in status_text
+    for workflow in status_report["capability"]["workflow_availability"]:
+        workflow_id = workflow["workflow_id"]
+        assert (
+            f"capability.workflow.{workflow_id}.implementation_extent="
+            f"{workflow['implementation_extent']}"
+        ) in status_text
+        assert (
+            f"capability.workflow.{workflow_id}.available_operations="
+            f"{','.join(workflow['available_operations']) or 'none'}"
+        ) in status_text
 
     stdout, _ = execute(
         ["capability", "report", "--repo", str(config_repo)],
@@ -1417,6 +1558,7 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
     assert capability_json["artifact_kind"] == "capability_report"
     assert "authority_readiness" in capability_json
     assert "highest_available" not in capability_json
+    _assert_human_state_coverage(capability_text, capability_json)
     for field in (
         "outcome",
         "plan_executability",
@@ -1424,12 +1566,6 @@ def test_all_cli_payload_modes_execute_with_exact_family_attribution(
         "baseline_assurance",
     ):
         assert f"{field}={capability_json[field]}" in capability_text
-    for field in (
-        "activation_readiness",
-        "replacement_coverage",
-        "operational_continuity",
-    ):
-        assert f"{field}={capability_json[field]['value']}" in capability_text
     for workflow in capability_json["workflow_availability"]:
         workflow_id = workflow["workflow_id"]
         assert (

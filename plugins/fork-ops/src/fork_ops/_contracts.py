@@ -550,6 +550,7 @@ class State:
     derivation_rule: str = ""
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "value", str(self.value))
         object.__setattr__(self, "evidence_ids", tuple(self.evidence_ids))
         if not self.value:
             raise ValueError("state value must not be empty")
@@ -711,6 +712,43 @@ _STATE_CONTAINER_NAMES = frozenset(
 )
 
 
+def _canonical_state_payloads(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+    state_container: bool = True,
+) -> tuple[tuple[tuple[str, ...], Mapping[str, object]], ...]:
+    """Return explicit canonical state fields without shape-inferring opaque data."""
+
+    if not isinstance(value, Mapping):
+        return ()
+    states: list[tuple[tuple[str, ...], Mapping[str, object]]] = []
+    for key, nested in value.items():
+        nested_path = (*path, str(key))
+        if (
+            state_container
+            and key in _STATE_FIELD_NAMES
+        ):
+            if isinstance(nested, Mapping):
+                states.append((nested_path, nested))
+            elif isinstance(nested, (list, tuple)):
+                states.extend(
+                    ((*nested_path, str(index)), item)
+                    for index, item in enumerate(nested)
+                    if isinstance(item, Mapping)
+                )
+            continue
+        if key in _STATE_CONTAINER_NAMES:
+            states.extend(
+                _canonical_state_payloads(
+                    nested,
+                    path=nested_path,
+                    state_container=True,
+                )
+            )
+    return tuple(states)
+
+
 def _state_evidence_ids(value: object) -> set[str]:
     if isinstance(value, Mapping):
         evidence_ids = value.get("evidence_ids")
@@ -734,21 +772,9 @@ def _state_evidence_ids(value: object) -> set[str]:
 
 def _referenced_state_evidence_ids(
     value: object,
-    *,
-    state_container: bool = True,
 ) -> set[str]:
-    if not isinstance(value, Mapping):
-        return set()
-    references: set[str] = set()
-    for key, nested in value.items():
-        if state_container and key in _STATE_FIELD_NAMES:
-            references.update(_state_evidence_ids(nested))
-            continue
-        nested_is_artifact = isinstance(nested, Mapping) and isinstance(
-            nested.get("artifact_kind"), str
-        )
-        if key in _STATE_CONTAINER_NAMES or nested_is_artifact:
-            references.update(
-                _referenced_state_evidence_ids(nested, state_container=True)
-            )
-    return references
+    return {
+        evidence_id
+        for _, state in _canonical_state_payloads(value)
+        for evidence_id in _state_evidence_ids(state)
+    }
