@@ -398,6 +398,7 @@ def _run_trusted_git(repo: Path, arguments: list[str]) -> BoundedProcessResult:
 
 @contextlib.contextmanager
 def _open_regular_nofollow(path: Path) -> Iterator[BinaryIO]:
+    """Bind a regular file for a nonblocking read without following a replacement link."""
     lexical = path.lstat()
     if not stat.S_ISREG(lexical.st_mode):
         raise ValueError(f"{path} must be a regular non-symlink file")
@@ -3187,6 +3188,7 @@ def _build_checks(
     *,
     candidate_container: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build privately and retain completed checks when publication rejects the output."""
     if artifact_dir.exists() and any(artifact_dir.iterdir()):
         return (
             [
@@ -3224,11 +3226,22 @@ def _build_checks(
                 candidate_container=candidate_container,
             )
             if all(check["status"] == "passed" for check in checks):
-                _stage_candidate_artifacts(candidate_output, artifact_dir)
+                try:
+                    _stage_candidate_artifacts(candidate_output, artifact_dir)
+                except ValidationDeadlineExceeded:
+                    raise
+                except (OSError, RuntimeError, ValueError) as exc:
+                    build_check = next(
+                        check for check in checks if check["id"] == "build_distributions"
+                    )
+                    build_check["status"] = "failed"
+                    build_check["exit_code"] = 1
+                    build_check["stderr_tail"] = f"Artifact staging failed: {exc}"
             return checks, provenance
 
 
 def _stage_candidate_artifacts(candidate_output: Path, artifact_dir: Path) -> None:
+    """Copy a closed distribution set into publication, rolling back incomplete copies."""
     wheels, sdists, unexpected = _candidate_artifact_paths(candidate_output)
     if len(wheels) != 1 or len(sdists) != 1 or unexpected:
         raise ValueError("Publication requires exactly one regular wheel and source distribution")
@@ -4983,6 +4996,7 @@ def _reuse_key(identity: dict[str, Any]) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one validation mode and write terminal evidence before returning its exit code."""
     global _COMMAND_TIMEOUT_SECONDS, _VALIDATION_DEADLINE
 
     parser = argparse.ArgumentParser(description=__doc__)

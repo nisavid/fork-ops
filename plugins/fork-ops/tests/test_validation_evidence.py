@@ -1753,6 +1753,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertIn("overall deadline", finalization["stderr_tail"].lower())
 
     def test_build_mode_emits_once_built_wheel_and_sdist_identity(self) -> None:
+        """Bind successful once-built files to evidence and exact upload step outputs."""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
@@ -1821,6 +1822,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "This regression exercises POSIX special files.")
     def test_build_never_publishes_rejected_or_failed_backend_output(self) -> None:
+        """Keep rejected and incomplete backend output outside the upload-visible directory."""
         for boundary in ("local-observational", "container"):
             for artifact_case in (
                 "symlink", "fifo", "directory", "unsafe-name", "failed", "timeout"
@@ -1852,6 +1854,11 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                         self.assertNotEqual(completed.returncode, 0, completed.stderr)
                         evidence = json.loads(evidence_path.read_text())
                         self.assertEqual(evidence["outcome"], "failed")
+                        self.assertTrue(
+                            {"build_constraints", "build_dependency_audit", "build_distributions"}
+                            <= {check["id"] for check in evidence["checks"]}
+                        )
+                        self.assertIn("build", evidence["dependency_provenance"])
                         self.assertEqual(evidence["identity"]["artifacts"], [])
                         self.assertEqual(list(artifact_dir.iterdir()), [])
                         self.assertFalse(paths_output.exists())
@@ -1859,6 +1866,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
     def test_build_backend_receives_only_private_output_and_preserves_existing_publication(
         self,
     ) -> None:
+        """Protect publication independently of the selected backend execution boundary."""
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         build = namespace["_build_checks"]
         for container in (False, True):
@@ -1875,6 +1883,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     publication: Path = published,
                     outputs: list[Path] = raw_outputs,
                 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                    """Detect whether the backend receives publication storage."""
                     self.assertEqual(candidate_container, expected_container)
                     self.assertNotEqual(output, publication)
                     outputs.append(output)
@@ -1898,8 +1907,49 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self.assertEqual(len(raw_outputs), 1)
                 self.assertFalse(raw_outputs[0].exists())
 
+    def test_staging_errors_preserve_build_checks_and_deadlines_remain_terminal(self) -> None:
+        """Keep completed build evidence on rejection without reclassifying deadline expiry."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        build = namespace["_build_checks"]
+        deadline_error = namespace["ValidationDeadlineExceeded"]
+        for failure in (OSError("read"), RuntimeError("changed"), deadline_error("expired")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo = self._create_fixture_repository(root)
+                checks = [
+                    {"id": check_id, "status": "passed", "required_ids": [check_id]}
+                    for check_id in (
+                        "build_constraints", "build_dependency_audit", "build_distributions"
+                    )
+                ]
+                provenance = {"scope": "pep517_build_isolation"}
+                with mock.patch.dict(
+                    build.__globals__,
+                    {
+                        "_build_checks_in_environment": mock.Mock(
+                            return_value=(checks, provenance)
+                        ),
+                        "_stage_candidate_artifacts": mock.Mock(side_effect=failure),
+                    },
+                ):
+                    if isinstance(failure, deadline_error):
+                        with self.assertRaises(deadline_error):
+                            build(repo, sys.executable, root / "published")
+                    else:
+                        retained, retained_provenance = build(
+                            repo, sys.executable, root / "published"
+                        )
+                        self.assertIs(retained, checks)
+                        self.assertIs(retained_provenance, provenance)
+                        self.assertEqual(retained[-1]["status"], "failed")
+                        self.assertEqual(retained[-1]["exit_code"], 1)
+                        self.assertIn(str(failure), retained[-1]["stderr_tail"])
+                        self.assertTrue(all(check["required_ids"] for check in retained))
+                        self.assertTrue(all(check["status"] == "passed" for check in retained[:-1]))
+
     @unittest.skipIf(os.name == "nt", "This regression exercises POSIX symlinks.")
     def test_step_output_failure_is_recorded_in_terminal_build_evidence(self) -> None:
+        """Represent handoff failure truthfully without overwriting its symlink target."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self._create_fixture_repository(root)
@@ -1929,6 +1979,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "This regression exercises POSIX symlinks.")
     def test_staging_rejects_links_and_unsafe_names_without_reading_the_target(self) -> None:
+        """Refuse special path forms before publication or host-target reads."""
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         stage = namespace["_stage_candidate_artifacts"]
         for kind in ("symlink", "dangling", "newline", "glob", "negation"):
@@ -1952,6 +2003,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 self.assertEqual(outside.read_bytes(), b"synthetic host data")
 
     def test_staging_copies_regular_bytes_and_rolls_back_partial_failure(self) -> None:
+        """Publish fresh regular copies and remove earlier copies if the transaction fails."""
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         stage = namespace["_stage_candidate_artifacts"]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1973,6 +2025,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             original_open = os.open
 
             def fail_second_copy(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                """Inject a failure after the first publication copy to exercise rollback."""
                 if path == published / sdist.name:
                     raise OSError("simulated second-copy failure")
                 return original_open(path, flags, *args, **kwargs)
@@ -1984,6 +2037,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "This regression exercises POSIX FIFO replacement.")
     def test_staging_rejects_a_regular_file_swapped_to_fifo_before_open(self) -> None:
+        """Reject a type-changing race without blocking on the replacement FIFO."""
         namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
         stage = namespace["_stage_candidate_artifacts"]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1998,6 +2052,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             original_open = os.open
 
             def swap_before_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                """Replace the lstat-checked wheel immediately before its descriptor is opened."""
                 if path == wheel:
                     self.assertTrue(flags & os.O_NONBLOCK)
                     wheel.unlink()
@@ -2010,6 +2065,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(list(published.iterdir()), [])
 
     def test_build_mode_rejects_an_open_candidate_artifact_set(self) -> None:
+        """Reject the complete output set rather than publishing its valid subset."""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
@@ -3126,6 +3182,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertIn("rejects symlink", evidence["checks"][0]["stderr_tail"])
 
     def test_workflows_expose_one_pinned_validation_contract(self) -> None:
+        """Keep orchestration, producer identity, and artifact transfer bound to trusted inputs."""
         workflow_paths = (
             REPOSITORY_ROOT / ".github" / "workflows" / "validation.yml",
             REPOSITORY_ROOT / ".github" / "workflows" / "release-validation.yml",
@@ -3477,6 +3534,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         reject_candidate_repo_cwd: bool = False,
         operation_sentinel: Path | None = None,
     ) -> Path:
+        """Model exact commands without real network or container execution."""
         fake_bin = fixture_root / "bin"
         fake_bin.mkdir()
         fake_uv = fake_bin / "uv"

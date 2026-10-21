@@ -1057,6 +1057,7 @@ def test_candidate_execution_boundary_rejects_artifact_overlay() -> None:
 
 @pytest.mark.parametrize("mutation", ("failure_upload", "candidate_globs"))
 def test_candidate_execution_boundary_rejects_unsafe_distribution_upload(mutation: str) -> None:
+    """Reject regressions that reintroduce failed-build uploads or candidate-path globs."""
     workflows = _mutable_workflow_documents()
     upload = _workflow_step(workflows["validation"], "Upload candidate distributions")
     if mutation == "failure_upload":
