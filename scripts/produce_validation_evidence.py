@@ -398,10 +398,16 @@ def _run_trusted_git(repo: Path, arguments: list[str]) -> BoundedProcessResult:
 
 @contextlib.contextmanager
 def _open_regular_nofollow(path: Path) -> Iterator[BinaryIO]:
+    """Bind a regular file for a nonblocking read without following a replacement link."""
     lexical = path.lstat()
     if not stat.S_ISREG(lexical.st_mode):
         raise ValueError(f"{path} must be a regular non-symlink file")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as source:
         opened = os.fstat(source.fileno())
@@ -3182,6 +3188,7 @@ def _build_checks(
     *,
     candidate_container: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build privately and retain completed checks when publication rejects the output."""
     if artifact_dir.exists() and any(artifact_dir.iterdir()):
         return (
             [
@@ -3194,21 +3201,79 @@ def _build_checks(
             ],
             {},
         )
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The publication directory is never mounted into a candidate container or
+    # passed to a local backend. Only verifier-copied regular files reach it.
+    if os.name == "nt":
+        _require_windows_plain_parent_chain(artifact_dir)
+    else:
+        with _open_directory_nofollow(artifact_dir):
+            pass
     with tempfile.TemporaryDirectory(prefix="fork-ops-build-constraints-") as temp_dir:
         temp_root = Path(temp_dir)
+        candidate_output = temp_root / "candidate-output"
+        candidate_output.mkdir(mode=0o700)
         with _workspace_locked_subprocess_environment(
             repo,
             temp_root / "host",
         ) as subprocess_env:
-            return _build_checks_in_environment(
+            checks, provenance = _build_checks_in_environment(
                 repo,
                 interpreter,
-                artifact_dir,
+                candidate_output,
                 temp_root,
                 subprocess_env,
                 candidate_container=candidate_container,
             )
+            if all(check["status"] == "passed" for check in checks):
+                try:
+                    _stage_candidate_artifacts(candidate_output, artifact_dir)
+                except ValidationDeadlineExceeded:
+                    raise
+                except (OSError, RuntimeError, ValueError) as exc:
+                    build_check = next(
+                        check for check in checks if check["id"] == "build_distributions"
+                    )
+                    build_check["status"] = "failed"
+                    build_check["exit_code"] = 1
+                    build_check["stderr_tail"] = f"Artifact staging failed: {exc}"
+            return checks, provenance
+
+
+def _stage_candidate_artifacts(candidate_output: Path, artifact_dir: Path) -> None:
+    """Copy a closed distribution set into publication, rolling back incomplete copies."""
+    wheels, sdists, unexpected = _candidate_artifact_paths(candidate_output)
+    if len(wheels) != 1 or len(sdists) != 1 or unexpected:
+        raise ValueError("Publication requires exactly one regular wheel and source distribution")
+    paths = sorted((*wheels, *sdists))
+    # These names become literal upload-action paths and single-line step
+    # outputs. Refuse glob syntax, negation, separators, and control characters.
+    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", path.name) is None for path in paths):
+        raise ValueError("Candidate artifact filenames must be literal distribution names")
+    created: list[Path] = []
+    try:
+        for path in paths:
+            destination = artifact_dir / path.name
+            with _open_regular_nofollow(path) as source:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                descriptor = os.open(destination, flags, 0o600)
+                created.append(destination)
+                with os.fdopen(descriptor, "wb") as target:
+                    digest = hashlib.sha256()
+                    size = 0
+                    while chunk := source.read(1024 * 1024):
+                        _deadline_checkpoint()
+                        target.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    if size != os.fstat(source.fileno()).st_size:
+                        raise RuntimeError(f"{path} changed during artifact staging")
+                if _sha256(destination) != digest.hexdigest():
+                    raise RuntimeError(f"{destination} changed during artifact staging")
+    except BaseException:
+        for destination in created:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def _build_checks_in_environment(
@@ -4931,6 +4996,7 @@ def _reuse_key(identity: dict[str, Any]) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one validation mode and write terminal evidence before returning its exit code."""
     global _COMMAND_TIMEOUT_SECONDS, _VALIDATION_DEADLINE
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -4938,6 +5004,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interpreter", required=True)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument(
+        "--artifact-paths-output",
+        type=Path,
+        help="Write successful build wheel_path and sdist_path step outputs to this trusted file.",
+    )
     parser.add_argument("--build-evidence", type=Path)
     parser.add_argument("--release-preflight-evidence", type=Path)
     parser.add_argument("--release-preflight-key-file", type=Path)
@@ -4980,6 +5051,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+    if args.artifact_paths_output is not None and args.mode != "build":
+        parser.error("--artifact-paths-output requires --mode build")
     if args.command_timeout_seconds <= 0:
         parser.error("--command-timeout-seconds must be greater than zero")
     if args.overall_timeout_seconds <= 0:
@@ -4989,7 +5062,13 @@ def main(argv: list[str] | None = None) -> int:
 
     started_at = _utc_now()
     repo = args.repo.resolve()
-    artifact_dir = args.artifact_dir.resolve() if args.artifact_dir is not None else None
+    artifact_dir = None
+    if args.artifact_dir is not None:
+        artifact_dir = (
+            Path(os.path.abspath(args.artifact_dir))
+            if args.mode == "build"
+            else args.artifact_dir.resolve()
+        )
     identity: dict[str, Any] = {
         "commit_sha": "",
         "source_tree": "unknown",
@@ -5028,6 +5107,8 @@ def main(argv: list[str] | None = None) -> int:
         identity["commit_sha"] = _git_commit(candidate_repo)
         identity["source_tree"] = _git_tree_state(candidate_repo)
         excluded_paths = [path for path in (artifact_dir, args.output) if path is not None]
+        if args.artifact_paths_output is not None:
+            excluded_paths.append(args.artifact_paths_output)
         if args.build_evidence is not None:
             excluded_paths.append(args.build_evidence.resolve())
         if args.release_preflight_evidence is not None:
@@ -5217,7 +5298,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         _deadline_checkpoint()
         identity["artifacts"] = _artifact_records(artifact_dir)
-        outcome = "passed" if all(check["status"] == "passed" for check in checks) else "failed"
+        checks_passed = all(check["status"] == "passed" for check in checks)
+        if checks_passed and args.artifact_paths_output is not None:
+            assert artifact_dir is not None
+            paths = {
+                artifact["kind"]: artifact_dir / artifact["filename"]
+                for artifact in identity["artifacts"]
+            }
+            if any(character in str(artifact_dir) for character in "\r\n*?[]!"):
+                raise ValueError("Artifact publication directory must be a literal upload path")
+            _atomic_write_text_nofollow(
+                args.artifact_paths_output,
+                f"wheel_path={paths['wheel']}\nsdist_path={paths['sdist']}\n",
+            )
+        outcome = "passed" if checks_passed else "failed"
         exit_code = 0 if outcome == "passed" else 1
         if args.mode == "release-preflight" and outcome == "passed":
             assert args.release_preflight_key_file is not None

@@ -1753,6 +1753,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertIn("overall deadline", finalization["stderr_tail"].lower())
 
     def test_build_mode_emits_once_built_wheel_and_sdist_identity(self) -> None:
+        """Bind successful once-built files to evidence and exact upload step outputs."""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
@@ -1762,6 +1763,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             )
             artifact_dir = fixture_root / "candidate"
             output_path = fixture_root / "validation-evidence.json"
+            paths_output = fixture_root / "artifact-paths.txt"
             env = os.environ.copy()
             env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
 
@@ -1777,6 +1779,8 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     str(repo),
                     "--artifact-dir",
                     str(artifact_dir),
+                    "--artifact-paths-output",
+                    str(paths_output),
                     "--output",
                     str(output_path),
                 ],
@@ -1786,7 +1790,14 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 env=env,
             )
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr + output_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                paths_output.read_text(),
+                f"wheel_path={artifact_dir}/fork_ops-0.1-py3-none-any.whl\n"
+                f"sdist_path={artifact_dir}/fork_ops-0.1.tar.gz\n",
+            )
             evidence = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(evidence["outcome"], "passed")
             self.assertEqual(
@@ -1809,7 +1820,252 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 all(len(artifact["sha256"]) == 64 for artifact in evidence["identity"]["artifacts"])
             )
 
+    @unittest.skipIf(os.name == "nt", "This regression exercises POSIX special files.")
+    def test_build_never_publishes_rejected_or_failed_backend_output(self) -> None:
+        """Keep rejected and incomplete backend output outside the upload-visible directory."""
+        for boundary in ("local-observational", "container"):
+            for artifact_case in (
+                "symlink", "fifo", "directory", "unsafe-name", "failed", "timeout"
+            ):
+                with self.subTest(boundary=boundary, artifact_case=artifact_case):
+                    if boundary == "container" and (os.getuid() == 0 or os.getgid() == 0):
+                        self.skipTest("Hosted container execution requires a non-root host")
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        root = Path(temp_dir)
+                        repo = self._create_fixture_repository(root)
+                        fake_bin = self._create_fake_uv(root, artifact_case=artifact_case)
+                        artifact_dir = root / "published"
+                        evidence_path = root / "evidence.json"
+                        paths_output = root / "step-outputs"
+                        env = os.environ.copy()
+                        env["PATH"] = os.pathsep.join((str(fake_bin), env["PATH"]))
+                        completed = subprocess.run(
+                            [
+                                sys.executable, str(VALIDATION_ENTRYPOINT),
+                                "--mode", "build", "--interpreter", sys.executable,
+                                "--repo", str(repo), "--artifact-dir", str(artifact_dir),
+                                "--artifact-paths-output", str(paths_output),
+                                "--execution-boundary", boundary,
+                                "--command-timeout-seconds", "1",
+                                "--output", str(evidence_path),
+                            ],
+                            capture_output=True, text=True, env=env, check=False, timeout=20,
+                        )
+                        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+                        evidence = json.loads(evidence_path.read_text())
+                        self.assertEqual(evidence["outcome"], "failed")
+                        self.assertTrue(
+                            {"build_constraints", "build_dependency_audit", "build_distributions"}
+                            <= {check["id"] for check in evidence["checks"]}
+                        )
+                        self.assertIn("build", evidence["dependency_provenance"])
+                        self.assertEqual(evidence["identity"]["artifacts"], [])
+                        self.assertEqual(list(artifact_dir.iterdir()), [])
+                        self.assertFalse(paths_output.exists())
+
+    def test_build_backend_receives_only_private_output_and_preserves_existing_publication(
+        self,
+    ) -> None:
+        """Protect publication independently of the selected backend execution boundary."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        build = namespace["_build_checks"]
+        for container in (False, True):
+            with self.subTest(container=container), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                repo = self._create_fixture_repository(root)
+                published = root / "published"
+                raw_outputs: list[Path] = []
+
+                def backend(
+                    _repo: Path, _interpreter: str, output: Path, _temp: Path,
+                    _env: dict[str, str], *, candidate_container: bool,
+                    expected_container: bool = container,
+                    publication: Path = published,
+                    outputs: list[Path] = raw_outputs,
+                ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                    """Detect whether the backend receives publication storage."""
+                    self.assertEqual(candidate_container, expected_container)
+                    self.assertNotEqual(output, publication)
+                    outputs.append(output)
+                    (output / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
+                    (output / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+                    return [{"status": "passed"}], {}
+
+                with mock.patch.dict(build.__globals__, {"_build_checks_in_environment": backend}):
+                    checks, _ = build(
+                        repo, sys.executable, published, candidate_container=container
+                    )
+                    self.assertEqual(checks[0]["status"], "passed")
+                    before = {path.name: path.read_bytes() for path in published.iterdir()}
+                    checks, _ = build(
+                        repo, sys.executable, published, candidate_container=container
+                    )
+                self.assertEqual(checks[0]["status"], "failed")
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in published.iterdir()}, before
+                )
+                self.assertEqual(len(raw_outputs), 1)
+                self.assertFalse(raw_outputs[0].exists())
+
+    def test_staging_errors_preserve_build_checks_and_deadlines_remain_terminal(self) -> None:
+        """Keep completed build evidence on rejection without reclassifying deadline expiry."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        build = namespace["_build_checks"]
+        deadline_error = namespace["ValidationDeadlineExceeded"]
+        for failure in (OSError("read"), RuntimeError("changed"), deadline_error("expired")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo = self._create_fixture_repository(root)
+                checks = [
+                    {"id": check_id, "status": "passed", "required_ids": [check_id]}
+                    for check_id in (
+                        "build_constraints", "build_dependency_audit", "build_distributions"
+                    )
+                ]
+                provenance = {"scope": "pep517_build_isolation"}
+                with mock.patch.dict(
+                    build.__globals__,
+                    {
+                        "_build_checks_in_environment": mock.Mock(
+                            return_value=(checks, provenance)
+                        ),
+                        "_stage_candidate_artifacts": mock.Mock(side_effect=failure),
+                    },
+                ):
+                    if isinstance(failure, deadline_error):
+                        with self.assertRaises(deadline_error):
+                            build(repo, sys.executable, root / "published")
+                    else:
+                        retained, retained_provenance = build(
+                            repo, sys.executable, root / "published"
+                        )
+                        self.assertIs(retained, checks)
+                        self.assertIs(retained_provenance, provenance)
+                        self.assertEqual(retained[-1]["status"], "failed")
+                        self.assertEqual(retained[-1]["exit_code"], 1)
+                        self.assertIn(str(failure), retained[-1]["stderr_tail"])
+                        self.assertTrue(all(check["required_ids"] for check in retained))
+                        self.assertTrue(all(check["status"] == "passed" for check in retained[:-1]))
+
+    @unittest.skipIf(os.name == "nt", "This regression exercises POSIX symlinks.")
+    def test_step_output_failure_is_recorded_in_terminal_build_evidence(self) -> None:
+        """Represent handoff failure truthfully without overwriting its symlink target."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self._create_fixture_repository(root)
+            fake = self._create_fake_uv(root)
+            outside = root / "outside"
+            outside.write_bytes(b"unchanged")
+            paths_output = root / "step-outputs"
+            paths_output.symlink_to(outside)
+            evidence_path = root / "evidence.json"
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(fake), env["PATH"]))
+            result = subprocess.run(
+                [
+                    sys.executable, str(VALIDATION_ENTRYPOINT), "--mode", "build",
+                    "--interpreter", sys.executable, "--repo", str(repo),
+                    "--artifact-dir", str(root / "published"),
+                    "--artifact-paths-output", str(paths_output),
+                    "--output", str(evidence_path),
+                ],
+                env=env, capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            evidence = json.loads(evidence_path.read_text())
+            self.assertEqual(evidence["outcome"], "failed")
+            self.assertEqual(evidence["checks"][-1]["id"], "evidence_finalization")
+            self.assertEqual(outside.read_bytes(), b"unchanged")
+
+    @unittest.skipIf(os.name == "nt", "This regression exercises POSIX symlinks.")
+    def test_staging_rejects_links_and_unsafe_names_without_reading_the_target(self) -> None:
+        """Refuse special path forms before publication or host-target reads."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        stage = namespace["_stage_candidate_artifacts"]
+        for kind in ("symlink", "dangling", "newline", "glob", "negation"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                raw, published = root / "raw", root / "published"
+                raw.mkdir()
+                published.mkdir()
+                outside = root / "outside"
+                outside.write_bytes(b"synthetic host data")
+                wheel = raw / "fork_ops-0.1-py3-none-any.whl"
+                (raw / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+                if kind in {"symlink", "dangling"}:
+                    wheel.symlink_to(outside if kind == "symlink" else root / "absent")
+                else:
+                    name = {"newline": "bad\nname.whl", "glob": "bad?.whl", "negation": "!bad.whl"}
+                    (raw / name[kind]).write_bytes(b"wheel")
+                with self.assertRaises(ValueError):
+                    stage(raw, published)
+                self.assertEqual(list(published.iterdir()), [])
+                self.assertEqual(outside.read_bytes(), b"synthetic host data")
+
+    def test_staging_copies_regular_bytes_and_rolls_back_partial_failure(self) -> None:
+        """Publish fresh regular copies and remove earlier copies if the transaction fails."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        stage = namespace["_stage_candidate_artifacts"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = root / "raw"
+            published = root / "published"
+            raw.mkdir()
+            published.mkdir()
+            wheel = raw / "fork_ops-0.1-py3-none-any.whl"
+            sdist = raw / "fork_ops-0.1.tar.gz"
+            wheel.write_bytes(b"once-built wheel")
+            sdist.write_bytes(b"once-built sdist")
+            stage(raw, published)
+            for source in (wheel, sdist):
+                destination = published / source.name
+                self.assertEqual(destination.read_bytes(), source.read_bytes())
+                self.assertNotEqual(destination.stat().st_ino, source.stat().st_ino)
+                destination.unlink()
+            original_open = os.open
+
+            def fail_second_copy(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                """Inject a failure after the first publication copy to exercise rollback."""
+                if path == published / sdist.name:
+                    raise OSError("simulated second-copy failure")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=fail_second_copy):
+                with self.assertRaisesRegex(OSError, "second-copy failure"):
+                    stage(raw, published)
+            self.assertEqual(list(published.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "This regression exercises POSIX FIFO replacement.")
+    def test_staging_rejects_a_regular_file_swapped_to_fifo_before_open(self) -> None:
+        """Reject a type-changing race without blocking on the replacement FIFO."""
+        namespace = runpy.run_path(str(VALIDATION_ENTRYPOINT))
+        stage = namespace["_stage_candidate_artifacts"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = root / "raw"
+            published = root / "published"
+            raw.mkdir()
+            published.mkdir()
+            wheel = raw / "fork_ops-0.1-py3-none-any.whl"
+            wheel.write_bytes(b"wheel")
+            (raw / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+            original_open = os.open
+
+            def swap_before_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                """Replace the lstat-checked wheel immediately before its descriptor is opened."""
+                if path == wheel:
+                    self.assertTrue(flags & os.O_NONBLOCK)
+                    wheel.unlink()
+                    os.mkfifo(wheel)
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=swap_before_open):
+                with self.assertRaisesRegex(ValueError, "changed before its no-follow read"):
+                    stage(raw, published)
+            self.assertEqual(list(published.iterdir()), [])
+
     def test_build_mode_rejects_an_open_candidate_artifact_set(self) -> None:
+        """Reject the complete output set rather than publishing its valid subset."""
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             repo = self._create_fixture_repository(fixture_root)
@@ -1847,6 +2103,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertEqual(build_check["status"], "failed")
             self.assertIn("unexpected.txt", build_check["stderr_tail"])
             self.assertEqual(evidence["identity"]["artifacts"], [])
+            self.assertEqual(list(artifact_dir.iterdir()), [])
 
     @unittest.skipIf(os.name == "nt", "The fake uv boundary uses POSIX executable launchers.")
     def test_installed_mode_checks_simulated_cli_schema_and_mcp_process_boundary(
@@ -2925,6 +3182,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
             self.assertIn("rejects symlink", evidence["checks"][0]["stderr_tail"])
 
     def test_workflows_expose_one_pinned_validation_contract(self) -> None:
+        """Keep orchestration, producer identity, and artifact transfer bound to trusted inputs."""
         workflow_paths = (
             REPOSITORY_ROOT / ".github" / "workflows" / "validation.yml",
             REPOSITORY_ROOT / ".github" / "workflows" / "release-validation.yml",
@@ -3030,8 +3288,9 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         self.assertIn("--trusted-verifier-repository", workflows[1])
         self.assertIn("--trusted-verifier-sha", workflows[1])
         self.assertEqual(workflows[1].count("GITHUB_TOKEN: ${{ github.token }}"), 1)
-        self.assertIn("${{ runner.temp }}/candidate/*.whl", workflows[0])
-        self.assertIn("${{ runner.temp }}/candidate/*.tar.gz", workflows[0])
+        self.assertIn("${{ steps.candidate_build.outputs.wheel_path }}", workflows[0])
+        self.assertIn("${{ steps.candidate_build.outputs.sdist_path }}", workflows[0])
+        self.assertNotIn("${{ runner.temp }}/candidate/*", workflows[0])
         self.assertNotIn("path: ${{ runner.temp }}/candidate/\n", workflows[0])
         self.assertIn(
             "python trusted-verifier/scripts/produce_validation_evidence.py",
@@ -3268,12 +3527,14 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         coverage_mode: str = "complete",
         delay_when: str = "",
         extra_artifact: bool = False,
+        artifact_case: str = "",
         assert_clean_environment: bool = False,
         reject_disabled_locked_workspace_sources: bool = False,
         reject_disabled_candidate_build: bool = False,
         reject_candidate_repo_cwd: bool = False,
         operation_sentinel: Path | None = None,
     ) -> Path:
+        """Model exact commands without real network or container execution."""
         fake_bin = fixture_root / "bin"
         fake_bin.mkdir()
         fake_uv = fake_bin / "uv"
@@ -3841,6 +4102,22 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     output.mkdir(parents=True, exist_ok=True)
                     (output / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
                     (output / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+                    wheel = output / "fork_ops-0.1-py3-none-any.whl"
+                    if {artifact_case!r} == "symlink":
+                        wheel.unlink()
+                        wheel.symlink_to(output / "fork_ops-0.1.tar.gz")
+                    elif {artifact_case!r} == "fifo":
+                        wheel.unlink()
+                        os.mkfifo(wheel)
+                    elif {artifact_case!r} == "directory":
+                        wheel.unlink()
+                        wheel.mkdir()
+                    elif {artifact_case!r} == "unsafe-name":
+                        wheel.rename(output / "unsafe[glob].whl")
+                    elif {artifact_case!r} == "failed":
+                        raise SystemExit(7)
+                    elif {artifact_case!r} == "timeout":
+                        time.sleep(30)
                     if {extra_artifact!r}:
                         (output / "unexpected.txt").write_text("not a candidate distribution")
                     raise SystemExit(0)
@@ -4437,6 +4714,22 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     output = require_isolated_user_writable_mount("/output")
                     (output / "fork_ops-0.1-py3-none-any.whl").write_bytes(b"wheel")
                     (output / "fork_ops-0.1.tar.gz").write_bytes(b"sdist")
+                    wheel = output / "fork_ops-0.1-py3-none-any.whl"
+                    if {artifact_case!r} == "symlink":
+                        wheel.unlink()
+                        wheel.symlink_to(output / "fork_ops-0.1.tar.gz")
+                    elif {artifact_case!r} == "fifo":
+                        wheel.unlink()
+                        os.mkfifo(wheel)
+                    elif {artifact_case!r} == "directory":
+                        wheel.unlink()
+                        wheel.mkdir()
+                    elif {artifact_case!r} == "unsafe-name":
+                        wheel.rename(output / "unsafe[glob].whl")
+                    elif {artifact_case!r} == "failed":
+                        raise SystemExit(7)
+                    elif {artifact_case!r} == "timeout":
+                        __import__("time").sleep(30)
                     if {extra_artifact!r}:
                         (output / "unexpected.txt").write_text("not a candidate distribution")
                 else:

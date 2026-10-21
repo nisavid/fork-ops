@@ -93,6 +93,7 @@ _BUILD_EVIDENCE_COMMAND = (
     "python trusted-verifier/scripts/produce_validation_evidence.py "
     "--mode build --interpreter python --repo candidate "
     '--artifact-dir "${{ runner.temp }}/candidate" '
+    '--artifact-paths-output "$GITHUB_OUTPUT" '
     "--execution-boundary container --overall-timeout-seconds 600 "
     '--output "${{ runner.temp }}/validation-evidence-build.json"'
 )
@@ -247,6 +248,7 @@ _APPROVED_RUN_STEP_METADATA = {
     _BUILD_EVIDENCE_COMMAND: _approved_run_step_metadata(
         "Build candidate distributions",
         _BUILD_EVIDENCE_COMMAND,
+        step_id="candidate_build",
     ),
     _INSTALLED_EVIDENCE_COMMAND: _approved_run_step_metadata(
         "Validate installed candidate",
@@ -318,11 +320,11 @@ _APPROVED_ARTIFACT_TRANSFERS = {
         _artifact_transfer_signature(
             "Upload candidate distributions",
             "actions/upload-artifact",
-            "${{ always() }}",
+            "${{ success() && steps.candidate_build.outcome == 'success' }}",
             {
                 "name": "candidate-dist",
-                "path": "${{ runner.temp }}/candidate/*.whl\n"
-                "${{ runner.temp }}/candidate/*.tar.gz\n",
+                "path": "${{ steps.candidate_build.outputs.wheel_path }}\n"
+                "${{ steps.candidate_build.outputs.sdist_path }}\n",
                 "if-no-files-found": "error",
                 "retention-days": 30,
             },
@@ -1049,6 +1051,21 @@ def test_candidate_execution_boundary_rejects_artifact_overlay() -> None:
     assert isinstance(download_inputs, dict)
     download_inputs["path"] = "trusted-verifier"
 
+    with pytest.raises(AssertionError, match="artifact transfers"):
+        _assert_candidate_execution_boundary(workflows)
+
+
+@pytest.mark.parametrize("mutation", ("failure_upload", "candidate_globs"))
+def test_candidate_execution_boundary_rejects_unsafe_distribution_upload(mutation: str) -> None:
+    """Reject regressions that reintroduce failed-build uploads or candidate-path globs."""
+    workflows = _mutable_workflow_documents()
+    upload = _workflow_step(workflows["validation"], "Upload candidate distributions")
+    if mutation == "failure_upload":
+        upload["if"] = "${{ always() }}"
+    else:
+        inputs = upload.get("with")
+        assert isinstance(inputs, dict)
+        inputs["path"] = "${{ runner.temp }}/candidate/*.whl\n"
     with pytest.raises(AssertionError, match="artifact transfers"):
         _assert_candidate_execution_boundary(workflows)
 
