@@ -30,9 +30,15 @@ The modes are:
   build-only scope, installs only those binary dependencies, and executes the
   PEP 517 backend in a private writable tmpfs copy made from a read-only source
   mount inside the isolated container. Only the explicit output directory is a
-  writable host bind.
+  writable host bind, in private temporary build state rather than the
+  publication directory.
   The build must produce exactly one wheel and one source distribution; any
   additional file, directory, or symlink makes the candidate fail closed.
+  Only after all build checks succeed does the verifier copy both files through
+  no-follow, descriptor-checked reads into the publication directory. It hashes
+  the copied bytes, preserves distribution names, and removes partial copies
+  on failure. Publication names must be literal distribution filenames without
+  glob syntax or control characters.
 - `release-preflight`: uses a read-only Actions token in a repository verifier
   process to bind an exact successful main Validation run, its two artifacts,
   the candidate commit, and the immutable verifier revision. This mode never
@@ -249,7 +255,7 @@ for the suite's fake CLI programs. Source lanes use digest-pinned full
 official Python images whose immutable image history includes Git; build and
 installed lanes retain the smaller digest-pinned slim images. Build validation mounts verified source
 and build dependencies read-only, copies source into private container tmpfs,
-and exposes only the explicit artifact output as a writable host bind. No lane
+and exposes only private temporary artifact output as a writable host bind. No lane
 mounts the trusted verifier, final evidence,
 runner temporary root, Docker socket, key, token, or host secret. The artifact
 directory is a closed set containing only the one recorded wheel and one
@@ -329,6 +335,11 @@ confined to the pinned container on Python 3.11 through 3.14. Candidate uploads 
 distribution rather than an open directory. The workflow never rebuilds the
 candidate. Its aggregate check is named `Release Validation`, so it cannot
 satisfy or obscure the normal `Validation` context.
+
+The distribution upload runs only after successful build validation and receives
+the verifier's exact `wheel_path` and `sdist_path` step outputs, written with
+`--artifact-paths-output "$GITHUB_OUTPUT"`. It never globs candidate-writable
+build output. Failed builds still upload terminal build evidence.
 
 The workflows only orchestrate the repository-owned producer. Focused tests
 use a strict fake uv/process boundary to assert critical arguments and failure

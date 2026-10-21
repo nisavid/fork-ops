@@ -96,23 +96,25 @@ jobs:
           version: "0.12.3"
           enable-cache: false
       - name: Build candidate distributions
+        id: candidate_build
         run: >-
           python trusted-verifier/scripts/produce_validation_evidence.py
           --mode build
           --interpreter python
           --repo candidate
           --artifact-dir "${{ runner.temp }}/candidate"
+          --artifact-paths-output "$GITHUB_OUTPUT"
           --execution-boundary container
           --overall-timeout-seconds 600
           --output "${{ runner.temp }}/validation-evidence-build.json"
       - name: Upload candidate distributions
-        if: ${{ always() }}
+        if: ${{ success() && steps.candidate_build.outcome == 'success' }}
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: candidate-dist
           path: |
-            ${{ runner.temp }}/candidate/*.whl
-            ${{ runner.temp }}/candidate/*.tar.gz
+            ${{ steps.candidate_build.outputs.wheel_path }}
+            ${{ steps.candidate_build.outputs.sdist_path }}
           if-no-files-found: error
           retention-days: 30
       - name: Upload build evidence
