@@ -2337,7 +2337,7 @@ def _validate_closed_workspace_project(repo: Path) -> dict[str, object]:
     if set(package) - {"build-system", "project", "dependency-groups", "tool"}:
         raise ValueError("Closed workspace package has unsupported top-level tables")
     if package.get("build-system") != {
-        "requires": ["setuptools==83.0.0", "wheel==0.46.2"],
+        "requires": ["setuptools==84.1.0", "wheel==0.46.2"],
         "build-backend": "setuptools.build_meta",
     }:
         raise ValueError("Closed workspace package build contract is unsupported")
