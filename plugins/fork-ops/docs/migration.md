@@ -267,6 +267,23 @@ Every mutating call requires an explicit non-empty selected repository. A plan's
 the write target. Execution also requires `complete = true` with complete scan
 accounting, so removing an incomplete-scan blocker cannot enable a write.
 
+MCP execution treats every supplied plan as untrusted input. Before writing, it
+requires the plan's canonical fingerprint (all fields except the rendered
+top-level narrative) to match a freshly generated plan for the selected repository
+and scan profile. It applies the supplied plan only if that check and the existing
+mutation guards pass; it never silently substitutes a different plan. Editing
+review decisions, config bytes, evidence, or blockers cannot grant MCP write
+authority. This check also applies when MCP generates the plan internally.
+
+Edited plans remain available for MCP dry-run previews. To execute a reviewed
+plan, an authorized operator must review the exact plan and use the trusted CLI
+`migration execute --repo ... --plan ...` workflow above. The Python execution
+API likewise expects an operator-authorized plan; adapters accepting untrusted
+plans must set the host-only `require_generated_plan=True` option. That option is
+not an MCP parameter or a plan field. A persisted review claim or a successful
+dry-run preview does not by itself establish operator authorization. Authenticated
+approval for edited plans over MCP is not implemented.
+
 The current execution slice supports creating `.agents/fork-ops.toml` from the
 validated config proposal, preserving retained source materials, reporting the
 migration map, proposed review artifact, equipment review record,
