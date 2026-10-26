@@ -717,6 +717,11 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                 'requires-python = ">=3.11"',
                 'requires-python = ">=3.12"',
             ),
+            "vulnerable-build-backend": (
+                "plugins/fork-ops/pyproject.toml",
+                "setuptools==84.1.0",
+                "setuptools==83.0.0",
+            ),
         }
         for source_kind, (project_path, before, after) in unsafe_project_replacements.items():
             for mode in ("locked-source", "build", "installed"):
@@ -3362,7 +3367,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(
             plugin_project["build-system"]["requires"],
-            ["setuptools==83.0.0", "wheel==0.46.2"],
+            ["setuptools==84.1.0", "wheel==0.46.2"],
         )
         lock = (REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8")
         self.assertRegex(lock, r'(?m)^name = "setuptools"$')
@@ -3888,7 +3893,7 @@ class ValidationEvidenceEntrypointTests(unittest.TestCase):
                     if "--only-group" in export_args:
                         group = export_args[export_args.index("--only-group") + 1]
                         packages = {{
-                            "build": ["setuptools==83.0.0", "wheel==0.46.2"],
+                            "build": ["setuptools==84.1.0", "wheel==0.46.2"],
                             "test": ["coverage==7.15.4", "pytest==9.0.3"],
                             "development": ["pyrefly==1.2.0", "ruff==0.15.13"],
                         }}.get(group)
