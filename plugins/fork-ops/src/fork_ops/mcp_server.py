@@ -137,12 +137,12 @@ def fork_ops_migration_execute(
     repo_path: str | None = None,
     migration_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Apply a validated migration plan through guarded operations."""
+    """Apply a generated plan; edited/reviewed plans require the trusted CLI."""
     if repo_path is None or not repo_path.strip():
         raise ForkOpsError("Mutation requires an explicit non-empty repository path.")
     if migration_plan is not None:
         _validate_bounded_object(migration_plan, label="MCP migration plan")
-    return execute_migration(repo_path, plan=migration_plan)
+    return execute_migration(repo_path, plan=migration_plan, require_generated_plan=True)
 
 
 @_tool

@@ -3554,21 +3554,36 @@ def _authoritative_equipment_group_projections(
 def execute_migration(
     repo_path: str | Path | None = None,
     plan: dict[str, Any] | None = None,
+    *,
+    require_generated_plan: bool = False,
 ) -> dict[str, Any]:
     selected_repo_path = _require_explicit_repository_path(repo_path)
     migration_plan = (
         plan if plan is not None else generate_migration_plan(selected_repo_path)
     )
-    return execute_migration_plan(migration_plan, selected_repo_path)
+    return execute_migration_plan(
+        migration_plan,
+        selected_repo_path,
+        require_generated_plan=require_generated_plan,
+    )
 
 
 def execute_migration_plan(
     plan: dict[str, Any],
     repo_path: str | Path | None = None,
+    *,
+    require_generated_plan: bool = False,
 ) -> dict[str, Any]:
+    """Execute an operator-reviewed plan, or require independent generation for MCP.
+
+    CLI/library callers own authorization of edited plans. Untrusted adapters must
+    set require_generated_plan; the option is host policy, never plan data.
+    """
     if not isinstance(plan, dict):
         raise ForkOpsError("Migration execution requires a migration plan object.")
     _validate_bounded_object(plan, label="Migration plan")
+    # Keep the validated, compared, and applied plan independent of caller mutation.
+    plan = copy.deepcopy(plan)
     identity_diagnostic = _migration_plan_identity_diagnostic(plan)
     if identity_diagnostic is not None:
         return _refused_operation_result(
@@ -3630,6 +3645,32 @@ def execute_migration_plan(
                 blockers=preview_blockers,
                 verification_results=[],
             ))
+
+        if require_generated_plan:
+            generated_plan = generate_migration_plan(
+                bound_repo.path,
+                scan_profile=str(plan["scan_profile"]),
+            )
+            if _migration_plan_fingerprint(plan) != _migration_plan_fingerprint(generated_plan):
+                return finish(_migration_execution_result(
+                    repo=repo,
+                    preview=preview,
+                    status="blocked",
+                    applied_edits=[],
+                    skipped_edits=_skipped_preview_edits(preview, "untrusted_plan"),
+                    blockers=[{
+                        "code": "migration_execution.untrusted_plan",
+                        "step": "verify_migration_plan",
+                        "source": "migration_plan",
+                        "message": (
+                            "MCP execution requires a plan matching fresh repository "
+                            "generation. Caller-supplied review decisions do not authorize "
+                            "writes. Review an edited plan with the operator and use the "
+                            "trusted CLI migration execute --repo ... --plan ... workflow."
+                        ),
+                    }],
+                    verification_results=[],
+                ))
 
         repository_diagnostic = _migration_plan_repository_diagnostic(
             plan,

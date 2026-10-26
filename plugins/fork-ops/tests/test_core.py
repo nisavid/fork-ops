@@ -7774,6 +7774,132 @@ default_onboarding_intent = "migrate_toward_fork_ops"
         self.assertEqual(payload["mutation_state"], "not_started")
         self.assertEqual(payload["blockers"][0]["code"], "migration_execution.repo_path_mismatch")
 
+    def test_mcp_migration_execution_rejects_caller_asserted_review(self) -> None:
+        for review_source in ("migration", "equipment", "removed_blocker"):
+            with self.subTest(review_source=review_source), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                modeled = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+                retained = repo_path / "docs/agents/local-policy.md"
+                modeled.parent.mkdir(parents=True)
+                retained.parent.mkdir(parents=True)
+                modeled.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+                retained.write_text("The upstream track policy remains fork-local authority.\n")
+                plan = generate_migration_plan(repo_path)
+                if review_source == "migration":
+                    _mark_reviewed_retain(plan, "docs/agents/local-policy.md")
+                elif review_source == "equipment":
+                    _mark_equipment_reviewed_retain(plan, "docs/agents/local-policy.md")
+                else:
+                    plan["blockers"] = [
+                        item for item in plan["blockers"]
+                        if item["code"] != "semantic_coverage.incomplete"
+                    ]
+
+                # Review editing remains useful as a non-mutating preview.
+                preview = fork_ops_migration_dry_run(str(repo_path), migration_plan=plan)
+                self.assertTrue(preview["can_execute"])
+                result = fork_ops_migration_execute(str(repo_path), migration_plan=plan)
+
+                self.assertEqual(result["outcome"], "blocked")
+                self.assertEqual(result["mutation_state"], "not_started")
+                self.assertIn(
+                    "migration_execution.untrusted_plan",
+                    {item["code"] for item in result["blockers"]},
+                )
+                self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+                self.assertEqual(
+                    retained.read_text(),
+                    "The upstream track policy remains fork-local authority.\n",
+                )
+
+    def test_mcp_migration_execution_accepts_generated_plan_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source.parent.mkdir(parents=True)
+            source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = json.loads(json.dumps(fork_ops_migration_plan(str(repo_path))))
+            plan["narrative"] = {"text": "Rendered explanation is not execution authority."}
+
+            result = fork_ops_migration_execute(str(repo_path), migration_plan=plan)
+
+            self.assertEqual(result["outcome"], "completed")
+            self.assertEqual(result["mutation_state"], "applied")
+            self.assertEqual(
+                (repo_path / CONFIG_RELATIVE_PATH).read_text(),
+                plan["proposed_config_patch"]["toml"],
+            )
+
+    def test_mcp_migration_execution_rejects_config_and_policy_edits(self) -> None:
+        for edit in ("config_bytes", "host_policy"):
+            with self.subTest(edit=edit), tempfile.TemporaryDirectory() as repo:
+                repo_path = Path(repo)
+                source = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+                source.parent.mkdir(parents=True)
+                source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+                plan = generate_migration_plan(repo_path)
+                if edit == "config_bytes":
+                    plan["proposed_config_patch"]["toml"] += "\n# Caller-selected bytes\n"
+                else:
+                    plan["require_generated_plan"] = False
+
+                result = fork_ops_migration_execute(str(repo_path), migration_plan=plan)
+
+                self.assertEqual(result["outcome"], "blocked")
+                self.assertEqual(result["mutation_state"], "not_started")
+                self.assertEqual(
+                    result["blockers"][0]["code"], "migration_execution.untrusted_plan"
+                )
+                self.assertFalse((repo_path / CONFIG_RELATIVE_PATH).exists())
+
+    def test_mcp_migration_execution_keeps_its_validated_plan_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            repo_path = Path(repo)
+            source = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            source.parent.mkdir(parents=True)
+            source.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            plan = generate_migration_plan(repo_path)
+            expected_toml = plan["proposed_config_patch"]["toml"]
+            original_dry_run = core_module._dry_run_migration_plan
+
+            def mutate_caller_plan(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                plan["proposed_config_patch"]["toml"] += "\n# Concurrent caller edit\n"
+                return original_dry_run(*args, **kwargs)
+
+            with patch("fork_ops.core._dry_run_migration_plan", side_effect=mutate_caller_plan):
+                result = fork_ops_migration_execute(str(repo_path), migration_plan=plan)
+
+            self.assertEqual(result["outcome"], "completed")
+            self.assertEqual((repo_path / CONFIG_RELATIVE_PATH).read_text(), expected_toml)
+
+    def test_cli_migration_execution_keeps_authorized_reviewed_plan_support(self) -> None:
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as state:
+            repo_path = Path(repo)
+            modeled = repo_path / ".agents/skills/working-with-upstream-refs/SKILL.md"
+            retained = repo_path / "docs/agents/local-policy.md"
+            modeled.parent.mkdir(parents=True)
+            retained.parent.mkdir(parents=True)
+            modeled.write_text(UPSTREAM_REF_PRESSURE_TEXT)
+            retained.write_text("The upstream track policy remains fork-local authority.\n")
+            plan = generate_migration_plan(repo_path)
+            _mark_reviewed_retain(plan, "docs/agents/local-policy.md")
+            plan_path = Path(state) / "reviewed-plan.json"
+            plan_path.write_text(json.dumps(plan))
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = cli_main([
+                    "migration", "execute", "--repo", str(repo_path), "--plan", str(plan_path),
+                ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json.loads(output.getvalue())["outcome"], "completed")
+            self.assertEqual(
+                (repo_path / CONFIG_RELATIVE_PATH).read_text(),
+                plan["proposed_config_patch"]["toml"],
+            )
+            self.assertTrue(retained.exists())
+
     def test_mcp_exposes_migration_execute(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             repo_path = Path(repo)
