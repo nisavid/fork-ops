@@ -10,7 +10,7 @@ uv run --package fork-ops python scripts/security_exception_projections.py --che
 
 Contract version: `1.0`
 
-Contract SHA-256: `b060b477b1fdcc9155a34939e607a7794ccb82f5d544816cfb95a3f6392f34f4`
+Contract SHA-256: `432dc29b1a02ab47fb48601e3d875311f3dc049533905b39d2042ae5b5bc34ab`
 
 ## Purpose and boundary
 
@@ -30,6 +30,32 @@ whole ledger when that projection is unavailable.
 An Unscanned Equipment Exception is separate equipment governance. It is not a
 Security Exception and cannot affect Security Posture without a separate record
 under this contract.
+
+## Inventory validation limits
+
+Public and whole-ledger validation apply these aggregate limits before schema
+validation, canonicalization, or copying caller inputs. Record and lineage counts
+cover the public ledger and sanitized private projection together. The evaluation
+timestamp shares the node and string-byte budgets with all supplied artifacts.
+
+| Limit | Maximum |
+| --- | ---: |
+| Current records | 1024 |
+| Lineage entries | 8192 |
+| Records plus lineage entries | 8192 |
+| Visited roots, keys, and values | 250000 |
+| Depth from each artifact root at zero | 32 |
+| UTF-8 bytes per key or string value | 65536 |
+| Aggregate UTF-8 bytes in keys and string values | 8388608 |
+| Integer magnitude bits | 64 |
+
+Every occurrence of a shared container counts toward the budgets. Cycles,
+non-string keys, invalid UTF-8 strings, and non-JSON values, including nonfinite
+numbers, are refused. Missing optional artifacts are excluded from traversal;
+the required private projection still fails whole-ledger validation when absent.
+These bounds establish structural conformance only and confer no authority.
+Current-record string arrays must also satisfy their schema-declared item limits
+and string item types before schema uniqueness checks run.
 
 ## Closed kind and subject matrix
 

@@ -29,7 +29,8 @@ build = [
 ]
 test = [
   "coverage>=7,<8",
-  "pytest>=9.0.3"
+  "pytest>=9.0.3",
+  "typing-extensions>=4.12",
 ]
 development = [
   "pyrefly>=1.1.1,<2",

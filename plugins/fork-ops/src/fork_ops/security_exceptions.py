@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -12,6 +13,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import product
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
@@ -22,7 +24,7 @@ from jsonschema.exceptions import ValidationError
 
 CONTRACT_FILENAME: Final = "security-exception-contract-1.0.json"
 EXPECTED_CONTRACT_SHA256: Final = (
-    "b060b477b1fdcc9155a34939e607a7794ccb82f5d544816cfb95a3f6392f34f4"
+    "432dc29b1a02ab47fb48601e3d875311f3dc049533905b39d2042ae5b5bc34ab"
 )
 MAX_CONTRACT_BYTES: Final = 1_048_576
 
@@ -1544,6 +1546,223 @@ def load_security_exception_contract(
     )
 
 
+def _inventory_record_array_limits(
+    contract: SecurityExceptionContract, schema_name: str
+) -> dict[str, int]:
+    """Read the bounded string arrays in a pinned current-record schema."""
+    definitions = contract.data.get("$defs")
+    if not isinstance(definitions, Mapping):
+        raise SecurityExceptionContractError("Security Exception record schemas are missing.")
+    pending = [definitions.get(schema_name)]
+    visited: set[int] = set()
+    limits: dict[str, int] = {}
+    while pending:
+        schema = pending.pop()
+        if not isinstance(schema, Mapping):
+            raise SecurityExceptionContractError("Security Exception record schema is malformed.")
+        if id(schema) in visited:
+            continue
+        visited.add(id(schema))
+        reference = schema.get("$ref")
+        if isinstance(reference, str):
+            pending.append(definitions.get(reference.removeprefix("#/$defs/")))
+        branches = schema.get("allOf", [])
+        properties = schema.get("properties", {})
+        if not isinstance(branches, list) or not isinstance(properties, Mapping):
+            raise SecurityExceptionContractError("Security Exception record schema is malformed.")
+        pending.extend(branches)
+        for field, field_schema in properties.items():
+            if not isinstance(field, str) or not isinstance(field_schema, Mapping):
+                raise SecurityExceptionContractError(
+                    "Security Exception record schema is malformed."
+                )
+            constant = field_schema.get("const")
+            if isinstance(constant, list) and all(isinstance(item, str) for item in constant):
+                limits[field] = len(constant)
+                continue
+            if field_schema.get("type") != "array":
+                continue
+            maximum = field_schema.get("maxItems")
+            items = field_schema.get("items")
+            if isinstance(items, Mapping) and isinstance(items.get("$ref"), str):
+                items = definitions.get(str(items["$ref"]).removeprefix("#/$defs/"))
+            enumeration = items.get("enum") if isinstance(items, Mapping) else None
+            string_items = isinstance(items, Mapping) and (
+                items.get("type") == "string"
+                or isinstance(enumeration, list)
+                and bool(enumeration)
+                and all(isinstance(item, str) for item in enumeration)
+            )
+            if type(maximum) is not int or maximum < 0 or not string_items:
+                raise SecurityExceptionContractError(
+                    "Security Exception record array bounds are malformed."
+                )
+            limits[field] = min(limits.get(field, maximum), maximum)
+    return limits
+
+
+def _validate_inventory_record_arrays(
+    contract: SecurityExceptionContract, public_values: object, private_values: object
+) -> None:
+    """Refuse unbounded or non-string arrays before schema uniqueness comparisons."""
+    for schema_name, values in (
+        ("public_record", public_values), ("sanitized_private_record", private_values)
+    ):
+        if not isinstance(values, (list, tuple)) or not values:
+            continue
+        limits = _inventory_record_array_limits(contract, schema_name)
+        for record in values:
+            if not isinstance(record, Mapping):
+                continue
+            for field, maximum in limits.items():
+                items = record.get(field)
+                if not isinstance(items, (list, tuple)):
+                    continue
+                if len(items) > maximum:
+                    raise SecurityExceptionValidationError(
+                        f"Security Exception record {field} exceeds its item limit."
+                    )
+                if any(not isinstance(item, str) for item in items):
+                    raise SecurityExceptionValidationError(
+                        f"Security Exception record {field} must contain only strings."
+                    )
+
+
+def _validate_inventory_budget(
+    contract: SecurityExceptionContract,
+    public_ledger: Mapping[str, object],
+    private_projection: Mapping[str, object] | None = None,
+    authority_observation: Mapping[str, object] | None = None,
+    *,
+    evaluated_at: str | None = None,
+) -> None:
+    """Bound caller-owned inventory graphs before schema traversal or copying."""
+    raw_limits = contract.data.get("inventory_limits")
+    names = (
+        "max_records",
+        "max_lineage_entries",
+        "max_items",
+        "max_nodes",
+        "max_depth",
+        "max_string_bytes",
+        "max_bytes",
+        "max_integer_bits",
+    )
+    limits: dict[str, int] = {}
+    for name in names:
+        value = raw_limits.get(name) if isinstance(raw_limits, Mapping) else None
+        if type(value) is not int or value <= 0:
+            raise SecurityExceptionContractError(
+                "Security Exception inventory limits are malformed."
+            )
+        limits[name] = value
+
+    public_values = public_ledger.get("exceptions") if isinstance(public_ledger, Mapping) else None
+    private_values = (
+        private_projection.get("records") if isinstance(private_projection, Mapping) else None
+    )
+    lineage_index = (
+        private_projection.get("lineage_index") if isinstance(private_projection, Mapping) else None
+    )
+    lineage_values = lineage_index.get("entries") if isinstance(lineage_index, Mapping) else None
+    record_count = sum(
+        len(values)
+        for values in (public_values, private_values)
+        if isinstance(values, (list, tuple))
+    )
+    lineage_count = len(lineage_values) if isinstance(lineage_values, (list, tuple)) else 0
+    if record_count > limits["max_records"]:
+        raise SecurityExceptionValidationError(
+            "Security Exception inventory exceeds the record limit."
+        )
+    if lineage_count > limits["max_lineage_entries"]:
+        raise SecurityExceptionValidationError(
+            "Security Exception inventory exceeds the lineage limit."
+        )
+    if record_count + lineage_count > limits["max_items"]:
+        raise SecurityExceptionValidationError(
+            "Security Exception inventory exceeds the item limit."
+        )
+
+    nodes = 0
+    string_bytes = 0
+    ancestors: set[int] = set()
+
+    def visit(value: object, depth: int) -> None:
+        nonlocal nodes, string_bytes
+        nodes += 1
+        if nodes > limits["max_nodes"]:
+            raise SecurityExceptionValidationError(
+                "Security Exception inventory exceeds the node limit."
+            )
+        if depth > limits["max_depth"]:
+            raise SecurityExceptionValidationError(
+                "Security Exception inventory exceeds the depth limit."
+            )
+        if isinstance(value, str):
+            remaining = min(limits["max_string_bytes"], limits["max_bytes"] - string_bytes)
+            # Avoid allocating an encoded copy of an already oversized string.
+            if len(value) > remaining:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory exceeds the byte limit."
+                )
+            try:
+                size = len(value.encode("utf-8"))
+            except UnicodeError as error:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory strings must be valid UTF-8."
+                ) from error
+            if size > remaining:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory exceeds the byte limit."
+                )
+            string_bytes += size
+        elif isinstance(value, (Mapping, list, tuple)):
+            identity = id(value)
+            if identity in ancestors:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory contains a cyclic container."
+                )
+            minimum_nodes = len(value) * (2 if isinstance(value, Mapping) else 1)
+            if minimum_nodes > limits["max_nodes"] - nodes:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory exceeds the node limit."
+                )
+            ancestors.add(identity)
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    if not isinstance(key, str):
+                        raise SecurityExceptionValidationError(
+                            "Security Exception inventory object keys must be strings."
+                        )
+                    visit(key, depth + 1)
+                    visit(child, depth + 1)
+            else:
+                for child in value:
+                    visit(child, depth + 1)
+            ancestors.remove(identity)
+        elif isinstance(value, int):
+            if value.bit_length() > limits["max_integer_bits"]:
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory exceeds the integer limit."
+                )
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise SecurityExceptionValidationError(
+                    "Security Exception inventory must contain finite JSON values."
+                )
+        elif value is not None:
+            raise SecurityExceptionValidationError(
+                "Security Exception inventory must contain JSON values."
+            )
+
+    for artifact in (public_ledger, private_projection, authority_observation):
+        if artifact is not None:
+            visit(artifact, 0)
+    visit(evaluated_at, 0)
+    _validate_inventory_record_arrays(contract, public_values, private_values)
+
+
 def validate_public_security_exception_ledger(
     public_ledger: Mapping[str, object],
     *,
@@ -1551,6 +1770,7 @@ def validate_public_security_exception_ledger(
 ) -> None:
     """Validate standalone public fields; private lineage reconciliation is separate."""
     contract = load_security_exception_contract()
+    _validate_inventory_budget(contract, public_ledger, evaluated_at=evaluated_at)
     _validate_artifact(contract, "public_ledger", public_ledger)
     public_values = public_ledger.get("exceptions", [])
     if not isinstance(public_values, list):
@@ -1596,6 +1816,13 @@ def validate_security_exception_inventory(
 ) -> SecurityExceptionInventory:
     """Validate public and sanitized private projections as one closed inventory."""
     contract = load_security_exception_contract()
+    _validate_inventory_budget(
+        contract,
+        public_ledger,
+        private_projection,
+        authority_observation,
+        evaluated_at=evaluated_at,
+    )
     _validate_artifact(contract, "public_ledger", public_ledger)
     if private_projection is None:
         raise SecurityExceptionValidationError(
@@ -1830,29 +2057,28 @@ def _validate_lineages(
             "Whole-ledger inventory contains exception identifier reuse."
         )
     subject_identities: dict[str, str] = {}
-    dependency_records = [
-        record
-        for record in record_values
-        if record.get("subject_kind") == "dependency_advisory"
-    ]
+    current_records: dict[str, list[Mapping[str, object]]] = {}
+    dependency_cells: set[tuple[str, str, str, str, str]] = set()
     for record in record_values:
         lineage_id = _required_str(record, "lineage_id")
+        current_records.setdefault(lineage_id, []).append(record)
         subject_identities[lineage_id] = _canonical_subject_identity(contract, record)
-    for index, first in enumerate(dependency_records):
-        for second in dependency_records[index + 1 :]:
-            if (
-                first.get("package") == second.get("package")
-                and first.get("locked_version") == second.get("locked_version")
-                and set(_string_tuple(first, "dependency_scopes"))
-                & set(_string_tuple(second, "dependency_scopes"))
-                and set(_string_tuple(first, "python_versions"))
-                & set(_string_tuple(second, "python_versions"))
-                and set(_string_tuple(first, "platforms"))
-                & set(_string_tuple(second, "platforms"))
-            ):
+        if record.get("subject_kind") != "dependency_advisory":
+            continue
+        package = _required_str(record, "package")
+        version = _required_str(record, "locked_version")
+        # Each dimension is already a closed, unique contract subset (at most 20 cells).
+        for scope, python_version, platform in product(
+            _string_tuple(record, "dependency_scopes"),
+            _string_tuple(record, "python_versions"),
+            _string_tuple(record, "platforms"),
+        ):
+            cell = (package, version, scope, python_version, platform)
+            if cell in dependency_cells:
                 raise SecurityExceptionValidationError(
                     "Whole-ledger inventory contains dependency subject overlap."
                 )
+            dependency_cells.add(cell)
     entries: list[Mapping[str, object]] = []
     for value in raw_entries:
         if not isinstance(value, Mapping):
@@ -1993,11 +2219,7 @@ def _validate_lineages(
                 last_approval_or_renewal = _required_str(entry, "effective_at")
             previous_alias_revision = alias_revision
             previous_evidence_revision = evidence_revision
-        matching = [
-            record
-            for record in records
-            if isinstance(record, Mapping) and record.get("lineage_id") == lineage_id
-        ]
+        matching = current_records.get(lineage_id, [])
         if len(matching) != 1:
             raise SecurityExceptionValidationError(
                 "Every lineage must have exactly one current whole-ledger record."
@@ -2038,10 +2260,7 @@ def _validate_lineages(
             raise SecurityExceptionValidationError(
                 "Current record predecessor does not link to the lineage head predecessor."
             )
-    record_lineages = {
-        record.get("lineage_id") for record in records if isinstance(record, Mapping)
-    }
-    if record_lineages != set(grouped):
+    if set(current_records) != set(grouped):
         raise SecurityExceptionValidationError(
             "Whole-ledger records and lineage index are not linked."
         )
