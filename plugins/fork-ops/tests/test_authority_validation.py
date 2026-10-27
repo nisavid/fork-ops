@@ -177,3 +177,11 @@ Run `git merge-base --is-ancestor origin/upstream-stable HEAD` for closeout.
         result = core.execute_migration_plan(plan, tmp_path)
         assert result['mutation_state'] == 'not_started'
         assert not (tmp_path / core.CONFIG_RELATIVE_PATH).exists()
+
+
+def test_optional_empty_sync_baseline(config: dict[str, Any]) -> None:
+    config['sync_policy'] = {'default_sync_baseline': ''}
+    assert schema_diagnostics(config) == []
+    report = core.capability_report(config)
+    assert report['authority_readiness']['highest_authority_ready'] == 'track-aware'
+    assert not report['authority_readiness']['levels']['sync-ready']['ready']
