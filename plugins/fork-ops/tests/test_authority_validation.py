@@ -140,3 +140,24 @@ def test_optional_empty_sync_baseline() -> None:
     assert levels["track-aware"]["ready"] is True
     assert levels["sync-ready"]["ready"] is False
     assert "sync_policy.default_sync_baseline" in levels["sync-ready"]["missing"]
+
+
+@pytest.mark.parametrize("failure", ["missing", "uninspectable", "parse_failed"])
+def test_unavailable_config_preserves_load_diagnostic(tmp_path: Path, failure: str) -> None:
+    target = tmp_path / core.CONFIG_RELATIVE_PATH
+    if failure != "missing":
+        target.parent.mkdir()
+        if failure == "uninspectable":
+            target.mkdir()
+        else:
+            target.write_text("invalid = [")
+    report = core.build_status_report(tmp_path)
+    assert report["capability"]["diagnostics"] == report["diagnostics"]
+    assert [x["code"] for x in report["diagnostics"]] == [f"config.{failure}"]
+    assert report["capability"]["authority_readiness"]["highest_authority_ready"] is None
+
+
+def test_direct_empty_config_is_still_validated() -> None:
+    report = core.capability_report({}, [])
+    assert any(x["code"] == "schema.invalid" for x in report["diagnostics"])
+    assert report["authority_readiness"]["highest_authority_ready"] is None

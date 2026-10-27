@@ -2103,7 +2103,12 @@ def capability_report(
         or bool(extension_paths)
         or any(item.code == "unsupported_schema_version" for item in diagnostics)
     )
-    if not semantic_refusal:
+    config_unavailable = not config and any(
+        item.severity == "error"
+        and item.code in {"config.missing", "config.uninspectable", "config.parse_failed"}
+        for item in diagnostics
+    )
+    if not semantic_refusal and not config_unavailable:
         # Derive readiness from this config even when callers supply diagnostics.
         config_diagnostics = schema_diagnostics(config)
         if not config_diagnostics:
