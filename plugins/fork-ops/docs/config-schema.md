@@ -42,6 +42,13 @@ authority readiness from that config.
 
 `[[local_surfaces]]` points agents to fork-local authority, docs, skills, scripts, hooks, and migration inputs. Use `domains` for the full non-normative domain classification and `domain` only as a primary routing hint. Use `portability_hints` and `repo_ops_candidate_scope` when only part of a surface is a plausible future Repo Ops migration candidate.
 
+Authority identifiers, remote names, track refs and sources, source-order entries,
+and local surface paths must contain a non-whitespace character. Optional track
+refs, branches, owner remotes, and sync baseline/ref fields follow the same rule
+when present; they may be omitted. Authored nonblank values, manual sources,
+blank notes, and unknown extensions remain supported. Capability reporting
+validates nested records and references even for direct Python callers.
+
 ## Sync-ready Sections
 
 `[sync_policy]` defines the Default Sync Baseline, default sync ref, fork sync start ref, commit identity requirements, merge methods, track update methods, ancestry checks, and history rewrite boundaries. Migration proposals map detected `origin/upstream-*` default baseline refs to matching `upstream_tracks` entries instead of relying on a single hard-coded baseline name.
