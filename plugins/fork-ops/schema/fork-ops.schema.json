@@ -327,7 +327,14 @@
           "uniqueItems": true
         },
         "default_sync_baseline": {
-          "pattern": "\\S",
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "pattern": "\\S"
+            }
+          ],
           "type": "string"
         },
         "default_sync_ref": {

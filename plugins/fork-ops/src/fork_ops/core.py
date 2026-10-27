@@ -2689,7 +2689,7 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
 
     sync_policy = _mapping_section(config, "sync_policy")
     default_baseline = sync_policy.get("default_sync_baseline")
-    if isinstance(default_baseline, str) and default_baseline not in track_ids:
+    if isinstance(default_baseline, str) and default_baseline and default_baseline not in track_ids:
         diagnostics.append(
             Diagnostic(
                 severity="error",

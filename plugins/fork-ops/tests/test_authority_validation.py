@@ -37,8 +37,16 @@ FIELDS = {
 }
 
 
-@pytest.mark.parametrize("section,key", [(s, k) for s, keys in FIELDS.items() for k in keys])
-@pytest.mark.parametrize("blank", ["", " \t\n", "\u2003\u00a0"])
+@pytest.mark.parametrize(
+    "section,key,blank",
+    [
+        (section, key, blank)
+        for section, keys in FIELDS.items()
+        for key in keys
+        for blank in ("", " \t\n", "\u2003\u00a0")
+        if not (key == "default_sync_baseline" and blank == "")
+    ],
+)
 def test_blank_authority_rejected_by_both_schemas_and_direct_capability(
     section: str,
     key: str,
@@ -120,3 +128,15 @@ def test_post_write_verification_rejects_blank_authority(tmp_path: Path) -> None
         bound.close()
     assert verification and all(x["status"] == "failed" for x in verification)
     assert "migration_execution.verification_failed" in {x["code"] for x in blockers}
+
+
+def test_optional_empty_sync_baseline() -> None:
+    config = core.normalize_config(core.parse_config_text(TRACK_AWARE_CONFIG))
+    config["sync_policy"]["default_sync_baseline"] = ""
+    assert not schema_diagnostics(config)
+    assert not core.reference_diagnostics(config)
+    report = core.capability_report(config)
+    levels = report["authority_readiness"]["levels"]
+    assert levels["track-aware"]["ready"] is True
+    assert levels["sync-ready"]["ready"] is False
+    assert "sync_policy.default_sync_baseline" in levels["sync-ready"]["missing"]

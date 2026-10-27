@@ -45,7 +45,9 @@ authority readiness from that config.
 Authority identifiers, remote names, track refs and sources, source-order entries,
 and local surface paths must contain a non-whitespace character. Optional track
 refs, branches, owner remotes, and sync baseline/ref fields follow the same rule
-when present; they may be omitted. Authored nonblank values, manual sources,
+when present; they may be omitted. An exactly empty `default_sync_baseline` is
+also a supported placeholder: it preserves track-aware readiness but cannot
+satisfy sync-ready. Whitespace-only baselines remain invalid. Authored nonblank values, manual sources,
 blank notes, and unknown extensions remain supported. Capability reporting
 validates nested records and references even for direct Python callers.
 
