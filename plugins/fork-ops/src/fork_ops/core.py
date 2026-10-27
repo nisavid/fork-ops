@@ -2103,6 +2103,24 @@ def capability_report(
         or bool(extension_paths)
         or any(item.code == "unsupported_schema_version" for item in diagnostics)
     )
+    config_unavailable = not config and any(
+        item.severity == "error"
+        and item.code in {"config.missing", "config.uninspectable", "config.parse_failed"}
+        for item in diagnostics
+    )
+    if not semantic_refusal and not config_unavailable:
+        # Derive readiness from this config even when callers supply diagnostics.
+        config_diagnostics = schema_diagnostics(config)
+        if not config_diagnostics:
+            config_diagnostics.extend(reference_diagnostics(config))
+        diagnostic_keys = {
+            (item.severity, item.code, item.path, item.message) for item in diagnostics
+        }
+        for diagnostic in config_diagnostics:
+            key = (diagnostic.severity, diagnostic.code, diagnostic.path, diagnostic.message)
+            if key not in diagnostic_keys:
+                diagnostics.append(diagnostic)
+                diagnostic_keys.add(key)
     blocking_errors = [item for item in diagnostics if item.severity == "error"]
     levels: dict[str, Any] = {}
     highest: str | None = None
@@ -2628,7 +2646,7 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
         if not isinstance(channel, dict):
             continue
         upstream = channel.get("upstream")
-        if upstream and upstream not in upstream_ids:
+        if isinstance(upstream, str) and upstream not in upstream_ids:
             diagnostics.append(
                 Diagnostic(
                     severity="error",
@@ -2645,7 +2663,7 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
         if not isinstance(track, dict):
             continue
         upstream = track.get("upstream")
-        if upstream and upstream not in upstream_ids:
+        if isinstance(upstream, str) and upstream not in upstream_ids:
             diagnostics.append(
                 Diagnostic(
                     severity="error",
@@ -2659,6 +2677,7 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
             )
         if (
             track.get("source_type") == "release_channel"
+            and isinstance(track.get("source"), str)
             and track.get("source") not in release_channel_ids
         ):
             diagnostics.append(
@@ -2675,7 +2694,7 @@ def reference_diagnostics(config: dict[str, Any]) -> list[Diagnostic]:
 
     sync_policy = _mapping_section(config, "sync_policy")
     default_baseline = sync_policy.get("default_sync_baseline")
-    if default_baseline and default_baseline not in track_ids:
+    if isinstance(default_baseline, str) and default_baseline and default_baseline not in track_ids:
         diagnostics.append(
             Diagnostic(
                 severity="error",

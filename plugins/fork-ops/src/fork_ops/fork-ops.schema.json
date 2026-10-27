@@ -36,6 +36,7 @@
         },
         "source_order": {
           "items": {
+            "pattern": "\\S",
             "type": "string"
           },
           "minItems": 1,
@@ -107,6 +108,7 @@
         "additionalProperties": true,
         "properties": {
           "name": {
+            "pattern": "\\S",
             "type": "string"
           },
           "owner": {
@@ -165,6 +167,7 @@
             "type": "string"
           },
           "path": {
+            "pattern": "\\S",
             "type": "string"
           },
           "portability_hint": {
@@ -212,6 +215,7 @@
         "additionalProperties": true,
         "properties": {
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "include_drafts": {
@@ -239,6 +243,7 @@
             "type": "string"
           },
           "upstream": {
+            "pattern": "\\S",
             "type": "string"
           }
         },
@@ -255,15 +260,19 @@
       "additionalProperties": true,
       "properties": {
         "default_branch": {
+          "pattern": "\\S",
           "type": "string"
         },
         "host": {
+          "pattern": "\\S",
           "type": "string"
         },
         "name": {
+          "pattern": "\\S",
           "type": "string"
         },
         "owner": {
+          "pattern": "\\S",
           "type": "string"
         },
         "product_site": {
@@ -318,9 +327,18 @@
           "uniqueItems": true
         },
         "default_sync_baseline": {
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "pattern": "\\S"
+            }
+          ],
           "type": "string"
         },
         "default_sync_ref": {
+          "pattern": "\\S",
           "type": "string"
         },
         "forbid_history_rewrites": {
@@ -341,6 +359,7 @@
           "uniqueItems": true
         },
         "fork_sync_start_ref": {
+          "pattern": "\\S",
           "type": "string"
         },
         "pre_sync_fetches": {
@@ -381,9 +400,11 @@
             "uniqueItems": true
           },
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "local_branch": {
+            "pattern": "\\S",
             "type": "string"
           },
           "local_branch_policy": {
@@ -396,18 +417,22 @@
             "type": "string"
           },
           "owner_remote": {
+            "pattern": "\\S",
             "type": "string"
           },
           "ref": {
+            "pattern": "\\S",
             "type": "string"
           },
           "role": {
             "type": "string"
           },
           "source": {
+            "pattern": "\\S",
             "type": "string"
           },
           "source_ref": {
+            "pattern": "\\S",
             "type": "string"
           },
           "source_type": {
@@ -422,12 +447,14 @@
             "type": "boolean"
           },
           "tracking_ref": {
+            "pattern": "\\S",
             "type": "string"
           },
           "update_policy": {
             "type": "string"
           },
           "upstream": {
+            "pattern": "\\S",
             "type": "string"
           }
         },
@@ -453,6 +480,7 @@
             "type": "string"
           },
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "name": {
@@ -468,6 +496,7 @@
             "type": "string"
           },
           "remote": {
+            "pattern": "\\S",
             "type": "string"
           },
           "site_url": {
