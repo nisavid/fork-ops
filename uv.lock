@@ -343,6 +343,7 @@ development = [
 test = [
     { name = "coverage" },
     { name = "pytest" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -366,6 +367,7 @@ development = [
 test = [
     { name = "coverage", specifier = ">=7,<8" },
     { name = "pytest", specifier = ">=9.0.3" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 
 [[package]]
@@ -389,6 +391,7 @@ development = [
 test = [
     { name = "coverage" },
     { name = "pytest" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -407,6 +410,7 @@ development = [
 test = [
     { name = "coverage", specifier = ">=7,<8" },
     { name = "pytest", specifier = ">=8.0" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 
 [[package]]
