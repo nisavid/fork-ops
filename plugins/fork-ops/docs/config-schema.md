@@ -17,6 +17,11 @@ canonical runtime serialization. Check both artifacts with:
 uv run --package fork-ops fork-ops schema check --plugin-root plugins/fork-ops
 ```
 
+Required authority strings and source-order entries must contain a non-whitespace
+character. Capability reporting validates the config and its references even when
+callers supply no diagnostics. Values are preserved as authored; optional notes
+and unknown extensions retain their existing behavior.
+
 ## Required Foundation Sections
 
 `schema_version` identifies the config schema family. The foundation version is `0.1`.

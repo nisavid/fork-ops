@@ -36,6 +36,7 @@
         },
         "source_order": {
           "items": {
+            "pattern": "\\S",
             "type": "string"
           },
           "minItems": 1,
@@ -107,6 +108,7 @@
         "additionalProperties": true,
         "properties": {
           "name": {
+            "pattern": "\\S",
             "type": "string"
           },
           "owner": {
@@ -165,6 +167,7 @@
             "type": "string"
           },
           "path": {
+            "pattern": "\\S",
             "type": "string"
           },
           "portability_hint": {
@@ -212,6 +215,7 @@
         "additionalProperties": true,
         "properties": {
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "include_drafts": {
@@ -239,6 +243,7 @@
             "type": "string"
           },
           "upstream": {
+            "pattern": "\\S",
             "type": "string"
           }
         },
@@ -255,15 +260,19 @@
       "additionalProperties": true,
       "properties": {
         "default_branch": {
+          "pattern": "\\S",
           "type": "string"
         },
         "host": {
+          "pattern": "\\S",
           "type": "string"
         },
         "name": {
+          "pattern": "\\S",
           "type": "string"
         },
         "owner": {
+          "pattern": "\\S",
           "type": "string"
         },
         "product_site": {
@@ -381,6 +390,7 @@
             "uniqueItems": true
           },
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "local_branch": {
@@ -399,12 +409,14 @@
             "type": "string"
           },
           "ref": {
+            "pattern": "\\S",
             "type": "string"
           },
           "role": {
             "type": "string"
           },
           "source": {
+            "pattern": "\\S",
             "type": "string"
           },
           "source_ref": {
@@ -428,6 +440,7 @@
             "type": "string"
           },
           "upstream": {
+            "pattern": "\\S",
             "type": "string"
           }
         },
@@ -453,6 +466,7 @@
             "type": "string"
           },
           "id": {
+            "pattern": "\\S",
             "type": "string"
           },
           "name": {
@@ -468,6 +482,7 @@
             "type": "string"
           },
           "remote": {
+            "pattern": "\\S",
             "type": "string"
           },
           "site_url": {
