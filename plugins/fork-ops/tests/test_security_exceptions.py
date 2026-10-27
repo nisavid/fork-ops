@@ -7,11 +7,15 @@ import runpy
 import subprocess
 import sys
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
+from jsonschema import Draft202012Validator
+from typing_extensions import override
 
+import fork_ops.security_exceptions as security_exceptions
 from fork_ops.security_exceptions import (
     PublicCommandRequest,
     RevocationPendingRequest,
@@ -21,6 +25,8 @@ from fork_ops.security_exceptions import (
     StructuralProviderObservation,
     StructuralTransitionProjection,
     _freeze_projection_mapping,
+    _validate_inventory_budget,
+    _validate_lineages,
     canonicalize_security_exception_projection,
     compute_security_exception_digest,
     compute_security_exception_lifecycle,
@@ -32,6 +38,7 @@ from fork_ops.security_exceptions import (
     validate_advisory_reconciliation_projection,
     validate_lineage_issuance_projection,
     validate_provider_observation_envelope,
+    validate_public_security_exception_ledger,
     validate_public_transition_projection,
     validate_response_clock_inventory,
     validate_security_exception_inventory,
@@ -65,6 +72,366 @@ def test_packaged_security_exception_contract_is_verified() -> None:
     assert contract.authority.login == "nisavid"
     assert contract.authority.database_id == 576874
     assert contract.authority.node_id == "MDQ6VXNlcjU3Njg3NA=="
+
+
+def test_inventory_limits_are_pinned_in_the_contract_and_collection_schemas() -> None:
+    data = load_security_exception_contract().data
+
+    assert data["inventory_limits"] == {
+        "max_records": 1024,
+        "max_lineage_entries": 8192,
+        "max_items": 8192,
+        "max_nodes": 250000,
+        "max_depth": 32,
+        "max_string_bytes": 65536,
+        "max_bytes": 8388608,
+        "max_integer_bits": 64,
+    }
+    schemas = cast(dict[str, dict[str, object]], data["artifact_schemas"])
+    definitions = cast(dict[str, dict[str, object]], data["$defs"])
+    for schema, field, expected in (
+        (schemas["public_ledger"], "exceptions", 1024),
+        (schemas["private_projection"], "records", 1024),
+        (definitions["lineage_index"], "entries", 8192),
+    ):
+        properties = cast(dict[str, dict[str, object]], schema["properties"])
+        assert properties[field]["maxItems"] == expected
+
+
+class _SchemaReached(Exception):
+    pass
+
+
+def _schema_reached(*_args: object) -> None:
+    raise _SchemaReached
+
+
+@pytest.mark.parametrize(
+    ("public_count", "private_count", "lineage_count", "grow"),
+    [
+        (1024, 0, 0, "public"),
+        (0, 1024, 0, "private"),
+        (512, 512, 0, "private"),
+        (0, 0, 8192, "lineage"),
+        (512, 512, 7168, "lineage"),
+    ],
+)
+def test_inventory_collection_limits_run_before_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    public_count: int,
+    private_count: int,
+    lineage_count: int,
+    grow: str,
+) -> None:
+    # Deliberately malformed entries show that count limits precede item validation.
+    public_values: list[object] = [None] * public_count
+    private_values: list[object] = [None] * private_count
+    lineage_values: list[object] = [None] * lineage_count
+    public = {"exceptions": public_values}
+    private = {"records": private_values, "lineage_index": {"entries": lineage_values}}
+    monkeypatch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+
+    with pytest.raises(_SchemaReached):
+        validate_security_exception_inventory(
+            public, private, {}, evaluated_at="2026-08-12T12:01:00Z"
+        )
+    if grow == "public":
+        with pytest.raises(_SchemaReached):
+            validate_public_security_exception_ledger(public, evaluated_at="2026-08-12T12:01:00Z")
+    collections = {"public": public_values, "private": private_values, "lineage": lineage_values}
+    collections[grow].append(None)
+
+    with pytest.raises(SecurityExceptionValidationError, match="limit"):
+        validate_security_exception_inventory(
+            public, private, {}, evaluated_at="2026-08-12T12:01:00Z"
+        )
+    if grow == "public":
+        with pytest.raises(SecurityExceptionValidationError, match="limit"):
+            validate_public_security_exception_ledger(public, evaluated_at="2026-08-12T12:01:00Z")
+
+
+@pytest.mark.parametrize("root_index", range(3))
+@pytest.mark.parametrize(
+    "shape", ["wide", "deep", "string", "cycle", "mapping_cycle", "tuple_records"]
+)
+def test_malformed_inventory_roots_are_bounded_before_any_schema(
+    monkeypatch: pytest.MonkeyPatch, root_index: int, shape: str
+) -> None:
+    value: object
+    if shape == "wide":
+        value = [None] * 250000
+    elif shape == "deep":
+        value = None
+        for _ in range(33):
+            value = [value]
+    elif shape == "string":
+        value = "x" * 65537
+    elif shape == "cycle":
+        cycle: list[object] = []
+        cycle.append(cycle)
+        value = cycle
+    elif shape == "mapping_cycle":
+        mapping_cycle: dict[str, object] = {}
+        mapping_cycle["self"] = mapping_cycle
+        value = mapping_cycle
+    else:
+        value = (None,) * (250000 if root_index == 2 else 1025)
+    roots: list[dict[str, object]] = [{}, {}, {}]
+    field = "exceptions" if shape == "tuple_records" and root_index == 0 else "unexpected"
+    if shape == "tuple_records" and root_index == 1:
+        field = "records"
+    roots[root_index][field] = value
+    monkeypatch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+    expected = "cyclic" if shape in {"cycle", "mapping_cycle"} else "limit"
+
+    with pytest.raises(SecurityExceptionValidationError, match=expected):
+        validate_security_exception_inventory(*roots, evaluated_at="2026-08-12T12:01:00Z")
+    if root_index == 0:
+        with pytest.raises(SecurityExceptionValidationError, match=expected):
+            validate_public_security_exception_ledger(roots[0], evaluated_at="2026-08-12T12:01:00Z")
+
+
+@pytest.mark.parametrize("root_index", range(3))
+@pytest.mark.parametrize("value", [None, [], (), 1, "not an object", object()])
+def test_malformed_root_types_preserve_inventory_validation_errors(
+    root_index: int, value: object
+) -> None:
+    roots = [_public_ledger(), _private_projection(), _authority_observation()]
+    roots[root_index] = cast(dict[str, object], value)
+
+    with pytest.raises(SecurityExceptionValidationError, match="invalid|unavailable|JSON"):
+        validate_security_exception_inventory(*roots, evaluated_at="2026-08-12T12:01:00Z")
+    if root_index == 0:
+        with pytest.raises(SecurityExceptionValidationError, match="invalid|JSON"):
+            validate_public_security_exception_ledger(roots[0], evaluated_at="2026-08-12T12:01:00Z")
+
+
+def test_inventory_node_limit_counts_all_roots_and_the_evaluation_timestamp() -> None:
+    values: list[object] = [None] * (250000 - 6)
+    public = {"x": values}  # Public root, key, list, items, two other roots, and timestamp.
+    contract = load_security_exception_contract()
+
+    _validate_inventory_budget(contract, public, {}, {}, evaluated_at="2026-08-12T12:01:00Z")
+    values.append(None)
+    with pytest.raises(SecurityExceptionValidationError, match="node limit"):
+        _validate_inventory_budget(contract, public, {}, {}, evaluated_at="2026-08-12T12:01:00Z")
+
+
+@pytest.mark.parametrize("root_index", range(3))
+def test_inventory_depth_limit_is_measured_from_each_artifact_root(root_index: int) -> None:
+    value: object = None
+    for _ in range(31):
+        value = [value]
+    roots: list[dict[str, object]] = [{}, {}, {}]
+    roots[root_index]["x"] = value
+    contract = load_security_exception_contract()
+
+    _validate_inventory_budget(contract, *roots)
+    roots[root_index]["x"] = [value]
+    with pytest.raises(SecurityExceptionValidationError, match="depth limit"):
+        _validate_inventory_budget(contract, *roots)
+
+
+def test_inventory_byte_limit_aggregates_utf8_keys_values_and_evaluation_timestamp() -> None:
+    # 127 full-size strings, a 65,535-byte value, and a one-byte key total 8 MiB.
+    full_string = "é" * 32768
+    values: list[object] = [full_string for _ in range(125)]
+    values.append("x" * 65535)
+    public = {full_string: values}
+    private: dict[str, object] = {"x": full_string}
+    contract = load_security_exception_contract()
+
+    _validate_inventory_budget(contract, public, private, {}, evaluated_at="")
+    with pytest.raises(SecurityExceptionValidationError, match="byte limit"):
+        _validate_inventory_budget(contract, public, private, {}, evaluated_at="x")
+    with pytest.raises(SecurityExceptionValidationError, match="byte limit"):
+        _validate_inventory_budget(contract, public, private, {"x": None}, evaluated_at="")
+
+
+@pytest.mark.parametrize("key", [False, True])
+def test_inventory_string_limit_uses_utf8_bytes_for_keys_and_values(key: bool) -> None:
+    value = "é" * 32768
+    contract = load_security_exception_contract()
+    _validate_inventory_budget(contract, {value: None} if key else {"x": value})
+
+    with pytest.raises(SecurityExceptionValidationError, match="byte limit"):
+        _validate_inventory_budget(contract, {value + "x": None} if key else {"x": value + "x"})
+
+
+@pytest.mark.parametrize("whole_inventory", [False, True])
+def test_evaluation_timestamp_is_bounded_before_schema_at_exact_string_limit(
+    monkeypatch: pytest.MonkeyPatch, whole_inventory: bool
+) -> None:
+    prefix = "2026-08-12T12:01:00."
+    timestamp = prefix + "0" * (65536 - len(prefix) - 1) + "Z"
+    monkeypatch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+
+    def validate(value: str) -> None:
+        if whole_inventory:
+            validate_security_exception_inventory({}, {}, {}, evaluated_at=value)
+        else:
+            validate_public_security_exception_ledger({}, evaluated_at=value)
+
+    with pytest.raises(_SchemaReached):
+        validate(timestamp)
+    with pytest.raises(SecurityExceptionValidationError, match="byte limit"):
+        validate(timestamp[:-1] + "0Z")
+    with pytest.raises(SecurityExceptionValidationError, match="UTF-8"):
+        validate("\ud800")
+
+
+@pytest.mark.parametrize("timestamp", ["not a timestamp", "2026-08-12T12:01:00", 1, None])
+def test_invalid_evaluation_timestamps_preserve_validation_errors(timestamp: object) -> None:
+    record = _dependency_record()
+    entry = _lineage_entry(record)
+    with pytest.raises(SecurityExceptionValidationError, match="evaluated_at"):
+        validate_security_exception_inventory(
+            _public_ledger(record), _private_projection(entry), _authority_observation(),
+            evaluated_at=cast(str, timestamp),
+        )
+    with pytest.raises(SecurityExceptionValidationError, match="evaluated_at"):
+        validate_public_security_exception_ledger(
+            _public_ledger(record), evaluated_at=cast(str, timestamp)
+        )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_inventory_integer_limit_is_bounded_without_rejecting_json_scalars(sign: int) -> None:
+    contract = load_security_exception_contract()
+    _validate_inventory_budget(contract, {"x": sign * (2**64 - 1), "flag": True, "float": 1.25})
+    with pytest.raises(SecurityExceptionValidationError, match="integer limit"):
+        _validate_inventory_budget(contract, {"x": sign * 2**64})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"bytes", {"set"}, object(), float("nan"), float("inf"), -float("inf"),
+        {1: "value"}, "\ud800",
+    ],
+)
+def test_non_json_inventory_values_are_refused_before_schema(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    monkeypatch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+    with pytest.raises(SecurityExceptionValidationError):
+        validate_public_security_exception_ledger({"x": value}, evaluated_at="2026-08-12T12:01:00Z")
+
+
+def test_inventory_counts_shared_containers_per_occurrence_and_skips_missing_artifacts() -> None:
+    contract = load_security_exception_contract()
+    limits = cast(dict[str, int], contract.data["inventory_limits"])
+    shared = ["x"]
+    public = {"a": shared, "b": shared}
+    bounded = replace(
+        contract, data={**contract.data, "inventory_limits": {**limits, "max_nodes": 8}}
+    )
+
+    _validate_inventory_budget(bounded, public)
+    for limit, maximum in (("max_nodes", 7), ("max_bytes", 3)):
+        bounded = replace(
+            contract, data={**contract.data, "inventory_limits": {**limits, limit: maximum}}
+        )
+        with pytest.raises(SecurityExceptionValidationError, match="limit"):
+            _validate_inventory_budget(bounded, public)
+    bounded = replace(
+        contract, data={**contract.data, "inventory_limits": {**limits, "max_nodes": 2}}
+    )
+    _validate_inventory_budget(bounded, {}, None, None)
+    assert public["a"] is public["b"] is shared
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "maximum"),
+    [
+        (location, field, maximum)
+        for location in ("standalone_public", "whole_public", "whole_private")
+        for field, maximum in (
+            ("aliases", 64), ("compensating_control_ids", 32), ("public_references", 32),
+            ("dependency_scopes", 5), ("python_versions", 4), ("platforms", 1),
+        )
+        if location != "whole_private" or field != "public_references"
+    ],
+)
+def test_record_array_caps_and_item_types_precede_schema_uniqueness(
+    monkeypatch: pytest.MonkeyPatch, location: str, field: str, maximum: int
+) -> None:
+    # Schema validation still handles the field's content and uniqueness at the cap.
+    with monkeypatch.context() as patch:
+        patch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+        with pytest.raises(_SchemaReached):
+            _validate_record_array_inventory(location, {field: ["x"] * maximum})
+
+    uniqueness_calls = 0
+
+    def refuse_uniqueness(*_args: object) -> None:
+        nonlocal uniqueness_calls
+        uniqueness_calls += 1
+        pytest.fail("malformed record arrays reached schema uniqueness comparisons")
+
+    monkeypatch.setitem(Draft202012Validator.VALIDATORS, "uniqueItems", refuse_uniqueness)
+    with pytest.raises(SecurityExceptionValidationError, match=f"{field}.*limit"):
+        _validate_record_array_inventory(location, {field: ["x"] * (maximum + 1)})
+    with pytest.raises(SecurityExceptionValidationError, match=f"{field}.*only strings"):
+        _validate_record_array_inventory(location, {field: [{"x": 0}]})
+    assert uniqueness_calls == 0
+
+
+@pytest.mark.parametrize("location", ["standalone_public", "whole_public", "whole_private"])
+@pytest.mark.parametrize("count", [100, 200, 80000])
+def test_nested_record_array_rejection_never_invokes_schema_uniqueness(
+    monkeypatch: pytest.MonkeyPatch, location: str, count: int
+) -> None:
+    uniqueness_calls = 0
+
+    def refuse_uniqueness(*_args: object) -> None:
+        nonlocal uniqueness_calls
+        uniqueness_calls += 1
+        pytest.fail("unbounded nested items reached schema uniqueness comparisons")
+
+    monkeypatch.setitem(Draft202012Validator.VALIDATORS, "uniqueItems", refuse_uniqueness)
+    with pytest.raises(SecurityExceptionValidationError, match="aliases.*item limit"):
+        _validate_record_array_inventory(location, {"aliases": [{"x": i} for i in range(count)]})
+    assert uniqueness_calls == 0
+
+
+def test_record_array_preflight_uses_the_contract_schema_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = load_security_exception_contract()
+    definitions = cast(dict[str, dict[str, object]], contract.data["$defs"])
+    properties = cast(
+        dict[str, dict[str, object]], definitions["record_subject_projection"]["properties"]
+    )
+    properties["aliases"]["maxItems"] = 1
+    monkeypatch.setattr(security_exceptions, "load_security_exception_contract", lambda: contract)
+    monkeypatch.setattr(security_exceptions, "_validate_artifact", _schema_reached)
+
+    with pytest.raises(_SchemaReached):
+        _validate_record_array_inventory("standalone_public", {"aliases": ["x"]})
+    with pytest.raises(SecurityExceptionValidationError, match="aliases.*item limit"):
+        _validate_record_array_inventory("standalone_public", {"aliases": ["x", "y"]})
+
+
+def test_bounded_duplicate_record_arrays_still_fail_schema_uniqueness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _dependency_record()
+    record["aliases"] = ["same", "same"]
+    uniqueness_calls = 0
+    original = Draft202012Validator.VALIDATORS["uniqueItems"]
+
+    def observe_uniqueness(*args: object) -> object:
+        nonlocal uniqueness_calls
+        uniqueness_calls += 1
+        return original(*args)
+
+    monkeypatch.setitem(Draft202012Validator.VALIDATORS, "uniqueItems", observe_uniqueness)
+    with pytest.raises(SecurityExceptionValidationError, match="invalid"):
+        validate_public_security_exception_ledger(
+            _public_ledger(record), evaluated_at="2026-08-12T12:01:00Z"
+        )
+    assert uniqueness_calls > 0
 
 
 def test_empty_public_and_private_projections_form_a_typed_inventory() -> None:
@@ -902,6 +1269,84 @@ def test_lineage_rejects_exception_id_reuse_and_dependency_overlap() -> None:
             _public_ledger(first, second),
             _private_projection(_lineage_entry(first), second_lineage),
             _authority_observation(),
+            evaluated_at="2026-08-12T12:01:00Z",
+        )
+
+
+class _LookupCountingRecord(dict[str, object]):
+    def __init__(self, value: dict[str, object], lookups: dict[str, int]) -> None:
+        super().__init__(value)
+        self.lookups = lookups
+
+    @override
+    def get(self, key: str, default: object = None) -> object:
+        if key in {"package", "lineage_id"}:
+            self.lookups[key] = self.lookups.get(key, 0) + 1
+        return super().get(key, default)
+
+
+@pytest.mark.parametrize("count", [100, 200])
+def test_valid_mixed_inventory_dependency_and_lineage_lookups_scale_linearly(count: int) -> None:
+    pairs = [_distinct_dependency_pair(index, private=index % 2 == 1) for index in range(count)]
+    lookups: dict[str, int] = {}
+    records = [_LookupCountingRecord(record, lookups) for record, _ in pairs]
+    private = _private_projection(*(entry for _, entry in pairs))
+    private["records"] = [record for record in records if record["visibility"] == "private"]
+
+    inventory = validate_security_exception_inventory(
+        _public_ledger(*(record for record in records if record["visibility"] == "public")),
+        private,
+        _authority_observation(),
+        evaluated_at="2026-08-12T12:01:00Z",
+    )
+
+    assert len(inventory.public_records) == len(inventory.private_records) == count // 2
+    assert len(inventory.lineages) == len(inventory.dependency_records) == count
+    assert len({record.lineage_id for record in inventory.all_records}) == count
+    assert inventory.authority_status == "structural_unverified"
+    # Count field reads rather than elapsed time: both former nested loops fail this bound.
+    assert lookups["package"] <= 8 * count
+    assert lookups["lineage_id"] <= 8 * count
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_dependency_overlap_is_checked_across_visibility_and_preserves_disjoint_scopes(
+    overlap: bool,
+) -> None:
+    public_record, public_entry = _distinct_dependency_pair(0, package="starlette")
+    private_record, private_entry = _distinct_dependency_pair(
+        1, private=True, package="starlette", scopes=("runtime", "test") if overlap else ("test",)
+    )
+    private = _private_projection(public_entry, private_entry)
+    private["records"] = [private_record]
+    if overlap:
+        with pytest.raises(SecurityExceptionValidationError, match="dependency subject overlap"):
+            validate_security_exception_inventory(
+                _public_ledger(public_record), private, _authority_observation(),
+                evaluated_at="2026-08-12T12:01:00Z",
+            )
+    else:
+        inventory = validate_security_exception_inventory(
+            _public_ledger(public_record), private, _authority_observation(),
+            evaluated_at="2026-08-12T12:01:00Z",
+        )
+        assert len(inventory.dependency_records) == 2
+
+
+def test_indexed_lineages_still_reject_multiple_current_records() -> None:
+    first = _non_dependency_record(
+        kind="policy_deviation",
+        subject_kind="repository_control",
+        subject_key="branch-protection",
+        exception_id=EXCEPTION_ID,
+        lineage_id=LINEAGE_ID,
+    )
+    second = {**first, "exception_id": "33333333-3333-4333-8333-333333333333"}
+    entry = _lineage_entry(first, subject_identity="repository_control:branch-protection")
+
+    with pytest.raises(SecurityExceptionValidationError, match="exactly one current"):
+        _validate_lineages(
+            load_security_exception_contract(), [first, second], [entry],
             evaluated_at="2026-08-12T12:01:00Z",
         )
 
@@ -2358,6 +2803,21 @@ def _structural_response_inventory() -> SecurityExceptionInventory:
     )
 
 
+def _validate_record_array_inventory(location: str, record: dict[str, object]) -> None:
+    if location == "standalone_public":
+        validate_public_security_exception_ledger(
+            _public_ledger(record), evaluated_at="2026-08-12T12:01:00Z"
+        )
+        return
+    public = _public_ledger(record) if location == "whole_public" else _public_ledger()
+    private = _private_projection()
+    if location == "whole_private":
+        private["records"] = [record]
+    validate_security_exception_inventory(
+        public, private, _authority_observation(), evaluated_at="2026-08-12T12:01:00Z"
+    )
+
+
 def _structural_empty_inventory() -> SecurityExceptionInventory:
     return validate_security_exception_inventory(
         _public_ledger(),
@@ -2437,6 +2897,33 @@ def _dependency_record() -> dict[str, object]:
     }
 
 
+def _distinct_dependency_pair(
+    index: int,
+    *,
+    private: bool = False,
+    package: str | None = None,
+    scopes: tuple[str, ...] = ("runtime",),
+) -> tuple[dict[str, object], dict[str, object]]:
+    record = _dependency_record()
+    package = f"package-{index}" if package is None else package
+    lineage_id = f"{index:08x}-1111-4111-8111-111111111111"
+    identity = (
+        f"dependency:{package}@1.0.0|scopes={','.join(scopes)}|"
+        "python=3.11,3.12,3.13,3.14|platform=linux"
+    )
+    record.update(
+        exception_id=f"{index:08x}-2222-4222-8222-222222222222",
+        lineage_id=lineage_id,
+        visibility="private" if private else "public",
+        package=package,
+        dependency_scopes=list(scopes),
+        subject_key=f"dependency:{lineage_id}:{identity.removeprefix('dependency:')}",
+    )
+    if private:
+        record.pop("public_references")
+    return record, _lineage_entry(record, subject_identity=identity)
+
+
 def _non_dependency_record(
     *,
     kind: str,
@@ -2476,6 +2963,8 @@ def _lineage_entry(
     *,
     predecessor_event_digest: str = ZERO_DIGEST,
     effective_at: str | None = None,
+    subject_identity: str = "dependency:starlette@1.0.0|scopes=runtime|"
+    "python=3.11,3.12,3.13,3.14|platform=linux",
 ) -> dict[str, object]:
     digest_fields = {
         "evidence_digest",
@@ -2502,8 +2991,7 @@ def _lineage_entry(
         "sequence": record["lineage_sequence"],
         "state": record["state"],
         "subject_key": record["subject_key"],
-        "subject_identity": "dependency:starlette@1.0.0|scopes=runtime|"
-        "python=3.11,3.12,3.13,3.14|platform=linux",
+        "subject_identity": subject_identity,
         "alias_revision": record["alias_revision"],
         "evidence_revision": record["evidence_revision"],
         "response_started_at": record["response_started_at"],

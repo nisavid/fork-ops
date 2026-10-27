@@ -182,6 +182,7 @@ def _render_guide(contract: dict[str, Any], digest: str) -> str:
     authority_observation = contract["authority_observation"]
     transition_observation = contract["transition_observation"]
     lineage_issuance = contract["lineage_issuance"]
+    inventory_limits = contract["inventory_limits"]
     subject_identity = contract["subject_identity"]
     required_passes = provider["required_passes"]
     validity_minutes = provider["maximum_validity_seconds"] // 60
@@ -255,6 +256,32 @@ whole ledger when that projection is unavailable.
 An Unscanned Equipment Exception is separate equipment governance. It is not a
 Security Exception and cannot affect Security Posture without a separate record
 under this contract.
+
+## Inventory validation limits
+
+Public and whole-ledger validation apply these aggregate limits before schema
+validation, canonicalization, or copying caller inputs. Record and lineage counts
+cover the public ledger and sanitized private projection together. The evaluation
+timestamp shares the node and string-byte budgets with all supplied artifacts.
+
+| Limit | Maximum |
+| --- | ---: |
+| Current records | {inventory_limits['max_records']} |
+| Lineage entries | {inventory_limits['max_lineage_entries']} |
+| Records plus lineage entries | {inventory_limits['max_items']} |
+| Visited roots, keys, and values | {inventory_limits['max_nodes']} |
+| Depth from each artifact root at zero | {inventory_limits['max_depth']} |
+| UTF-8 bytes per key or string value | {inventory_limits['max_string_bytes']} |
+| Aggregate UTF-8 bytes in keys and string values | {inventory_limits['max_bytes']} |
+| Integer magnitude bits | {inventory_limits['max_integer_bits']} |
+
+Every occurrence of a shared container counts toward the budgets. Cycles,
+non-string keys, invalid UTF-8 strings, and non-JSON values, including nonfinite
+numbers, are refused. Missing optional artifacts are excluded from traversal;
+the required private projection still fails whole-ledger validation when absent.
+These bounds establish structural conformance only and confer no authority.
+Current-record string arrays must also satisfy their schema-declared item limits
+and string item types before schema uniqueness checks run.
 
 ## Closed kind and subject matrix
 
