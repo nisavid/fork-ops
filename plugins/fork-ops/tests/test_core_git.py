@@ -21,6 +21,7 @@ def git_repo(tmp_path: Path) -> Path:
     assert executable is not None
     repo = tmp_path / "repo"
     repo.mkdir()
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     for arguments in (
         ("init", "-b", "main"),
         ("remote", "add", "origin", "https://github.com/fork/project.git"),
@@ -31,6 +32,7 @@ def git_repo(tmp_path: Path) -> Path:
             [executable, "-C", str(repo), *arguments],
             check=True,
             capture_output=True,
+            env=environment,
         )
     return repo
 
@@ -152,6 +154,8 @@ def test_live_git_refuses_untrusted_or_unusable_selection(
         assert result.stderr
         runner.assert_not_called()
     assert core._git_ok(git_repo, "rev-parse", "--is-inside-work-tree") is False
+    diagnostics = core.git_diagnostics(git_repo, {})
+    assert [item.code for item in diagnostics] == ["git.unavailable"]
     assert core._git_output(git_repo, "remote", "get-url", "origin") is None
     assert not marker.exists()
 
