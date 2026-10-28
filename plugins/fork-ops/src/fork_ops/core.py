@@ -10,6 +10,7 @@ import os
 import re
 import selectors
 import shlex
+import shutil
 import signal as process_signal
 import stat
 import subprocess
@@ -1656,11 +1657,14 @@ def _default_command_runner(
     command: list[str],
     cwd: Path,
     timeout: float,
+    *,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -11327,7 +11331,48 @@ def _git_output(repo: Path, *args: str) -> str | None:
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     command = ["git", "-C", str(repo), *args]
-    return _default_command_runner(command, repo, 10.0)
+    try:
+        # Never search the inspected repository, even when a platform default
+        # contains a relative entry or a system directory resolves into it.
+        repository = repo.resolve(strict=True)
+        directories = [
+            Path(entry).resolve()
+            for entry in os.defpath.split(os.pathsep)
+            if Path(entry).is_absolute()
+        ]
+        search_path = os.pathsep.join(
+            str(directory) for directory in directories if not directory.is_relative_to(repository)
+        )
+        selected = shutil.which("git", path=search_path) if search_path else None
+        if selected is None or not Path(selected).is_absolute():
+            raise OSError("Trusted Git executable is unavailable.")
+        executable = Path(selected).resolve(strict=True)
+        metadata = executable.stat()
+        if (
+            executable.is_relative_to(repository)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o111 == 0
+        ):
+            raise OSError("Trusted Git executable is unavailable.")
+    except (OSError, RuntimeError):
+        return subprocess.CompletedProcess(
+            command, 127, "", "Trusted Git executable is unavailable."
+        )
+
+    environment = {
+        "PATH": search_path,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    # Preserve operator-owned Git configuration (including safe.directory and
+    # URL rewriting) without inheriting executable or repository overrides.
+    for name in ("HOME", "XDG_CONFIG_HOME"):
+        if value := os.environ.get(name):
+            environment[name] = value
+    command[0] = str(executable)
+    return _default_command_runner(command, repo, 10.0, env=environment)
 
 
 def _iter_candidate_paths(

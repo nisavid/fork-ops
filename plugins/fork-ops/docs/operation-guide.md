@@ -29,6 +29,13 @@ uv run --package fork-ops fork-ops config show --repo /path/to/configured-fork -
 uv run --package fork-ops fork-ops config validate --repo /path/to/configured-fork --required-level track-aware
 ```
 
+Live Git checks require an executable Git installation in the platform's default
+system search directories (`os.defpath`), outside the inspected repository.
+They ignore the caller's `PATH` and Git executable/repository environment
+overrides. Local repository configuration and operator Git configuration through
+`HOME` and `XDG_CONFIG_HOME` remain available. If trusted Git cannot be launched,
+config validation reports `git.unavailable` without trying the caller's `PATH`.
+
 Create a starter config when fork-local authority already identifies the fork
 and upstream repository:
 
