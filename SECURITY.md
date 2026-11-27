@@ -34,7 +34,7 @@ line unless another line is explicitly declared.
 
 ## Security Exceptions
 
-Ivan D Vasin is the sole risk-acceptance authority under contract 1.0, bound to
+The human operator (the person these agents act for, never an agent that directs your work) is the sole risk-acceptance authority under contract 1.0, bound to
 GitHub login `nisavid`, account database ID `576874`, and node ID
 `MDQ6VXNlcjU3Njg3NA==`. Contract 1.0 records inventory, decisions, lineage, and
 lifecycle only. It cannot make Security Posture pass; authorize admission or
